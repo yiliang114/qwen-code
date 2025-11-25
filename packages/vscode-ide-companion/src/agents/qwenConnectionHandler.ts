@@ -23,11 +23,11 @@ export class QwenConnectionHandler {
   /**
    * Connect to Qwen service and establish session
    *
-   * @param connection - ACP连接实例
-   * @param sessionReader - 会话读取器实例
-   * @param workingDir - 工作目录
-   * @param authStateManager - 认证状态管理器（可选）
-   * @param cliPath - CLI路径（可选，如果提供将覆盖配置中的路径）
+   * @param connection - ACP connection instance
+   * @param sessionReader - Session reader instance
+   * @param workingDir - Working directory
+   * @param authStateManager - Authentication state manager (optional)
+   * @param cliPath - CLI path (optional, if provided will override the path in configuration)
    */
   async connect(
     connection: AcpConnection,
@@ -104,7 +104,7 @@ export class QwenConnectionHandler {
           '[QwenAgentManager] Found existing sessions:',
           sessions.length,
         );
-        const lastSession = sessions[0]; // 已按lastUpdated排序
+        const lastSession = sessions[0]; // Already sorted by lastUpdated
 
         try {
           await connection.switchSession(lastSession.sessionId);

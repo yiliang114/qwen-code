@@ -72,9 +72,9 @@ export class QwenAgentManager {
   /**
    * Connect to Qwen service
    *
-   * @param workingDir - 工作目录
-   * @param authStateManager - 认证状态管理器（可选）
-   * @param cliPath - CLI路径（可选，如果提供将覆盖配置中的路径）
+   * @param workingDir - Working directory
+   * @param authStateManager - Authentication state manager (optional)
+   * @param cliPath - CLI path (optional, if provided will override the path in configuration)
    */
   async connect(
     workingDir: string,
