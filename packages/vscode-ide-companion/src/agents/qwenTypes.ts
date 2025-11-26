@@ -3,13 +3,6 @@
  * Copyright 2025 Qwen Team
  * SPDX-License-Identifier: Apache-2.0
  */
-
-/**
- * Qwen Agent Manager Type Definitions
- *
- * Contains all related interfaces and type definitions
- */
-
 import type { AcpPermissionRequest } from '../shared/acpTypes.js';
 
 /**

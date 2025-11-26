@@ -107,7 +107,7 @@ export class CliInstaller {
             );
             console.log(
               '[CliInstaller] Current process PATH:',
-              process.env.PATH,
+              process.env['PATH'],
             );
 
             // Also log Node.js version being used by VS Code
