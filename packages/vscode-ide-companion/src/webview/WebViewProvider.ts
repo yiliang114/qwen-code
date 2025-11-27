@@ -207,16 +207,6 @@ export class WebViewProvider {
     // Register panel dispose handler
     this.panelManager.registerDisposeHandler(this.disposables);
 
-    // Track last known editor state (to preserve when switching to webview)
-    let _lastEditorState: {
-      fileName: string | null;
-      filePath: string | null;
-      selection: {
-        startLine: number;
-        endLine: number;
-      } | null;
-    } | null = null;
-
     // Listen for active editor changes and notify WebView
     const editorChangeDisposable = vscode.window.onDidChangeActiveTextEditor(
       (editor) => {
@@ -238,9 +228,6 @@ export class WebViewProvider {
             endLine: selection.end.line + 1,
           };
         }
-
-        // Update last known state
-        _lastEditorState = { fileName, filePath, selection: selectionInfo };
 
         this.sendMessageToWebView({
           type: 'activeEditorChanged',
@@ -267,9 +254,6 @@ export class WebViewProvider {
               endLine: selection.end.line + 1,
             };
           }
-
-          // Update last known state
-          _lastEditorState = { fileName, filePath, selection: selectionInfo };
 
           this.sendMessageToWebView({
             type: 'activeEditorChanged',
@@ -300,51 +284,11 @@ export class WebViewProvider {
       });
     }
 
-    // Smart login restore: Check if we have valid cached auth and restore connection if available
-    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-    const workingDir = workspaceFolder?.uri.fsPath || process.cwd();
-    const config = vscode.workspace.getConfiguration('qwenCode');
-    const openaiApiKey = config.get<string>('qwen.openaiApiKey', '');
-    const authMethod = openaiApiKey ? 'openai' : 'qwen-oauth';
+    // Initialize empty conversation immediately for fast UI rendering
+    await this.initializeEmptyConversation();
 
-    // Check if we have valid cached authentication
-    let hasValidAuth = false;
-    if (this.authStateManager) {
-      hasValidAuth = await this.authStateManager.hasValidAuth(
-        workingDir,
-        authMethod,
-      );
-      console.log(
-        '[WebViewProvider] Has valid cached auth on show:',
-        hasValidAuth,
-      );
-    }
-
-    if (hasValidAuth && !this.agentInitialized) {
-      console.log(
-        '[WebViewProvider] Found valid cached auth, attempting to restore connection...',
-      );
-      try {
-        await this.initializeAgentConnection();
-        console.log('[WebViewProvider] Connection restored successfully');
-      } catch (error) {
-        console.error('[WebViewProvider] Failed to restore connection:', error);
-        // Fall back to empty conversation if restore fails
-        await this.initializeEmptyConversation();
-      }
-    } else if (this.agentInitialized) {
-      console.log(
-        '[WebViewProvider] Agent already initialized, reusing existing connection',
-      );
-      // Reload current session messages
-      await this.loadCurrentSessionMessages();
-    } else {
-      console.log(
-        '[WebViewProvider] No valid cached auth or agent already initialized, showing empty conversation',
-      );
-      // Just initialize empty conversation for the UI
-      await this.initializeEmptyConversation();
-    }
+    // Perform background CLI detection and connection without blocking UI
+    this.performBackgroundInitialization();
   }
 
   /**
@@ -408,6 +352,12 @@ export class WebViewProvider {
 
           // Load messages from the current Qwen session
           await this.loadCurrentSessionMessages();
+
+          // Notify webview that agent is connected
+          this.sendMessageToWebView({
+            type: 'agentConnected',
+            data: {},
+          });
         } catch (error) {
           console.error('[WebViewProvider] Agent connection error:', error);
           // Clear auth cache on error (might be auth issue)
@@ -417,12 +367,138 @@ export class WebViewProvider {
           );
           // Fallback to empty conversation
           await this.initializeEmptyConversation();
+
+          // Notify webview that agent connection failed
+          this.sendMessageToWebView({
+            type: 'agentConnectionError',
+            data: {
+              message: error instanceof Error ? error.message : String(error),
+            },
+          });
         }
       }
     } else {
       console.log('[WebViewProvider] Qwen agent is disabled in settings');
       // Fallback to ConversationStore
       await this.initializeEmptyConversation();
+    }
+  }
+
+  /**
+   * Perform background initialization without blocking UI
+   * This method runs CLI detection and connection in the background
+   */
+  private async performBackgroundInitialization(): Promise<void> {
+    try {
+      const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+      const workingDir = workspaceFolder?.uri.fsPath || process.cwd();
+      const config = vscode.workspace.getConfiguration('qwenCode');
+      const qwenEnabled = config.get<boolean>('qwen.enabled', true);
+
+      if (qwenEnabled) {
+        // Check if we have valid cached authentication
+        const openaiApiKey = config.get<string>('qwen.openaiApiKey', '');
+        const authMethod = openaiApiKey ? 'openai' : 'qwen-oauth';
+
+        let hasValidAuth = false;
+        if (this.authStateManager) {
+          hasValidAuth = await this.authStateManager.hasValidAuth(
+            workingDir,
+            authMethod,
+          );
+          console.log(
+            '[WebViewProvider] Has valid cached auth in background init:',
+            hasValidAuth,
+          );
+        }
+
+        // Perform CLI detection in background
+        const cliDetection = await CliDetector.detectQwenCli();
+
+        if (!cliDetection.isInstalled) {
+          console.log(
+            '[WebViewProvider] Qwen CLI not detected in background check',
+          );
+          console.log(
+            '[WebViewProvider] CLI detection error:',
+            cliDetection.error,
+          );
+
+          // Notify webview that CLI is not installed
+          this.sendMessageToWebView({
+            type: 'cliNotInstalled',
+            data: {
+              error: cliDetection.error,
+            },
+          });
+        } else {
+          console.log(
+            '[WebViewProvider] Qwen CLI detected in background check, attempting connection...',
+          );
+          console.log('[WebViewProvider] CLI path:', cliDetection.cliPath);
+          console.log('[WebViewProvider] CLI version:', cliDetection.version);
+
+          if (hasValidAuth && !this.agentInitialized) {
+            console.log(
+              '[WebViewProvider] Found valid cached auth, attempting to restore connection in background...',
+            );
+            try {
+              // Pass the detected CLI path to ensure we use the correct installation
+              await this.agentManager.connect(
+                workingDir,
+                this.authStateManager,
+                cliDetection.cliPath,
+              );
+              console.log(
+                '[WebViewProvider] Connection restored successfully in background',
+              );
+              this.agentInitialized = true;
+
+              // Load messages from the current Qwen session
+              await this.loadCurrentSessionMessages();
+
+              // Notify webview that agent is connected
+              this.sendMessageToWebView({
+                type: 'agentConnected',
+                data: {},
+              });
+            } catch (error) {
+              console.error(
+                '[WebViewProvider] Failed to restore connection in background:',
+                error,
+              );
+              // Clear auth cache on error
+              await this.authStateManager.clearAuthState();
+
+              // Notify webview that agent connection failed
+              this.sendMessageToWebView({
+                type: 'agentConnectionError',
+                data: {
+                  message:
+                    error instanceof Error ? error.message : String(error),
+                },
+              });
+            }
+          } else if (this.agentInitialized) {
+            console.log(
+              '[WebViewProvider] Agent already initialized, no need to reconnect in background',
+            );
+          } else {
+            console.log(
+              '[WebViewProvider] No valid cached auth, skipping background connection',
+            );
+          }
+        }
+      } else {
+        console.log(
+          '[WebViewProvider] Qwen agent is disabled in settings (background)',
+        );
+      }
+    } catch (error) {
+      console.error(
+        '[WebViewProvider] Background initialization failed:',
+        error,
+      );
     }
   }
 
@@ -647,16 +723,6 @@ export class WebViewProvider {
     // Register dispose handler
     this.panelManager.registerDisposeHandler(this.disposables);
 
-    // Track last known editor state (to preserve when switching to webview)
-    let _lastEditorState: {
-      fileName: string | null;
-      filePath: string | null;
-      selection: {
-        startLine: number;
-        endLine: number;
-      } | null;
-    } | null = null;
-
     // Listen for active editor changes and notify WebView
     const editorChangeDisposable = vscode.window.onDidChangeActiveTextEditor(
       (editor) => {
@@ -678,9 +744,6 @@ export class WebViewProvider {
             endLine: selection.end.line + 1,
           };
         }
-
-        // Update last known state
-        _lastEditorState = { fileName, filePath, selection: selectionInfo };
 
         this.sendMessageToWebView({
           type: 'activeEditorChanged',
@@ -716,58 +779,11 @@ export class WebViewProvider {
 
     console.log('[WebViewProvider] Panel restored successfully');
 
-    // Smart login restore: Check if we have valid cached auth and restore connection if available
-    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-    const workingDir = workspaceFolder?.uri.fsPath || process.cwd();
-    const config = vscode.workspace.getConfiguration('qwenCode');
-    const openaiApiKey = config.get<string>('qwen.openaiApiKey', '');
-    const authMethod = openaiApiKey ? 'openai' : 'qwen-oauth';
+    // Initialize empty conversation immediately for fast UI rendering
+    await this.initializeEmptyConversation();
 
-    // Check if we have valid cached authentication
-    let hasValidAuth = false;
-    if (this.authStateManager) {
-      hasValidAuth = await this.authStateManager.hasValidAuth(
-        workingDir,
-        authMethod,
-      );
-      console.log(
-        '[WebViewProvider] Has valid cached auth on restore:',
-        hasValidAuth,
-      );
-    }
-
-    if (hasValidAuth && !this.agentInitialized) {
-      console.log(
-        '[WebViewProvider] Found valid cached auth, attempting to restore connection...',
-      );
-      try {
-        await this.initializeAgentConnection();
-        console.log('[WebViewProvider] Connection restored successfully');
-      } catch (error) {
-        console.error('[WebViewProvider] Failed to restore connection:', error);
-        // Fall back to empty conversation if restore fails
-        await this.initializeEmptyConversation();
-      }
-    } else if (this.agentInitialized) {
-      console.log(
-        '[WebViewProvider] Agent already initialized, refreshing connection...',
-      );
-      try {
-        await this.refreshConnection();
-        console.log('[WebViewProvider] Connection refreshed successfully');
-      } catch (error) {
-        console.error('[WebViewProvider] Failed to refresh connection:', error);
-        // Fall back to empty conversation if refresh fails
-        this.agentInitialized = false;
-        await this.initializeEmptyConversation();
-      }
-    } else {
-      console.log(
-        '[WebViewProvider] No valid cached auth or agent already initialized, showing empty conversation',
-      );
-      // Just initialize empty conversation for the UI
-      await this.initializeEmptyConversation();
-    }
+    // Perform background initialization without blocking UI
+    this.performBackgroundInitialization();
   }
 
   /**

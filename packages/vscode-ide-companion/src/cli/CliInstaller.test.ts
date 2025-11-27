@@ -123,23 +123,23 @@ describe('CliInstaller', () => {
 
   describe('promptInstallation', () => {
     it('should show warning message with installation options', async () => {
-      vi.mocked(vscode.window.showWarningMessage).mockResolvedValue(
-        'Install Now',
+      vi.mocked(vscode.window.showWarningMessage).mockImplementation(() =>
+        Promise.resolve({ title: 'Install Now' }),
       );
 
       await CliInstaller.promptInstallation();
 
       expect(vscode.window.showWarningMessage).toHaveBeenCalledWith(
         'Qwen Code CLI is not installed. You can browse conversation history, but cannot send new messages.',
-        'Install Now',
-        'View Documentation',
-        'Remind Me Later',
+        { title: 'Install Now' },
+        { title: 'View Documentation' },
+        { title: 'Remind Me Later' },
       );
     });
 
     it('should install CLI when user selects "Install Now"', async () => {
-      vi.mocked(vscode.window.showWarningMessage).mockResolvedValue(
-        'Install Now',
+      vi.mocked(vscode.window.showWarningMessage).mockImplementation(() =>
+        Promise.resolve({ title: 'Install Now' }),
       );
       const installSpy = vi.spyOn(CliInstaller, 'install').mockResolvedValue();
 
@@ -149,8 +149,8 @@ describe('CliInstaller', () => {
     });
 
     it('should open documentation when user selects "View Documentation"', async () => {
-      vi.mocked(vscode.window.showWarningMessage).mockResolvedValue(
-        'View Documentation',
+      vi.mocked(vscode.window.showWarningMessage).mockImplementation(() =>
+        Promise.resolve({ title: 'View Documentation' }),
       );
 
       await CliInstaller.promptInstallation();
@@ -161,8 +161,8 @@ describe('CliInstaller', () => {
     });
 
     it('should do nothing when user selects "Remind Me Later"', async () => {
-      vi.mocked(vscode.window.showWarningMessage).mockResolvedValue(
-        'Remind Me Later',
+      vi.mocked(vscode.window.showWarningMessage).mockImplementation(() =>
+        Promise.resolve({ title: 'Remind Me Later' }),
       );
 
       await CliInstaller.promptInstallation();
