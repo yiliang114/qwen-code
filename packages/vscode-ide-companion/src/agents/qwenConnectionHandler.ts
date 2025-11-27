@@ -272,6 +272,14 @@ export class QwenConnectionHandler {
           errorMessage,
         );
 
+        // If this is an authentication error, don't retry
+        if (errorMessage.includes('Authentication required')) {
+          console.log(
+            '[QwenAgentManager] Authentication required, not retrying',
+          );
+          throw new Error(`Authentication required: ${errorMessage}`);
+        }
+
         if (attempt === maxRetries) {
           throw new Error(
             `Session creation failed after ${maxRetries} attempts: ${errorMessage}`,

@@ -670,13 +670,28 @@ export class QwenAgentManager {
       );
     }
 
-    await this.connection.newSession(workingDir);
-    const newSessionId = this.connection.currentSessionId;
-    console.log(
-      '[QwenAgentManager] New session created with ID:',
-      newSessionId,
-    );
-    return newSessionId;
+    try {
+      await this.connection.newSession(workingDir);
+      const newSessionId = this.connection.currentSessionId;
+      console.log(
+        '[QwenAgentManager] New session created with ID:',
+        newSessionId,
+      );
+      return newSessionId;
+    } catch (error) {
+      const errorMessage = String(error);
+      // Check if this is an authentication error
+      if (errorMessage.includes('Authentication required')) {
+        console.log(
+          '[QwenAgentManager] Authentication required for new session, clearing auth cache',
+        );
+        // Clear auth cache since it's invalid
+        if (authStateManager) {
+          await authStateManager.clearAuthState();
+        }
+      }
+      throw error;
+    }
   }
 
   /**
