@@ -362,9 +362,36 @@ export class WebViewProvider {
           console.error('[WebViewProvider] Agent connection error:', error);
           // Clear auth cache on error (might be auth issue)
           await this.authStateManager.clearAuthState();
-          vscode.window.showWarningMessage(
+
+          // Show non-modal notification with Login button
+          const result = await vscode.window.showWarningMessage(
             `Failed to connect to Qwen CLI: ${error}\nYou can still use the chat UI, but messages won't be sent to AI.`,
+            'Login Now',
           );
+
+          if (result === 'Login Now') {
+            // Use login handler directly
+            if (this.messageHandler) {
+              // Get the login handler from the auth message handler
+              const authHandler = (this.messageHandler as any).router?.authHandler;
+              if (authHandler && typeof authHandler.handleLogin === 'function') {
+                await authHandler.handleLogin();
+              } else {
+                // Fallback to command
+                vscode.window.showInformationMessage(
+                  'Please wait while we connect to Qwen Code...',
+                );
+                await vscode.commands.executeCommand('qwenCode.login');
+              }
+            } else {
+              // Fallback to command
+              vscode.window.showInformationMessage(
+                'Please wait while we connect to Qwen Code...',
+              );
+              await vscode.commands.executeCommand('qwenCode.login');
+            }
+          }
+
           // Fallback to empty conversation
           await this.initializeEmptyConversation();
 
@@ -616,9 +643,34 @@ export class WebViewProvider {
           '[WebViewProvider] Failed to create ACP session:',
           sessionError,
         );
-        vscode.window.showWarningMessage(
+        // Show non-modal notification with Login button
+        const result = await vscode.window.showWarningMessage(
           `Failed to create ACP session: ${sessionError}. You may need to authenticate first.`,
+          'Login Now',
         );
+
+        if (result === 'Login Now') {
+          // Use login handler directly
+          if (this.messageHandler) {
+            // Get the login handler from the auth message handler
+            const authHandler = (this.messageHandler as any).router?.authHandler;
+            if (authHandler && typeof authHandler.handleLogin === 'function') {
+              await authHandler.handleLogin();
+            } else {
+              // Fallback to command
+              vscode.window.showInformationMessage(
+                'Please wait while we connect to Qwen Code...',
+              );
+              await vscode.commands.executeCommand('qwenCode.login');
+            }
+          } else {
+            // Fallback to command
+            vscode.window.showInformationMessage(
+              'Please wait while we connect to Qwen Code...',
+            );
+            await vscode.commands.executeCommand('qwenCode.login');
+          }
+        }
       }
 
       await this.initializeEmptyConversation();
@@ -865,7 +917,41 @@ export class WebViewProvider {
       console.log('[WebViewProvider] New session created successfully');
     } catch (error) {
       console.error('[WebViewProvider] Failed to create new session:', error);
-      vscode.window.showErrorMessage(`Failed to create new session: ${error}`);
+
+      // Check if this is an authentication error
+      const errorMsg = String(error);
+      if (errorMsg.includes('Authentication required') || errorMsg.includes('authenticate')) {
+        // Show non-modal notification with Login button
+        const result = await vscode.window.showWarningMessage(
+          `Failed to create new session: ${error}. You may need to authenticate first.`,
+          'Login Now',
+        );
+
+        if (result === 'Login Now') {
+          // Use login handler directly
+          if (this.messageHandler) {
+            // Get the login handler from the auth message handler
+            const authHandler = (this.messageHandler as any).router?.authHandler;
+            if (authHandler && typeof authHandler.handleLogin === 'function') {
+              await authHandler.handleLogin();
+            } else {
+              // Fallback to command
+              vscode.window.showInformationMessage(
+                'Please wait while we connect to Qwen Code...',
+              );
+              await vscode.commands.executeCommand('qwenCode.login');
+            }
+          } else {
+            // Fallback to command
+            vscode.window.showInformationMessage(
+              'Please wait while we connect to Qwen Code...',
+            );
+            await vscode.commands.executeCommand('qwenCode.login');
+          }
+        }
+      } else {
+        vscode.window.showErrorMessage(`Failed to create new session: ${error}`);
+      }
     }
   }
 

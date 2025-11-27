@@ -416,6 +416,32 @@ export class SessionMessageHandler extends BaseMessageHandler {
         '[SessionMessageHandler] Failed to create new session:',
         error,
       );
+
+      // Check if this is an authentication error
+      const errorMsg = String(error);
+      if (errorMsg.includes('Authentication required') || errorMsg.includes('authenticate')) {
+        // Show non-modal notification with Login button
+        const result = await vscode.window.showWarningMessage(
+          `Failed to create new session: ${error}. You may need to authenticate first.`,
+          'Login Now',
+        );
+
+        if (result === 'Login Now') {
+          // Use login handler directly
+          if (this.loginHandler) {
+            await this.loginHandler();
+          } else {
+            // Fallback to command
+            vscode.window.showInformationMessage(
+              'Please wait while we connect to Qwen Code...',
+            );
+            await vscode.commands.executeCommand('qwenCode.login');
+          }
+        }
+      } else {
+        vscode.window.showErrorMessage(`Failed to create new session: ${error}`);
+      }
+
       this.sendToWebView({
         type: 'error',
         data: { message: `Failed to create new session: ${error}` },
