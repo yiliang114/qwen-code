@@ -40,6 +40,7 @@ export interface AskUserQuestionParams {
   metadata?: {
     source?: string;
   };
+  answers?: Record<string, string>;
 }
 
 const askUserQuestionToolDescription = `Use this tool when you need to ask the user questions during execution. This allows you to:
@@ -129,6 +130,14 @@ const askUserQuestionToolSchemaData: FunctionDeclaration = {
         },
         additionalProperties: false,
       },
+      answers: {
+        description:
+          'Optional host-provided answers for stream-json integrations. When present, the tool will use them directly instead of opening an interactive confirmation dialog.',
+        type: 'object',
+        additionalProperties: {
+          type: 'string',
+        },
+      },
     },
     required: ['questions'],
     additionalProperties: false,
@@ -157,6 +166,12 @@ class AskUserQuestionToolInvocation extends BaseToolInvocation<
   override async shouldConfirmExecute(
     _abortSignal: AbortSignal,
   ): Promise<ToolAskUserQuestionConfirmationDetails | false> {
+    if (this.params.answers && Object.keys(this.params.answers).length > 0) {
+      this.wasAnswered = true;
+      this.userAnswers = this.params.answers;
+      return false;
+    }
+
     // Check if we're in a mode that supports user interaction
     // ACP mode (VSCode extension, etc.) uses non-interactive mode but can still collect user input
     const isAcpMode =
