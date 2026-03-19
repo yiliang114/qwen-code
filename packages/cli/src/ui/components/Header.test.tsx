@@ -81,4 +81,45 @@ describe('<Header />', () => {
     expect(lastFrame()).toContain('┌');
     expect(lastFrame()).toContain('┐');
   });
+
+  it('renders when theme gradient is empty', async () => {
+    vi.resetModules();
+    vi.doMock('../semantic-colors.js', () => ({
+      theme: {
+        text: {
+          primary: '',
+          secondary: '',
+          link: '',
+          accent: '',
+          code: '',
+        },
+        background: {
+          primary: '',
+          diff: {
+            added: '',
+            removed: '',
+          },
+        },
+        border: {
+          default: '',
+          focused: '',
+        },
+        ui: {
+          comment: '',
+          symbol: '',
+          gradient: [],
+        },
+        status: {
+          error: '',
+          success: '',
+          warning: '',
+          errorDim: '',
+          warningDim: '',
+        },
+      },
+    }));
+    const { Header: Empty } = await import('./Header.js');
+
+    expect(() => render(<Empty {...defaultProps} />)).not.toThrow();
+  });
 });

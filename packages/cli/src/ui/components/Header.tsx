@@ -99,7 +99,10 @@ export const Header: React.FC<HeaderProps> = ({
         : shortenedPath;
 
   // Use theme gradient colors if available, otherwise use text colors (excluding primary)
-  const gradientColors = theme.ui.gradient || [
+  const gradientColors =
+    theme.ui.gradient && theme.ui.gradient.length > 0
+      ? theme.ui.gradient
+      : [
     theme.text.secondary,
     theme.text.link,
     theme.text.accent,
