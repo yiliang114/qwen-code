@@ -391,6 +391,7 @@ describe('gemini.tsx main function', () => {
 
 describe('gemini.tsx main function kitty protocol', () => {
   let originalEnvNoRelaunch: string | undefined;
+  let originalOpencodeTerminal: string | undefined;
   let setRawModeSpy: MockInstance<
     (mode: boolean) => NodeJS.ReadStream & { fd: 0 }
   >;
@@ -399,6 +400,8 @@ describe('gemini.tsx main function kitty protocol', () => {
     // Set no relaunch in tests since process spawning causing issues in tests
     originalEnvNoRelaunch = process.env['QWEN_CODE_NO_RELAUNCH'];
     process.env['QWEN_CODE_NO_RELAUNCH'] = 'true';
+    originalOpencodeTerminal = process.env['OPENCODE_TERMINAL'];
+    delete process.env['OPENCODE_TERMINAL'];
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (!(process.stdin as any).setRawMode) {
@@ -423,6 +426,11 @@ describe('gemini.tsx main function kitty protocol', () => {
       process.env['QWEN_CODE_NO_RELAUNCH'] = originalEnvNoRelaunch;
     } else {
       delete process.env['QWEN_CODE_NO_RELAUNCH'];
+    }
+    if (originalOpencodeTerminal !== undefined) {
+      process.env['OPENCODE_TERMINAL'] = originalOpencodeTerminal;
+    } else {
+      delete process.env['OPENCODE_TERMINAL'];
     }
   });
 
@@ -516,6 +524,100 @@ describe('gemini.tsx main function kitty protocol', () => {
 
     expect(setRawModeSpy).toHaveBeenCalledWith(true);
     expect(detectAndEnableKittyProtocol).toHaveBeenCalledTimes(1);
+  });
+
+  it('should skip kitty protocol detection in opencode terminals', async () => {
+    process.env['OPENCODE_TERMINAL'] = '1';
+    const { detectAndEnableKittyProtocol } = await import(
+      './ui/utils/kittyProtocolDetector.js'
+    );
+    const { loadCliConfig, parseArguments } = await import(
+      './config/config.js'
+    );
+    const { loadSettings } = await import('./config/settings.js');
+    vi.mocked(loadCliConfig).mockResolvedValue({
+      isInteractive: () => true,
+      getQuestion: () => '',
+      getSandbox: () => false,
+      getDebugMode: () => false,
+      getListExtensions: () => false,
+      getMcpServers: () => ({}),
+      initialize: vi.fn(),
+      getIdeMode: () => false,
+      getExperimentalZedIntegration: () => false,
+      getScreenReader: () => false,
+      getGeminiMdFileCount: () => 0,
+      getWarnings: () => [],
+      getUsageStatisticsEnabled: () => true,
+    } as unknown as Config);
+    vi.mocked(loadSettings).mockReturnValue({
+      errors: [],
+      merged: {
+        advanced: {},
+        security: { auth: {} },
+        ui: {},
+      },
+      setValue: vi.fn(),
+      forScope: () => ({ settings: {}, originalSettings: {}, path: '' }),
+      migrationWarnings: [],
+    } as never);
+    vi.mocked(parseArguments).mockResolvedValue({
+      model: undefined,
+      sandbox: undefined,
+      sandboxImage: undefined,
+      debug: undefined,
+      prompt: undefined,
+      promptInteractive: undefined,
+      systemPrompt: undefined,
+      appendSystemPrompt: undefined,
+      query: undefined,
+      yolo: undefined,
+      approvalMode: undefined,
+      telemetry: undefined,
+      checkpointing: undefined,
+      telemetryTarget: undefined,
+      telemetryOtlpEndpoint: undefined,
+      telemetryOtlpProtocol: undefined,
+      telemetryLogPrompts: undefined,
+      telemetryOutfile: undefined,
+      allowedMcpServerNames: undefined,
+      allowedTools: undefined,
+      acp: undefined,
+      experimentalAcp: undefined,
+      extensions: undefined,
+      listExtensions: undefined,
+      openaiLogging: undefined,
+      openaiApiKey: undefined,
+      openaiBaseUrl: undefined,
+      openaiLoggingDir: undefined,
+      proxy: undefined,
+      includeDirectories: undefined,
+      tavilyApiKey: undefined,
+      googleApiKey: undefined,
+      googleSearchEngineId: undefined,
+      webSearchDefault: undefined,
+      screenReader: undefined,
+      inputFormat: undefined,
+      outputFormat: undefined,
+      includePartialMessages: undefined,
+      continue: undefined,
+      resume: undefined,
+      coreTools: undefined,
+      excludeTools: undefined,
+      authType: undefined,
+      maxSessionTurns: undefined,
+      experimentalLsp: undefined,
+      experimentalHooks: undefined,
+      channel: undefined,
+      chatRecording: undefined,
+      sessionId: undefined,
+    });
+    const count = vi.mocked(detectAndEnableKittyProtocol).mock.calls.length;
+
+    await main();
+
+    expect(setRawModeSpy).toHaveBeenCalledWith(true);
+    expect(detectAndEnableKittyProtocol).toHaveBeenCalledTimes(count);
   });
 });
 

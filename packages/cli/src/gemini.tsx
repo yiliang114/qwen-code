@@ -381,8 +381,12 @@ export async function main() {
         process.stdin.setRawMode(wasRaw);
       });
 
-      // Detect and enable Kitty keyboard protocol once at startup.
-      kittyProtocolDetectionComplete = detectAndEnableKittyProtocol();
+      // Opencode's web terminal currently leaks device-attribute probe
+      // responses into the user input stream. Skip kitty detection there.
+      if (process.env['OPENCODE_TERMINAL'] !== '1') {
+        // Detect and enable Kitty keyboard protocol once at startup.
+        kittyProtocolDetectionComplete = detectAndEnableKittyProtocol();
+      }
     }
 
     setMaxSizedBoxDebugging(isDebugMode);
