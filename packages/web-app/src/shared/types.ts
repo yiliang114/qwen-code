@@ -115,8 +115,13 @@ export interface PermissionRequest {
  * WebSocket message types
  */
 export type WSMessageType =
+  | 'connected'
   | 'join_session'
   | 'leave_session'
+  | 'create_session'
+  | 'auth'
+  | 'auth_success'
+  | 'auth_error'
   | 'user_message'
   | 'assistant_message'
   | 'tool_call'
@@ -127,7 +132,9 @@ export type WSMessageType =
   | 'permission_request'
   | 'permission_response'
   | 'cancel'
-  | 'error';
+  | 'error'
+  | 'session_created'
+  | 'joined';
 
 /**
  * WebSocket message base
@@ -142,18 +149,54 @@ export interface WSMessage {
  * API response for listing sessions
  */
 export interface SessionsListResponse {
-  sessions: Session[];
-  hasMore: boolean;
+  success: boolean;
+  data: {
+    sessions: Session[];
+    hasMore: boolean;
+  };
 }
 
 /**
  * API response for session details
  */
 export interface SessionDetailResponse {
-  id: string;
-  title: string;
-  messages: Message[];
-  lastUpdated: string;
+  success: boolean;
+  data: {
+    id: string;
+    title: string;
+    messages?: Message[];
+    lastUpdated: string;
+  };
+}
+
+/**
+ * API response for auth login
+ */
+export interface AuthLoginResponse {
+  success: boolean;
+  data: {
+    user: {
+      id: string;
+      username: string;
+    };
+    sessionId: string;
+    token: string;
+    expiresAt: string;
+  };
+}
+
+/**
+ * API response for auth me
+ */
+export interface AuthMeResponse {
+  success: boolean;
+  data: {
+    user: {
+      id: string;
+      username: string;
+      createdAt: string;
+    };
+  };
 }
 
 /**
