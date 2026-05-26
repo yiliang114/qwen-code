@@ -68,7 +68,8 @@ jobs:
       - name: 'Checkout base branch'
         uses: 'actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd' # v6.0.2
         with:
-          ref: 'main'
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
 
       - name: 'Setup Node.js'
         uses: 'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020' # v4.4.0
@@ -148,7 +149,7 @@ jobs:
 
           ADDITIONAL_INSTRUCTIONS=""
           if [ -n "${TRIGGER_BODY:-}" ]; then
-            ADDITIONAL_INSTRUCTIONS="${TRIGGER_BODY##*@qwen-code /review}"
+            ADDITIONAL_INSTRUCTIONS="${TRIGGER_BODY#*@qwen-code /review}"
           fi
 
           PROMPT="/review ${REVIEW_URL} ${REVIEW_FLAGS}
@@ -185,8 +186,8 @@ jobs:
 
       - name: 'Post fallback comment on failure'
         if: |-
-          failure() &&
-          steps.context.outputs.review_mode == 'comment'
+          (failure() || cancelled()) &&
+          steps.context.outputs.pr_number != ''
         env:
           GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
           PR_NUMBER: '${{ steps.context.outputs.pr_number }}'
@@ -194,4 +195,4 @@ jobs:
         run: |-
           gh pr comment "$PR_NUMBER" \
             --repo "$GITHUB_REPOSITORY" \
-            --body "_Qwen Code review did not complete successfully. See [workflow logs](${RUN_URL})._"
+            --body "_Qwen Code review did not complete successfully (it may have been superseded by a newer review request). See [workflow logs](${RUN_URL})._"
