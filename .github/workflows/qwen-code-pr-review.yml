@@ -176,6 +176,7 @@ jobs:
 
           QWEN_TIMEOUT=$((TIMEOUT_MINUTES - 5))
           timeout --kill-after=10s "${QWEN_TIMEOUT}m" qwen \
+            --auth-type api-key \
             --approval-mode yolo \
             "${MODEL_ARGS[@]}" \
             --prompt "$PROMPT" \
@@ -184,7 +185,7 @@ jobs:
 
       - name: 'Post fallback comment on failure'
         if: |-
-          (failure() || cancelled()) &&
+          failure() &&
           steps.context.outputs.review_mode == 'comment'
         env:
           GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
