@@ -35,6 +35,7 @@ describe('executeToolCall', () => {
 
     mockToolRegistry = {
       getTool: vi.fn(),
+      ensureTool: vi.fn(async (name: string) => mockToolRegistry.getTool(name)),
       getAllToolNames: vi.fn(),
     } as unknown as ToolRegistry;
 
@@ -47,7 +48,7 @@ describe('executeToolCall', () => {
       getDebugMode: () => false,
       getContentGeneratorConfig: () => ({
         model: 'test-model',
-        authType: 'gemini-api-key',
+        authType: 'gemini',
       }),
       getShellExecutionConfig: () => ({
         terminalWidth: 90,
@@ -59,10 +60,19 @@ describe('executeToolCall', () => {
       getTruncateToolOutputThreshold: () =>
         DEFAULT_TRUNCATE_TOOL_OUTPUT_THRESHOLD,
       getTruncateToolOutputLines: () => DEFAULT_TRUNCATE_TOOL_OUTPUT_LINES,
-      getUseSmartEdit: () => false,
       getUseModelRouter: () => false,
       getGeminiClient: () => null, // No client needed for these tests
       getChatRecordingService: () => undefined,
+      getMessageBus: vi.fn().mockReturnValue(undefined),
+      getDisableAllHooks: vi.fn().mockReturnValue(true),
+      getHookSystem: vi.fn().mockReturnValue(undefined),
+      getDebugLogger: vi.fn().mockReturnValue({
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      }),
+      isInteractive: vi.fn().mockReturnValue(false),
     } as unknown as Config;
 
     abortController = new AbortController();
@@ -95,7 +105,6 @@ describe('executeToolCall', () => {
       callId: 'call1',
       error: undefined,
       errorType: undefined,
-      outputFile: undefined,
       resultDisplay: 'Success!',
       contentLength:
         typeof toolResult.llmContent === 'string'
@@ -300,7 +309,6 @@ describe('executeToolCall', () => {
       callId: 'call6',
       error: undefined,
       errorType: undefined,
-      outputFile: undefined,
       resultDisplay: 'Image processed',
       contentLength: undefined,
       responseParts: [
@@ -309,11 +317,13 @@ describe('executeToolCall', () => {
             name: 'testTool',
             id: 'call6',
             response: {
-              output: 'Binary content of type image/png was processed.',
+              output: '',
             },
+            parts: [
+              { inlineData: { mimeType: 'image/png', data: 'base64data' } },
+            ],
           },
         },
-        imageDataPart,
       ],
     });
   });

@@ -5,20 +5,24 @@
  */
 
 import { access, cp, mkdir, readdir, writeFile } from 'node:fs/promises';
-import { join, dirname, basename } from 'node:path';
+import { join, basename } from 'node:path';
 import type { CommandModule } from 'yargs';
-import { fileURLToPath } from 'node:url';
+import { resolveBundleDir } from '@qwen-code/qwen-code-core';
 import { getErrorMessage } from '../../utils/errors.js';
+import { writeStdoutLine, writeStderrLine } from '../../utils/stdioHelpers.js';
 
 interface NewArgs {
   path: string;
   template?: string;
 }
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-const EXAMPLES_PATH = join(__dirname, 'examples');
+// Anchor the bundled extension-examples directory at the on-disk sibling of
+// `cli.js` (i.e. `dist/examples/`, populated by `prepare-package.js`). Today
+// this module is bundled into `cli.js` itself, so the `chunks/` strip in
+// `resolveBundleDir` is a no-op — but using the same helper as the other
+// asset-anchor sites means this code stays correct if esbuild later hoists
+// this module into a shared chunk.
+const EXAMPLES_PATH = join(resolveBundleDir(import.meta.url), 'examples');
 
 async function pathExists(path: string) {
   try {
@@ -52,7 +56,7 @@ async function handleNew(args: NewArgs) {
   try {
     if (args.template) {
       await copyDirectory(args.template, args.path);
-      console.log(
+      writeStdoutLine(
         `Successfully created new extension from template "${args.template}" at ${args.path}.`,
       );
     } else {
@@ -66,13 +70,13 @@ async function handleNew(args: NewArgs) {
         join(args.path, 'qwen-extension.json'),
         JSON.stringify(manifest, null, 2),
       );
-      console.log(`Successfully created new extension at ${args.path}.`);
+      writeStdoutLine(`Successfully created new extension at ${args.path}.`);
     }
-    console.log(
+    writeStdoutLine(
       `You can install this using "qwen extensions link ${args.path}" to test it out.`,
     );
   } catch (error) {
-    console.error(getErrorMessage(error));
+    writeStderrLine(getErrorMessage(error));
     throw error;
   }
 }

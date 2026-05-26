@@ -3,16 +3,21 @@ import type {
   PermissionSuggestion,
   SubagentConfig,
   SDKMcpServerConfig,
+  AuthType,
 } from './protocol.js';
+import type { SpawnInfo } from '../utils/cliPath.js';
 
-export type { PermissionMode };
+export type { PermissionMode, AuthType };
 
 export type TransportOptions = {
-  pathToQwenExecutable: string;
+  pathToQwenExecutable?: string;
+  spawnInfo?: SpawnInfo;
   cwd?: string;
   model?: string;
   permissionMode?: PermissionMode;
   env?: Record<string, string>;
+  systemPrompt?: string;
+  appendSystemPrompt?: string;
   abortController?: AbortController;
   debug?: boolean;
   stderr?: (message: string) => void;
@@ -21,9 +26,35 @@ export type TransportOptions = {
   coreTools?: string[];
   excludeTools?: string[];
   allowedTools?: string[];
-  authType?: string;
+  authType?: AuthType;
   includePartialMessages?: boolean;
+  /**
+   * Resume the most recent session for the current project.
+   * Equivalent to CLI's --continue flag.
+   * @default false
+   */
+  continue?: boolean;
+  /**
+   * Resume a specific session by its ID.
+   * Equivalent to CLI's --resume flag.
+   * When provided, takes precedence over `continue`.
+   */
+  resume?: string;
+  /**
+   * Session ID to use for this session.
+   * Passed to CLI via --session-id to ensure consistent session ID.
+   * When resume is provided, this should match the resume ID.
+   */
+  sessionId?: string;
 };
+
+export interface QuerySystemPromptPreset {
+  type: 'preset';
+  preset: 'qwen_code';
+  append?: string;
+}
+
+export type QuerySystemPrompt = string | QuerySystemPromptPreset;
 
 type ToolInput = Record<string, unknown>;
 
@@ -177,32 +208,25 @@ export interface QueryOptions {
   model?: string;
 
   /**
-   * Path to the Qwen CLI executable or runtime specification.
+   * Path to the Qwen CLI executable.
+   *
+   * If not provided, the SDK automatically uses the bundled CLI included in the package.
    *
    * Supports multiple formats:
-   * - 'qwen' -> native binary (auto-detected from PATH)
-   * - '/path/to/qwen' -> native binary (explicit path)
-   * - '/path/to/cli.js' -> Node.js bundle (default for .js files)
-   * - '/path/to/index.ts' -> TypeScript source (requires tsx)
-   * - 'bun:/path/to/cli.js' -> Force Bun runtime
-   * - 'node:/path/to/cli.js' -> Force Node.js runtime
-   * - 'tsx:/path/to/index.ts' -> Force tsx runtime
-   * - 'deno:/path/to/cli.ts' -> Force Deno runtime
+   * - Command name (no path separators): `'qwen'` -> executes from PATH
+   * - JavaScript file: `'/path/to/cli.js'` -> uses Node.js (or Bun if running under Bun)
+   * - TypeScript file: `'/path/to/index.ts'` -> uses tsx if available (silent support for dev/debug)
+   * - Native binary: `'/path/to/qwen'` -> executes directly
    *
-   * If not provided, the SDK will auto-detect the native binary in this order:
-   * 1. QWEN_CODE_CLI_PATH environment variable
-   * 2. ~/.volta/bin/qwen
-   * 3. ~/.npm-global/bin/qwen
-   * 4. /usr/local/bin/qwen
-   * 5. ~/.local/bin/qwen
-   * 6. ~/node_modules/.bin/qwen
-   * 7. ~/.yarn/bin/qwen
+   * Runtime detection:
+   * - `.js/.mjs/.cjs` files: Node.js (or Bun if running under Bun)
+   * - `.ts/.tsx` files: tsx if available, otherwise treated as native
+   * - Command names: executed directly from PATH
+   * - Other files: executed as native binaries
    *
-   * The .ts files are only supported for debugging purposes.
-   *
+   * @example '/path/to/cli.js'
    * @example 'qwen'
-   * @example '/usr/local/bin/qwen'
-   * @example 'tsx:/path/to/packages/cli/src/index.ts'
+   * @example './packages/cli/index.ts'
    */
   pathToQwenExecutable?: string;
 
@@ -213,6 +237,16 @@ export interface QueryOptions {
   env?: Record<string, string>;
 
   /**
+   * System prompt configuration for the Qwen CLI session.
+   *
+   * - `string`: fully overrides the main session system prompt
+   * - `{ type: 'preset', preset: 'qwen_code', append?: string }`:
+   *   uses Qwen Code's built-in prompt as the base and optionally appends extra
+   *   instructions for the main session
+   */
+  systemPrompt?: QuerySystemPrompt;
+
+  /**
    * Permission mode controlling how the SDK handles tool execution approval.
    *
    * - 'default': Write tools are denied unless approved via `canUseTool` callback or in `allowedTools`.
@@ -220,6 +254,10 @@ export interface QueryOptions {
    * - 'plan': Blocks all write tools, instructing AI to present a plan first.
    *   Read-only tools execute normally.
    * - 'auto-edit': Auto-approve edit tools (edit, write_file) while other tools require confirmation.
+   * - 'auto': An LLM classifier evaluates each tool call and auto-approves
+   *   safe ones / blocks risky ones. Fail-closed: classifier outages route
+   *   the call to manual approval. Best for long autonomous sessions in
+   *   trusted projects. See `docs/users/features/auto-mode.md`.
    * - 'yolo': All tools execute automatically without confirmation.
    *
    * **Priority Chain (highest to lowest):**
@@ -227,15 +265,16 @@ export interface QueryOptions {
    * 2. `permissionMode: 'plan'` - Blocks non-read-only tools (except exit_plan_mode)
    * 3. `permissionMode: 'yolo'` - Auto-approves all tools
    * 4. `allowedTools` - Auto-approves matching tools
-   * 5. `canUseTool` callback - Custom approval logic
-   * 6. Default behavior - Auto-deny in SDK mode
+   * 5. `permissionMode: 'auto'` - Classifier-mediated approval for the rest
+   * 6. `canUseTool` callback - Custom approval logic
+   * 7. Default behavior - Auto-deny in SDK mode
    *
    * @default 'default'
    * @see canUseTool For custom permission handling
    * @see allowedTools For auto-approving specific tools
    * @see excludeTools For blocking specific tools
    */
-  permissionMode?: 'default' | 'plan' | 'auto-edit' | 'yolo';
+  permissionMode?: 'default' | 'plan' | 'auto-edit' | 'auto' | 'yolo';
 
   /**
    * Custom permission handler for tool execution approval.
@@ -389,7 +428,7 @@ export interface QueryOptions {
    * Though we support 'qwen-oauth', it's not recommended to use it in the SDK.
    * Because the credentials are stored in `~/.qwen` and may need to refresh periodically.
    */
-  authType?: 'openai' | 'qwen-oauth';
+  authType?: AuthType;
 
   /**
    * Configuration for subagents that can be invoked during the session.
@@ -406,6 +445,21 @@ export interface QueryOptions {
    * @default false
    */
   includePartialMessages?: boolean;
+
+  /**
+   * Resume a previous session by providing its session ID.
+   * This is equivalent to using the `--resume` flag in the Qwen CLI.
+   * @example '123e4567-e89b-12d3-a456-426614174000'
+   */
+  resume?: string;
+
+  /**
+   * Specify a session ID for the new session.
+   * This ensures the SDK and CLI use the same session ID without resuming a previous session.
+   * Equivalent to CLI's `--session-id` flag.
+   * @example '123e4567-e89b-12d3-a456-426614174000'
+   */
+  sessionId?: string;
 
   /**
    * Timeout configuration for various SDK operations.

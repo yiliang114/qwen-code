@@ -42,15 +42,22 @@ export class McpPromptLoader implements ICommandLoader {
       const prompts = getMCPServerPrompts(this.config, serverName) || [];
       for (const prompt of prompts) {
         const commandName = `${prompt.name}`;
+        const description =
+          prompt.description || `Invoke prompt ${prompt.name}`;
         const newPromptCommand: SlashCommand = {
           name: commandName,
-          description: prompt.description || `Invoke prompt ${prompt.name}`,
+          description,
+          modelDescription: description,
           kind: CommandKind.MCP_PROMPT,
+          source: 'mcp-prompt' as const,
+          sourceLabel: `MCP: ${serverName}`,
           subCommands: [
             {
               name: 'help',
               description: 'Show help for this prompt',
+              modelDescription: 'Show help for this prompt',
               kind: CommandKind.MCP_PROMPT,
+              source: 'mcp-prompt' as const,
               action: async (): Promise<SlashCommandActionReturn> => {
                 if (!prompt.arguments || prompt.arguments.length === 0) {
                   return {

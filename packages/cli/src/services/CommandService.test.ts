@@ -139,10 +139,6 @@ describe('CommandService', () => {
     const commands = service.getCommands();
     expect(commands).toHaveLength(1);
     expect(commands).toEqual([mockCommandA]);
-    expect(console.debug).toHaveBeenCalledWith(
-      'A command loader failed:',
-      error,
-    );
   });
 
   it('getCommands should return a readonly array that cannot be mutated', async () => {
@@ -348,5 +344,60 @@ describe('CommandService', () => {
     );
     expect(deployExtension).toBeDefined();
     expect(deployExtension?.description).toBe('[gcp] Deploy to Google Cloud');
+  });
+
+  describe('disabled commands (disabledNames parameter)', () => {
+    it('should exclude commands whose names are in the disabledNames set', async () => {
+      const mockLoader = new MockCommandLoader([
+        mockCommandA,
+        mockCommandB,
+        mockCommandC,
+      ]);
+      const service = await CommandService.create(
+        [mockLoader],
+        new AbortController().signal,
+        new Set(['command-a']),
+      );
+
+      const commands = service.getCommands();
+      expect(commands).toHaveLength(2);
+      expect(commands.find((c) => c.name === 'command-a')).toBeUndefined();
+      expect(commands.find((c) => c.name === 'command-b')).toBeDefined();
+      expect(commands.find((c) => c.name === 'command-c')).toBeDefined();
+    });
+
+    it('should match disabled names case-insensitively', async () => {
+      const mockLoader = new MockCommandLoader([mockCommandA, mockCommandB]);
+      const service = await CommandService.create(
+        [mockLoader],
+        new AbortController().signal,
+        new Set(['COMMAND-A', 'Command-B']),
+      );
+
+      const commands = service.getCommands();
+      expect(commands).toHaveLength(0);
+    });
+
+    it('should not filter any commands when disabledNames is empty', async () => {
+      const mockLoader = new MockCommandLoader([mockCommandA, mockCommandB]);
+      const service = await CommandService.create(
+        [mockLoader],
+        new AbortController().signal,
+        new Set(),
+      );
+
+      expect(service.getCommands()).toHaveLength(2);
+    });
+
+    it('should not filter any commands when disabledNames is undefined', async () => {
+      const mockLoader = new MockCommandLoader([mockCommandA, mockCommandB]);
+      const service = await CommandService.create(
+        [mockLoader],
+        new AbortController().signal,
+        undefined,
+      );
+
+      expect(service.getCommands()).toHaveLength(2);
+    });
   });
 });

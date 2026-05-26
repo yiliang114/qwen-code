@@ -10,7 +10,7 @@ import {
   type Config,
   type ServerGeminiStreamEvent,
   type ToolCallRequestInfo,
-  type TaskResultDisplay,
+  type AgentResultDisplay,
 } from '@qwen-code/qwen-code-core';
 import type { Part, GenerateContentResponseUsageMetadata } from '@google/genai';
 import type {
@@ -144,7 +144,7 @@ class TestJsonOutputAdapter extends BaseJsonOutputAdapter {
 
   exposeCreateSubagentToolUseBlock(
     state: MessageState,
-    toolCall: NonNullable<TaskResultDisplay['toolCalls']>[number],
+    toolCall: NonNullable<AgentResultDisplay['toolCalls']>[number],
     parentToolUseId: string,
   ) {
     return this.createSubagentToolUseBlock(state, toolCall, parentToolUseId);
@@ -630,6 +630,67 @@ describe('BaseJsonOutputAdapter', () => {
 
       expect(state.blocks).toHaveLength(0);
     });
+
+    it('should preserve whitespace in thinking content', () => {
+      const state = adapter.exposeCreateMessageState();
+      adapter.startAssistantMessage();
+
+      adapter.exposeAppendThinking(
+        state,
+        '',
+        'The user just said "Hello"',
+        null,
+      );
+
+      expect(state.blocks).toHaveLength(1);
+      expect(state.blocks[0]).toMatchObject({
+        type: 'thinking',
+        thinking: 'The user just said "Hello"',
+      });
+      // Verify spaces are preserved
+      const block = state.blocks[0] as { thinking: string };
+      expect(block.thinking).toContain('user just');
+      expect(block.thinking).not.toContain('userjust');
+    });
+
+    it('should preserve whitespace when appending multiple thinking fragments', () => {
+      const state = adapter.exposeCreateMessageState();
+      adapter.startAssistantMessage();
+
+      // Simulate streaming thinking content in fragments
+      adapter.exposeAppendThinking(state, '', 'The user just', null);
+      adapter.exposeAppendThinking(state, '', ' said "Hello"', null);
+      adapter.exposeAppendThinking(
+        state,
+        '',
+        '. This is a simple greeting',
+        null,
+      );
+
+      expect(state.blocks).toHaveLength(1);
+      const block = state.blocks[0] as { thinking: string };
+      // Verify the complete text with all spaces preserved
+      expect(block.thinking).toBe(
+        'The user just said "Hello". This is a simple greeting',
+      );
+      // Verify specific space preservation
+      expect(block.thinking).toContain('user just ');
+      expect(block.thinking).toContain(' said');
+      expect(block.thinking).toContain('". This');
+      expect(block.thinking).not.toContain('userjust');
+      expect(block.thinking).not.toContain('justsaid');
+    });
+
+    it('should preserve leading and trailing whitespace in description', () => {
+      const state = adapter.exposeCreateMessageState();
+      adapter.startAssistantMessage();
+
+      adapter.exposeAppendThinking(state, '', '  content with spaces  ', null);
+
+      expect(state.blocks).toHaveLength(1);
+      const block = state.blocks[0] as { thinking: string };
+      expect(block.thinking).toBe('  content with spaces  ');
+    });
   });
 
   describe('appendToolUse', () => {
@@ -1025,6 +1086,26 @@ describe('BaseJsonOutputAdapter', () => {
     });
   });
 
+  describe('emitToolProgress', () => {
+    it('should be a no-op in base class (does not emit any message)', () => {
+      const request: ToolCallRequestInfo = {
+        callId: 'tool-call-1',
+        name: 'mcp__echo-test__echo',
+        args: {},
+        isClientInitiated: false,
+        prompt_id: '',
+      };
+      adapter.emitToolProgress(request, {
+        type: 'mcp_tool_progress',
+        progress: 1,
+        total: 10,
+        message: 'Echo: 1',
+      });
+
+      expect(adapter.emittedMessages).toHaveLength(0);
+    });
+  });
+
   describe('buildResultMessage', () => {
     beforeEach(() => {
       adapter.startAssistantMessage();
@@ -1163,6 +1244,70 @@ describe('BaseJsonOutputAdapter', () => {
         expect(result.result).toBe('');
       }
     });
+
+    it('includes structured_result and JSON-stringifies result when structuredResult is provided', () => {
+      const payload = { summary: 'hi', score: 42 };
+      const options: ResultOptions = {
+        isError: false,
+        durationMs: 1000,
+        apiDurationMs: 800,
+        numTurns: 1,
+        structuredResult: payload,
+      };
+
+      const result = adapter.exposeBuildResultMessage(options);
+
+      if (!result.is_error) {
+        expect(result.result).toBe(JSON.stringify(payload));
+        expect(
+          (result as unknown as { structured_result?: unknown })
+            .structured_result,
+        ).toEqual(payload);
+      }
+    });
+
+    it('omits structured_result when structuredResult is undefined (back-compat)', () => {
+      const options: ResultOptions = {
+        isError: false,
+        durationMs: 1000,
+        apiDurationMs: 800,
+        numTurns: 1,
+      };
+
+      const result = adapter.exposeBuildResultMessage(options);
+
+      expect(
+        (result as unknown as { structured_result?: unknown })
+          .structured_result,
+      ).toBeUndefined();
+    });
+
+    it('emits structured_result=null when the field is explicitly present but undefined', () => {
+      // runNonInteractive sets `structuredResult: undefined` when the
+      // model called structured_output with no args under an empty
+      // schema (`{}`). The previous `!== undefined` guard collapsed
+      // "absent" with "submitted-as-undefined", silently dropping the
+      // field and falling back to the free-text result. Track presence
+      // by key existence and normalize undefined to null so both
+      // `result` and `structured_result` render as JSON-safe values.
+      const options: ResultOptions = {
+        isError: false,
+        durationMs: 1000,
+        apiDurationMs: 800,
+        numTurns: 1,
+        structuredResult: undefined,
+      };
+
+      const result = adapter.exposeBuildResultMessage(options);
+
+      if (!result.is_error) {
+        expect(result.result).toBe('null');
+      }
+      expect(
+        (result as unknown as { structured_result?: unknown })
+          .structured_result,
+      ).toBeNull();
+    });
   });
 
   describe('startSubagentAssistantMessage', () => {
@@ -1233,7 +1378,7 @@ describe('BaseJsonOutputAdapter', () => {
     it('should process subagent tool call', () => {
       const parentToolUseId = 'parent-tool-1';
       adapter.startSubagentAssistantMessage(parentToolUseId);
-      const toolCall: NonNullable<TaskResultDisplay['toolCalls']>[number] = {
+      const toolCall: NonNullable<AgentResultDisplay['toolCalls']>[number] = {
         callId: 'tool-1',
         name: 'test_tool',
         args: { param: 'value' },
@@ -1265,7 +1410,7 @@ describe('BaseJsonOutputAdapter', () => {
       const state = adapter.exposeGetMessageState(parentToolUseId);
       adapter.exposeAppendText(state, 'Text', parentToolUseId);
 
-      const toolCall: NonNullable<TaskResultDisplay['toolCalls']>[number] = {
+      const toolCall: NonNullable<AgentResultDisplay['toolCalls']>[number] = {
         callId: 'tool-1',
         name: 'test_tool',
         args: {},
@@ -1286,7 +1431,7 @@ describe('BaseJsonOutputAdapter', () => {
     it('should create tool_use block for subagent', () => {
       const state = adapter.exposeCreateMessageState();
       adapter.startAssistantMessage();
-      const toolCall: NonNullable<TaskResultDisplay['toolCalls']>[number] = {
+      const toolCall: NonNullable<AgentResultDisplay['toolCalls']>[number] = {
         callId: 'tool-1',
         name: 'test_tool',
         args: { param: 'value' },

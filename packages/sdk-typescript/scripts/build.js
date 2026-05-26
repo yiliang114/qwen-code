@@ -50,7 +50,7 @@ await esbuild.build({
   bundle: true,
   format: 'esm',
   platform: 'node',
-  target: 'node18',
+  target: 'node22',
   outfile: join(rootDir, 'dist', 'index.mjs'),
   external: ['@modelcontextprotocol/sdk'],
   sourcemap: false,
@@ -68,7 +68,7 @@ await esbuild.build({
   bundle: true,
   format: 'cjs',
   platform: 'node',
-  target: 'node18',
+  target: 'node22',
   outfile: join(rootDir, 'dist', 'index.cjs'),
   external: ['@modelcontextprotocol/sdk'],
   sourcemap: false,
@@ -91,35 +91,3 @@ if (existsSync(licenseSource)) {
     console.warn('Could not copy LICENSE:', error.message);
   }
 }
-
-console.log('Bundling CLI into SDK package...');
-const repoRoot = join(rootDir, '..', '..');
-const rootDistDir = join(repoRoot, 'dist');
-
-if (!existsSync(rootDistDir) || !existsSync(join(rootDistDir, 'cli.js'))) {
-  console.log('Building CLI bundle...');
-  try {
-    execSync('npm run bundle', { stdio: 'inherit', cwd: repoRoot });
-  } catch (error) {
-    console.error('Failed to build CLI bundle:', error.message);
-    throw error;
-  }
-}
-
-const cliDistDir = join(rootDir, 'dist', 'cli');
-mkdirSync(cliDistDir, { recursive: true });
-
-console.log('Copying CLI bundle...');
-cpSync(join(rootDistDir, 'cli.js'), join(cliDistDir, 'cli.js'));
-
-const vendorSource = join(rootDistDir, 'vendor');
-if (existsSync(vendorSource)) {
-  cpSync(vendorSource, join(cliDistDir, 'vendor'), { recursive: true });
-}
-
-const localesSource = join(rootDistDir, 'locales');
-if (existsSync(localesSource)) {
-  cpSync(localesSource, join(cliDistDir, 'locales'), { recursive: true });
-}
-
-console.log('CLI bundle copied successfully to SDK package');

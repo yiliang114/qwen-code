@@ -4,7 +4,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { ChatRecord, TaskResultDisplay } from '@qwen-code/qwen-code-core';
+import type {
+  ChatRecord,
+  AgentResultDisplay,
+  SlashCommandRecordPayload,
+  NotificationRecordPayload,
+} from '@qwen-code/qwen-code-core';
 import type {
   Content,
   GenerateContentResponseUsageMetadata,
@@ -21,10 +26,12 @@ import { ToolCallEmitter } from './emitters/ToolCallEmitter.js';
  * have appeared during the original session.
  */
 export class HistoryReplayer {
+  private readonly ctx: SessionContext;
   private readonly messageEmitter: MessageEmitter;
   private readonly toolCallEmitter: ToolCallEmitter;
 
   constructor(ctx: SessionContext) {
+    this.ctx = ctx;
     this.messageEmitter = new MessageEmitter(ctx);
     this.toolCallEmitter = new ToolCallEmitter(ctx);
   }
@@ -44,16 +51,50 @@ export class HistoryReplayer {
    * Replays a single chat record.
    */
   private async replayRecord(record: ChatRecord): Promise<void> {
+    this.setActiveRecordId(record.uuid, record.timestamp);
     switch (record.type) {
       case 'user':
+        // Notification/cron records hold raw XML/prompt the user never
+        // typed; replay the friendly displayText so the assistant's reply
+        // has an antecedent in the ACP transcript.
+        if (record.subtype === 'notification' || record.subtype === 'cron') {
+          const displayText = (
+            record.systemPayload as NotificationRecordPayload | undefined
+          )?.displayText;
+          if (displayText) {
+            await this.messageEmitter.emitUserMessage(
+              displayText,
+              record.timestamp,
+            );
+          }
+          break;
+        }
+        if (record.subtype === 'mid_turn_user_message') {
+          const displayText = (
+            record.systemPayload as NotificationRecordPayload | undefined
+          )?.displayText;
+          if (displayText) {
+            await this.messageEmitter.emitUserMessage(
+              displayText,
+              record.timestamp,
+            );
+          } else if (record.message) {
+            await this.replayContent(record.message, 'user', record.timestamp);
+          }
+          break;
+        }
         if (record.message) {
-          await this.replayContent(record.message, 'user');
+          await this.replayContent(record.message, 'user', record.timestamp);
         }
         break;
 
       case 'assistant':
         if (record.message) {
-          await this.replayContent(record.message, 'assistant');
+          await this.replayContent(
+            record.message,
+            'assistant',
+            record.timestamp,
+          );
         }
         if (record.usageMetadata) {
           await this.replayUsageMetadata(record.usageMetadata);
@@ -64,25 +105,42 @@ export class HistoryReplayer {
         await this.replayToolResult(record);
         break;
 
+      case 'system':
+        if (record.subtype === 'slash_command') {
+          await this.replaySlashCommandResult(record);
+        }
+        // Other system subtypes (compression, telemetry, at_command) are skipped.
+        break;
+
       default:
-        // Skip system records (compression, telemetry, slash commands)
         break;
     }
+    this.setActiveRecordId(null);
   }
 
   /**
    * Replays content from a message (user or assistant).
    * Handles text parts, thought parts, and function calls.
+   *
+   * @param content - The content to replay
+   * @param role - The role (user or assistant)
+   * @param timestamp - Optional server-side timestamp from the JSONL record
    */
   private async replayContent(
     content: Content,
     role: 'user' | 'assistant',
+    timestamp?: string,
   ): Promise<void> {
     for (const part of content.parts ?? []) {
       // Text content
       if ('text' in part && part.text) {
         const isThought = (part as { thought?: boolean }).thought ?? false;
-        await this.messageEmitter.emitMessage(part.text, role, isThought);
+        await this.messageEmitter.emitMessage(
+          part.text,
+          role,
+          isThought,
+          timestamp,
+        );
       }
 
       // Function call (tool start)
@@ -95,6 +153,7 @@ export class HistoryReplayer {
           callId,
           args: part.functionCall.args as Record<string, unknown>,
           status: 'in_progress',
+          timestamp,
         });
       }
     }
@@ -134,6 +193,7 @@ export class HistoryReplayer {
       // For TodoWriteTool fallback, try to extract args from the record
       // Note: args aren't stored in tool_result records by default
       args: undefined,
+      timestamp: record.timestamp,
     });
 
     // Special handling: Task tool execution summary contains token usage
@@ -145,16 +205,16 @@ export class HistoryReplayer {
       (resultDisplay as { type?: unknown }).type === 'task_execution'
     ) {
       await this.emitTaskUsageFromResultDisplay(
-        resultDisplay as TaskResultDisplay,
+        resultDisplay as AgentResultDisplay,
       );
     }
   }
 
   /**
-   * Emits token usage from a TaskResultDisplay execution summary, if present.
+   * Emits token usage from a AgentResultDisplay execution summary, if present.
    */
   private async emitTaskUsageFromResultDisplay(
-    resultDisplay: TaskResultDisplay,
+    resultDisplay: AgentResultDisplay,
   ): Promise<void> {
     const summary = resultDisplay.executionSummary;
     if (!summary) {
@@ -186,6 +246,29 @@ export class HistoryReplayer {
   }
 
   /**
+   * Replays a slash_command system record by re-emitting its output as an
+   * agent message chunk. This allows Zed to reconstruct the correct turn
+   * structure (user → agent) on session resume without polluting model context.
+   */
+  private async replaySlashCommandResult(record: ChatRecord): Promise<void> {
+    const payload = record.systemPayload as
+      | SlashCommandRecordPayload
+      | undefined;
+    if (payload?.phase !== 'result' || !payload.outputHistoryItems?.length) {
+      return;
+    }
+    for (const item of payload.outputHistoryItems) {
+      const text = typeof item['text'] === 'string' ? item['text'] : '';
+      if (text) {
+        await this.messageEmitter.emitAgentMessage(
+          text.replace(/\n/g, '  \n'),
+          record.timestamp,
+        );
+      }
+    }
+  }
+
+  /**
    * Extracts tool name from a chat record's function response.
    */
   private extractToolNameFromRecord(record: ChatRecord): string {
@@ -198,5 +281,14 @@ export class HistoryReplayer {
       }
     }
     return '';
+  }
+
+  private setActiveRecordId(recordId: string | null, timestamp?: string): void {
+    const context = this.ctx as unknown as {
+      setActiveRecordId?: (id: string | null, timestamp?: string) => void;
+    };
+    if (typeof context.setActiveRecordId === 'function') {
+      context.setActiveRecordId(recordId, timestamp);
+    }
   }
 }

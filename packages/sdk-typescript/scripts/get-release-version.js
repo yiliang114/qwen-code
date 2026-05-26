@@ -8,29 +8,19 @@
 
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import {
+  getArgs,
+  isExpectedMissingGitHubRelease,
+  readJson,
+  validateVersion,
+} from '../../../scripts/lib/release-helpers.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const PACKAGE_NAME = '@qwen-code/sdk';
 const TAG_PREFIX = 'sdk-typescript-v';
-
-function readJson(filePath) {
-  return JSON.parse(readFileSync(filePath, 'utf-8'));
-}
-
-function getArgs() {
-  const args = {};
-  process.argv.slice(2).forEach((arg) => {
-    if (arg.startsWith('--')) {
-      const [key, value] = arg.substring(2).split('=');
-      args[key] = value === undefined ? true : value;
-    }
-  });
-  return args;
-}
 
 function getVersionFromNPM(distTag) {
   const command = `npm view ${PACKAGE_NAME} version --tag=${distTag}`;
@@ -168,19 +158,14 @@ function doesVersionExist(version) {
 
   // Check GitHub releases
   try {
-    const command = `gh release view "${TAG_PREFIX}${version}" --json tagName --jq .tagName 2>/dev/null`;
+    const command = `gh release view "${TAG_PREFIX}${version}" --json tagName --jq .tagName`;
     const output = execSync(command).toString().trim();
     if (output === `${TAG_PREFIX}${version}`) {
       console.error(`GitHub release ${TAG_PREFIX}${version} already exists.`);
       return true;
     }
   } catch (error) {
-    const isExpectedNotFound =
-      error.message.includes('release not found') ||
-      error.message.includes('Not Found') ||
-      error.message.includes('not found') ||
-      error.status === 1;
-    if (!isExpectedNotFound) {
+    if (!isExpectedMissingGitHubRelease(error)) {
       console.error(
         `Failed to check GitHub releases for conflicts: ${error.message}`,
       );
@@ -227,9 +212,20 @@ function getLatestStableReleaseTag() {
   }
 }
 
+function getNextPatchVersion() {
+  // Get latest stable version from npm and increment patch
+  const latestVersion = getVersionFromNPM('latest');
+  if (!latestVersion) {
+    // Fallback to package.json if npm fails
+    const packageJson = readJson(join(__dirname, '..', 'package.json'));
+    return packageJson.version.split('-')[0];
+  }
+  const [major, minor, patch] = latestVersion.split('.').map(Number);
+  return `${major}.${minor}.${patch + 1}`;
+}
+
 function getNightlyVersion() {
-  const packageJson = readJson(join(__dirname, '..', 'package.json'));
-  const baseVersion = packageJson.version.split('-')[0];
+  const baseVersion = getNextPatchVersion();
   const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
   const gitShortHash = execSync('git rev-parse --short HEAD').toString().trim();
   const releaseVersion = `${baseVersion}-nightly.${date}.${gitShortHash}`;
@@ -237,19 +233,6 @@ function getNightlyVersion() {
     releaseVersion,
     npmTag: 'nightly',
   };
-}
-
-function validateVersion(version, format, name) {
-  const versionRegex = {
-    'X.Y.Z': /^\d+\.\d+\.\d+$/,
-    'X.Y.Z-preview.N': /^\d+\.\d+\.\d+-preview\.\d+$/,
-  };
-
-  if (!versionRegex[format] || !versionRegex[format].test(version)) {
-    throw new Error(
-      `Invalid ${name}: ${version}. Must be in ${format} format.`,
-    );
-  }
 }
 
 function getStableVersion(args) {
@@ -281,10 +264,9 @@ function getPreviewVersion(args) {
     );
     releaseVersion = overrideVersion;
   } else {
-    // Try to get from nightly, fallback to package.json for first release
-    const { latestVersion: latestNightlyVersion } = getAndVerifyTags('nightly');
-    releaseVersion =
-      latestNightlyVersion.replace(/-nightly.*/, '') + '-preview.0';
+    // Get next patch version from npm latest and add preview suffix
+    const baseVersion = getNextPatchVersion();
+    releaseVersion = `${baseVersion}-preview.0`;
   }
 
   return {

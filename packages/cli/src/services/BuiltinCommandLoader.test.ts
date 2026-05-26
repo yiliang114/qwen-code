@@ -8,7 +8,8 @@ vi.mock('../ui/commands/aboutCommand.js', async () => {
   const { CommandKind } = await import('../ui/commands/types.js');
   return {
     aboutCommand: {
-      name: 'about',
+      name: 'status',
+      altNames: ['about'],
       description: 'About the CLI',
       kind: CommandKind.BUILT_IN,
     },
@@ -36,12 +37,33 @@ vi.mock('../ui/commands/ideCommand.js', async () => {
 vi.mock('../ui/commands/restoreCommand.js', () => ({
   restoreCommand: vi.fn(),
 }));
+vi.mock('../ui/commands/trustCommand.js', async () => {
+  const { CommandKind } = await import('../ui/commands/types.js');
+  return {
+    trustCommand: {
+      name: 'trust',
+      description: 'Trust command',
+      kind: CommandKind.BUILT_IN,
+    },
+  };
+});
 vi.mock('../ui/commands/permissionsCommand.js', async () => {
   const { CommandKind } = await import('../ui/commands/types.js');
   return {
     permissionsCommand: {
       name: 'permissions',
-      description: 'Permissions command',
+      description: 'Manage permission rules',
+      kind: CommandKind.BUILT_IN,
+    },
+  };
+});
+
+vi.mock('../ui/commands/hooksCommand.js', async () => {
+  const { CommandKind } = await import('../ui/commands/types.js');
+  return {
+    hooksCommand: {
+      name: 'hooks',
+      description: 'Hooks command',
       kind: CommandKind.BUILT_IN,
     },
   };
@@ -59,12 +81,14 @@ vi.mock('../ui/commands/bugCommand.js', () => ({ bugCommand: {} }));
 vi.mock('../ui/commands/clearCommand.js', () => ({ clearCommand: {} }));
 vi.mock('../ui/commands/compressCommand.js', () => ({ compressCommand: {} }));
 vi.mock('../ui/commands/docsCommand.js', () => ({ docsCommand: {} }));
+vi.mock('../ui/commands/exportCommand.js', () => ({ exportCommand: {} }));
 vi.mock('../ui/commands/editorCommand.js', () => ({ editorCommand: {} }));
 vi.mock('../ui/commands/extensionsCommand.js', () => ({
   extensionsCommand: {},
 }));
 vi.mock('../ui/commands/helpCommand.js', () => ({ helpCommand: {} }));
 vi.mock('../ui/commands/memoryCommand.js', () => ({ memoryCommand: {} }));
+vi.mock('../ui/commands/insightCommand.js', () => ({ insightCommand: {} }));
 vi.mock('../ui/commands/modelCommand.js', () => ({
   modelCommand: { name: 'model' },
 }));
@@ -99,6 +123,9 @@ describe('BuiltinCommandLoader', () => {
     mockConfig = {
       getFolderTrust: vi.fn().mockReturnValue(true),
       getUseModelRouter: () => false,
+      getDisableAllHooks: vi.fn().mockReturnValue(false),
+      getManagedAutoMemoryEnabled: vi.fn().mockReturnValue(true),
+      isLspEnabled: vi.fn().mockReturnValue(false),
     } as unknown as Config;
 
     restoreCommandMock.mockReturnValue({
@@ -127,8 +154,8 @@ describe('BuiltinCommandLoader', () => {
     expect(ideCmd).toBeDefined();
 
     // Other commands should still be present.
-    const aboutCmd = commands.find((c) => c.name === 'about');
-    expect(aboutCmd).toBeDefined();
+    const statusCmd = commands.find((c) => c.name === 'status');
+    expect(statusCmd).toBeDefined();
   });
 
   it('should handle a null config gracefully when calling factories', async () => {
@@ -143,9 +170,9 @@ describe('BuiltinCommandLoader', () => {
     const loader = new BuiltinCommandLoader(mockConfig);
     const commands = await loader.loadCommands(new AbortController().signal);
 
-    const aboutCmd = commands.find((c) => c.name === 'about');
-    expect(aboutCmd).toBeDefined();
-    expect(aboutCmd?.kind).toBe(CommandKind.BUILT_IN);
+    const statusCmd = commands.find((c) => c.name === 'status');
+    expect(statusCmd).toBeDefined();
+    expect(statusCmd?.kind).toBe(CommandKind.BUILT_IN);
 
     const approvalModeCmd = commands.find((c) => c.name === 'approval-mode');
     expect(approvalModeCmd).toBeDefined();
@@ -161,19 +188,19 @@ describe('BuiltinCommandLoader', () => {
     expect(modelCmd).toBeDefined();
   });
 
-  it('should include permissions command when folder trust is enabled', async () => {
+  it('should include trust command when folder trust is enabled', async () => {
     const loader = new BuiltinCommandLoader(mockConfig);
     const commands = await loader.loadCommands(new AbortController().signal);
-    const permissionsCmd = commands.find((c) => c.name === 'permissions');
-    expect(permissionsCmd).toBeDefined();
+    const trustCmd = commands.find((c) => c.name === 'trust');
+    expect(trustCmd).toBeDefined();
   });
 
-  it('should exclude permissions command when folder trust is disabled', async () => {
+  it('should exclude trust command when folder trust is disabled', async () => {
     (mockConfig.getFolderTrust as Mock).mockReturnValue(false);
     const loader = new BuiltinCommandLoader(mockConfig);
     const commands = await loader.loadCommands(new AbortController().signal);
-    const permissionsCmd = commands.find((c) => c.name === 'permissions');
-    expect(permissionsCmd).toBeUndefined();
+    const trustCmd = commands.find((c) => c.name === 'trust');
+    expect(trustCmd).toBeUndefined();
   });
 
   it('should always include modelCommand', async () => {
@@ -182,5 +209,64 @@ describe('BuiltinCommandLoader', () => {
     const modelCmd = commands.find((c) => c.name === 'model');
     expect(modelCmd).toBeDefined();
     expect(modelCmd?.name).toBe('model');
+  });
+
+  it('should include lsp command only when LSP is enabled', async () => {
+    const disabledLoader = new BuiltinCommandLoader(mockConfig);
+    const disabledCommands = await disabledLoader.loadCommands(
+      new AbortController().signal,
+    );
+    expect(disabledCommands.find((c) => c.name === 'lsp')).toBeUndefined();
+
+    (mockConfig.isLspEnabled as Mock).mockReturnValue(true);
+    const enabledLoader = new BuiltinCommandLoader(mockConfig);
+    const enabledCommands = await enabledLoader.loadCommands(
+      new AbortController().signal,
+    );
+
+    expect(enabledCommands.find((c) => c.name === 'lsp')).toBeDefined();
+  });
+
+  it('should still load all other commands when ideCommand() throws', async () => {
+    // Simulate ideCommand() failure (e.g., platform-specific process detection fails)
+    const { ideCommand: ideCommandMock } = await import(
+      '../ui/commands/ideCommand.js'
+    );
+    (ideCommandMock as Mock).mockRejectedValueOnce(
+      new Error('PowerShell not available'),
+    );
+
+    const loader = new BuiltinCommandLoader(mockConfig);
+    const commands = await loader.loadCommands(new AbortController().signal);
+
+    // IDE command should NOT be present
+    const ideCmd = commands.find((c) => c.name === 'ide');
+    expect(ideCmd).toBeUndefined();
+
+    // But all other built-in commands should still be loaded
+    const modelCmd = commands.find((c) => c.name === 'model');
+    expect(modelCmd).toBeDefined();
+
+    const statusCmd = commands.find((c) => c.name === 'status');
+    expect(statusCmd).toBeDefined();
+
+    const mcpCmd = commands.find((c) => c.name === 'mcp');
+    expect(mcpCmd).toBeDefined();
+  });
+
+  it('should always include hooks command regardless of disableAllHooks', async () => {
+    // When disableAllHooks is false
+    const loader1 = new BuiltinCommandLoader(mockConfig);
+    const commands1 = await loader1.loadCommands(new AbortController().signal);
+    const hooksCmd1 = commands1.find((c) => c.name === 'hooks');
+    expect(hooksCmd1).toBeDefined();
+
+    // When disableAllHooks is true - hooks command should still be available
+    // (it will show a disabled state page in the UI instead of hiding the command)
+    (mockConfig.getDisableAllHooks as Mock).mockReturnValue(true);
+    const loader2 = new BuiltinCommandLoader(mockConfig);
+    const commands2 = await loader2.loadCommands(new AbortController().signal);
+    const hooksCmd2 = commands2.find((c) => c.name === 'hooks');
+    expect(hooksCmd2).toBeDefined();
   });
 });
