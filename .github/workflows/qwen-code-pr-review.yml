@@ -176,7 +176,7 @@ jobs:
 
           QWEN_TIMEOUT=$((TIMEOUT_MINUTES - 5))
           timeout --kill-after=10s "${QWEN_TIMEOUT}m" qwen \
-            --auth-type api-key \
+            --auth-type openai \
             --approval-mode yolo \
             "${MODEL_ARGS[@]}" \
             --prompt "$PROMPT" \
