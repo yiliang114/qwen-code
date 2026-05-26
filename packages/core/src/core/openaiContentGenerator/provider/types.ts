@@ -1,5 +1,10 @@
 import type { GenerateContentConfig } from '@google/genai';
 import type OpenAI from 'openai';
+import type { OpenAIResponseParsingOptions } from '../responseParsingOptions.js';
+
+export type OpenAIRequestContextOverrides = {
+  splitToolMedia?: boolean;
+};
 
 // Extended types to support cache_control for DashScope
 export interface ChatCompletionContentPartTextWithCache
@@ -24,6 +29,8 @@ export interface OpenAICompatibleProvider {
     userPromptId: string,
   ): OpenAI.Chat.ChatCompletionCreateParams;
   getDefaultGenerationConfig(): GenerateContentConfig;
+  getResponseParsingOptions?(): OpenAIResponseParsingOptions;
+  getRequestContextOverrides?(): OpenAIRequestContextOverrides;
 }
 
 export type DashScopeRequestMetadata = {

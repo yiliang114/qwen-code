@@ -4,7 +4,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { AcpMeta, ModelInfo } from '../types/acpTypes.js';
+import type { ModelInfo } from '@agentclientprotocol/sdk';
+import { knownTokenLimit } from '@qwen-code/qwen-code-core';
+import type { ApprovalModeValue } from '../types/approvalModeValueTypes.js';
+
+type AcpMeta = Record<string, unknown>;
 
 const asMeta = (value: unknown): AcpMeta | null | undefined => {
   if (value === null) {
@@ -14,6 +18,15 @@ const asMeta = (value: unknown): AcpMeta | null | undefined => {
     return value as AcpMeta;
   }
   return undefined;
+};
+
+const getContextLimitFromMeta = (
+  meta: AcpMeta | null | undefined,
+): number | null | undefined => {
+  const metaLimit = meta?.['contextLimit'];
+  return typeof metaLimit === 'number' || metaLimit === null
+    ? metaLimit
+    : undefined;
 };
 
 const normalizeModelInfo = (value: unknown): ModelInfo | null => {
@@ -45,10 +58,25 @@ const normalizeModelInfo = (value: unknown): ModelInfo | null => {
 
   // Back-compat: older implementations used `contextLimit` at the top-level.
   const legacyContextLimit = obj['contextLimit'];
-  const contextLimit =
+  const legacyLimit =
     typeof legacyContextLimit === 'number' || legacyContextLimit === null
       ? legacyContextLimit
       : undefined;
+  const metaLimit = getContextLimitFromMeta(metaFromWire);
+  const derivedLimit = knownTokenLimit(modelId || name);
+
+  // Priority: legacy numeric > meta numeric > derived from known model > explicit null > undefined.
+  // An explicit `null` from the server means "limit intentionally unknown"; `undefined` means "not provided".
+  const contextLimit =
+    typeof legacyLimit === 'number'
+      ? legacyLimit
+      : typeof metaLimit === 'number'
+        ? metaLimit
+        : typeof derivedLimit === 'number'
+          ? derivedLimit
+          : legacyLimit === null || metaLimit === null
+            ? null
+            : undefined;
 
   let mergedMeta: AcpMeta | null | undefined = metaFromWire;
   if (typeof contextLimit !== 'undefined') {
@@ -66,6 +94,157 @@ const normalizeModelInfo = (value: unknown): ModelInfo | null => {
     name,
     ...(typeof description !== 'undefined' ? { description } : {}),
     ...(typeof mergedMeta !== 'undefined' ? { _meta: mergedMeta } : {}),
+  };
+};
+
+/**
+ * SessionModelState as returned from ACP session/new.
+ */
+export interface SessionModelState {
+  availableModels: ModelInfo[];
+  currentModelId: string;
+}
+
+export interface SessionModeState {
+  currentModeId?: ApprovalModeValue;
+  availableModes?: Array<{
+    id: ApprovalModeValue;
+    name: string;
+    description: string;
+  }>;
+}
+
+const APPROVAL_MODE_VALUES: ApprovalModeValue[] = [
+  'plan',
+  'default',
+  'auto-edit',
+  'auto',
+  'yolo',
+];
+
+const isApprovalModeValue = (value: unknown): value is ApprovalModeValue =>
+  typeof value === 'string' &&
+  APPROVAL_MODE_VALUES.includes(value as ApprovalModeValue);
+
+/**
+ * Extract complete model state from ACP `session/new` result.
+ *
+ * Returns both the list of available models and the current model ID.
+ */
+export const extractSessionModelState = (
+  result: unknown,
+): SessionModelState | null => {
+  if (!result || typeof result !== 'object') {
+    return null;
+  }
+
+  const obj = result as Record<string, unknown>;
+  const models = obj['models'];
+
+  // ACP draft: NewSessionResponse.models is a SessionModelState object.
+  if (models && typeof models === 'object' && !Array.isArray(models)) {
+    const state = models as Record<string, unknown>;
+    const availableModels = state['availableModels'];
+    const currentModelId = state['currentModelId'];
+
+    if (Array.isArray(availableModels)) {
+      const normalizedModels = availableModels
+        .map(normalizeModelInfo)
+        .filter((m): m is ModelInfo => Boolean(m));
+
+      const modelId =
+        typeof currentModelId === 'string' && currentModelId.length > 0
+          ? currentModelId
+          : normalizedModels[0]?.modelId || '';
+
+      return {
+        availableModels: normalizedModels,
+        currentModelId: modelId,
+      };
+    }
+  }
+
+  // Legacy: some implementations returned `models` as a raw array.
+  if (Array.isArray(models)) {
+    const normalizedModels = models
+      .map(normalizeModelInfo)
+      .filter((m): m is ModelInfo => Boolean(m));
+
+    if (normalizedModels.length > 0) {
+      return {
+        availableModels: normalizedModels,
+        currentModelId: normalizedModels[0].modelId,
+      };
+    }
+  }
+
+  return null;
+};
+
+export const extractSessionModeState = (
+  result: unknown,
+): SessionModeState | null => {
+  if (!result || typeof result !== 'object') {
+    return null;
+  }
+
+  const obj = result as Record<string, unknown>;
+  const modes = obj['modes'];
+  if (!modes || typeof modes !== 'object' || Array.isArray(modes)) {
+    return null;
+  }
+
+  const state = modes as Record<string, unknown>;
+  const currentModeRaw = state['currentModeId'];
+  const availableModesRaw = state['availableModes'];
+
+  const currentModeId = isApprovalModeValue(currentModeRaw)
+    ? currentModeRaw
+    : undefined;
+
+  let availableModes:
+    | Array<{
+        id: ApprovalModeValue;
+        name: string;
+        description: string;
+      }>
+    | undefined;
+  if (Array.isArray(availableModesRaw)) {
+    availableModes = availableModesRaw
+      .map((entry) => {
+        if (!entry || typeof entry !== 'object') {
+          return null;
+        }
+        const item = entry as Record<string, unknown>;
+        const idRaw = item['id'];
+        if (!isApprovalModeValue(idRaw)) {
+          return null;
+        }
+        return {
+          id: idRaw,
+          name: typeof item['name'] === 'string' ? item['name'] : idRaw,
+          description:
+            typeof item['description'] === 'string' ? item['description'] : '',
+        };
+      })
+      .filter(
+        (
+          item,
+        ): item is {
+          id: ApprovalModeValue;
+          name: string;
+          description: string;
+        } => Boolean(item),
+      );
+  }
+
+  if (!currentModeId && (!availableModes || availableModes.length === 0)) {
+    return null;
+  }
+
+  return {
+    ...(currentModeId ? { currentModeId } : {}),
+    ...(availableModes ? { availableModes } : {}),
   };
 };
 

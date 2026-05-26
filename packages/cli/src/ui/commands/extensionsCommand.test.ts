@@ -4,11 +4,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { GeminiCLIExtension } from '@qwen-code/qwen-code-core';
-import {
-  updateAllUpdatableExtensions,
-  updateExtension,
-} from '../../config/extensions/update.js';
 import { createMockCommandContext } from '../../test-utils/mockCommandContext.js';
 import { MessageType } from '../types.js';
 import { extensionsCommand } from './extensionsCommand.js';
@@ -21,35 +16,46 @@ import {
   beforeEach,
   type MockedFunction,
 } from 'vitest';
-import { ExtensionUpdateState } from '../state/extensions.js';
 
-vi.mock('../../config/extensions/update.js', () => ({
-  updateExtension: vi.fn(),
-  updateAllUpdatableExtensions: vi.fn(),
-  checkForAllExtensionUpdates: vi.fn(),
-}));
+import {
+  ExtensionManager,
+  parseInstallSource,
+} from '@qwen-code/qwen-code-core';
 
-const mockUpdateExtension = updateExtension as MockedFunction<
-  typeof updateExtension
->;
-
-const mockUpdateAllUpdatableExtensions =
-  updateAllUpdatableExtensions as MockedFunction<
-    typeof updateAllUpdatableExtensions
-  >;
+vi.mock('@qwen-code/qwen-code-core', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('@qwen-code/qwen-code-core')>();
+  return {
+    ...actual,
+    parseInstallSource: vi.fn(),
+  };
+});
 
 const mockGetExtensions = vi.fn();
+const mockGetLoadedExtensions = vi.fn();
+const mockInstallExtension = vi.fn();
+
+const createMockExtensionManager = () => ({
+  installExtension: mockInstallExtension,
+  getLoadedExtensions: mockGetLoadedExtensions,
+});
 
 describe('extensionsCommand', () => {
   let mockContext: CommandContext;
+  let mockExtensionManager: ReturnType<typeof createMockExtensionManager>;
 
   beforeEach(() => {
     vi.resetAllMocks();
+    mockExtensionManager = createMockExtensionManager();
+    mockGetExtensions.mockReturnValue([]);
+    mockGetLoadedExtensions.mockReturnValue([]);
     mockContext = createMockCommandContext({
       services: {
         config: {
           getExtensions: mockGetExtensions,
           getWorkingDir: () => '/test/dir',
+          getExtensionManager: () =>
+            mockExtensionManager as unknown as ExtensionManager,
         },
       },
       ui: {
@@ -58,278 +64,195 @@ describe('extensionsCommand', () => {
     });
   });
 
-  describe('list', () => {
-    it('should add an EXTENSIONS_LIST item to the UI', async () => {
+  describe('default action (manage)', () => {
+    it('should open extensions manager dialog when extensions exist', async () => {
       if (!extensionsCommand.action) throw new Error('Action not defined');
-      await extensionsCommand.action(mockContext, '');
+      mockGetExtensions.mockReturnValue([{ name: 'test-ext', isActive: true }]);
+      const result = await extensionsCommand.action(mockContext, '');
 
-      expect(mockContext.ui.addItem).toHaveBeenCalledWith(
-        {
-          type: MessageType.EXTENSIONS_LIST,
-        },
-        expect.any(Number),
-      );
+      expect(result).toEqual({
+        type: 'dialog',
+        dialog: 'extensions_manage',
+      });
+    });
+
+    it('should open extensions manager dialog when no extensions installed', async () => {
+      if (!extensionsCommand.action) throw new Error('Action not defined');
+      mockGetExtensions.mockReturnValue([]);
+      const result = await extensionsCommand.action(mockContext, '');
+
+      expect(result).toEqual({
+        type: 'dialog',
+        dialog: 'extensions_manage',
+      });
     });
   });
 
-  describe('update', () => {
-    const updateAction = extensionsCommand.subCommands?.find(
-      (cmd) => cmd.name === 'update',
+  describe('manage', () => {
+    const manageAction = extensionsCommand.subCommands?.find(
+      (cmd) => cmd.name === 'manage',
     )?.action;
 
-    if (!updateAction) {
-      throw new Error('Update action not found');
+    if (!manageAction) {
+      throw new Error('Manage action not found');
     }
 
-    it('should show usage if no args are provided', async () => {
-      await updateAction(mockContext, '');
+    it('should return dialog action for extensions manager', async () => {
+      mockGetExtensions.mockReturnValue([{ name: 'test-ext', isActive: true }]);
+      const result = await manageAction(mockContext, '');
+
+      expect(result).toEqual({
+        type: 'dialog',
+        dialog: 'extensions_manage',
+      });
+    });
+
+    it('should return dialog action even when no extensions installed', async () => {
+      mockGetExtensions.mockReturnValue([]);
+      const result = await manageAction(mockContext, '');
+
+      expect(result).toEqual({
+        type: 'dialog',
+        dialog: 'extensions_manage',
+      });
+    });
+  });
+
+  describe('install', () => {
+    const installAction = extensionsCommand.subCommands?.find(
+      (cmd) => cmd.name === 'install',
+    )?.action;
+
+    if (!installAction) {
+      throw new Error('Install action not found');
+    }
+
+    const mockParseInstallSource = parseInstallSource as MockedFunction<
+      typeof parseInstallSource
+    >;
+
+    // Create a real ExtensionManager mock that passes instanceof check
+    let realMockExtensionManager: ExtensionManager;
+
+    beforeEach(() => {
+      vi.resetAllMocks();
+      // Create a mock that inherits from ExtensionManager prototype
+      realMockExtensionManager = Object.create(ExtensionManager.prototype);
+      realMockExtensionManager.installExtension = mockInstallExtension;
+
+      mockContext = createMockCommandContext({
+        services: {
+          config: {
+            getExtensions: mockGetExtensions,
+            getWorkingDir: () => '/test/dir',
+            getExtensionManager: () => realMockExtensionManager,
+          },
+        },
+        ui: {
+          dispatchExtensionStateUpdate: vi.fn(),
+        },
+      });
+    });
+
+    it('should show usage if no source is provided', async () => {
+      await installAction(mockContext, '');
       expect(mockContext.ui.addItem).toHaveBeenCalledWith(
         {
           type: MessageType.ERROR,
-          text: 'Usage: /extensions update <extension-names>|--all',
+          text: 'Usage: /extensions install <source>',
         },
         expect.any(Number),
       );
     });
 
-    it('should inform user if there are no extensions to update with --all', async () => {
-      mockUpdateAllUpdatableExtensions.mockResolvedValue([]);
-      await updateAction(mockContext, '--all');
+    it('should install extension successfully', async () => {
+      mockParseInstallSource.mockResolvedValue({
+        type: 'git',
+        source: 'https://github.com/test/extension',
+      });
+      mockInstallExtension.mockResolvedValue({
+        name: 'test-extension',
+        version: '1.0.0',
+      });
+
+      await installAction(mockContext, 'https://github.com/test/extension');
+
       expect(mockContext.ui.addItem).toHaveBeenCalledWith(
         {
           type: MessageType.INFO,
-          text: 'No extensions to update.',
+          text: 'Installing extension from "https://github.com/test/extension"...',
         },
         expect.any(Number),
       );
+      expect(mockContext.ui.addItem).toHaveBeenCalledWith(
+        {
+          type: MessageType.INFO,
+          text: 'Extension "test-extension" installed successfully.',
+        },
+        expect.any(Number),
+      );
+      expect(mockContext.ui.reloadCommands).toHaveBeenCalled();
     });
 
-    it('should call setPendingItem and addItem in a finally block on success', async () => {
-      mockUpdateAllUpdatableExtensions.mockResolvedValue([
-        {
-          name: 'ext-one',
-          originalVersion: '1.0.0',
-          updatedVersion: '1.0.1',
-        },
-        {
-          name: 'ext-two',
-          originalVersion: '2.0.0',
-          updatedVersion: '2.0.1',
-        },
-      ]);
-      await updateAction(mockContext, '--all');
-      expect(mockContext.ui.setPendingItem).toHaveBeenCalledWith({
-        type: MessageType.EXTENSIONS_LIST,
+    it('should redact URL credentials in install progress messages', async () => {
+      mockParseInstallSource.mockResolvedValue({
+        type: 'git',
+        source: 'https://user:token@example.com/test/extension',
       });
-      expect(mockContext.ui.setPendingItem).toHaveBeenCalledWith(null);
-      expect(mockContext.ui.addItem).toHaveBeenCalledWith(
-        {
-          type: MessageType.EXTENSIONS_LIST,
-        },
-        expect.any(Number),
-      );
-    });
-
-    it('should call setPendingItem and addItem in a finally block on failure', async () => {
-      mockUpdateAllUpdatableExtensions.mockRejectedValue(
-        new Error('Something went wrong'),
-      );
-      await updateAction(mockContext, '--all');
-      expect(mockContext.ui.setPendingItem).toHaveBeenCalledWith({
-        type: MessageType.EXTENSIONS_LIST,
-      });
-      expect(mockContext.ui.setPendingItem).toHaveBeenCalledWith(null);
-      expect(mockContext.ui.addItem).toHaveBeenCalledWith(
-        {
-          type: MessageType.EXTENSIONS_LIST,
-        },
-        expect.any(Number),
-      );
-      expect(mockContext.ui.addItem).toHaveBeenCalledWith(
-        {
-          type: MessageType.ERROR,
-          text: 'Something went wrong',
-        },
-        expect.any(Number),
-      );
-    });
-
-    it('should update a single extension by name', async () => {
-      const extension: GeminiCLIExtension = {
-        name: 'ext-one',
+      mockInstallExtension.mockResolvedValue({
+        name: 'test-extension',
         version: '1.0.0',
-        isActive: true,
-        path: '/test/dir/ext-one',
-        installMetadata: {
-          type: 'git',
-          autoUpdate: false,
-          source: 'https://github.com/some/extension.git',
+      });
+
+      await installAction(
+        mockContext,
+        'https://user:token@example.com/test/extension',
+      );
+
+      expect(mockContext.ui.addItem).toHaveBeenCalledWith(
+        {
+          type: MessageType.INFO,
+          text: 'Installing extension from "https://***REDACTED***@example.com/test/extension"...',
         },
-      };
-      mockUpdateExtension.mockResolvedValue({
-        name: extension.name,
-        originalVersion: extension.version,
-        updatedVersion: '1.0.1',
-      });
-      mockGetExtensions.mockReturnValue([extension]);
-      mockContext.ui.extensionsUpdateState.set(extension.name, {
-        status: ExtensionUpdateState.UPDATE_AVAILABLE,
-        processed: false,
-      });
-      await updateAction(mockContext, 'ext-one');
-      expect(mockUpdateExtension).toHaveBeenCalledWith(
-        extension,
-        '/test/dir',
-        expect.any(Function),
-        ExtensionUpdateState.UPDATE_AVAILABLE,
-        expect.any(Function),
+        expect.any(Number),
       );
     });
 
-    it('should handle errors when updating a single extension', async () => {
-      mockUpdateExtension.mockRejectedValue(new Error('Extension not found'));
-      mockGetExtensions.mockReturnValue([]);
-      await updateAction(mockContext, 'ext-one');
+    it('should handle install errors', async () => {
+      mockParseInstallSource.mockRejectedValue(
+        new Error('Install source not found.'),
+      );
+
+      await installAction(mockContext, '/invalid/path');
+
       expect(mockContext.ui.addItem).toHaveBeenCalledWith(
         {
           type: MessageType.ERROR,
-          text: 'Extension ext-one not found.',
+          text: 'Failed to install extension from "/invalid/path": Install source not found.',
         },
         expect.any(Number),
       );
     });
 
-    it('should update multiple extensions by name', async () => {
-      const extensionOne: GeminiCLIExtension = {
-        name: 'ext-one',
-        version: '1.0.0',
-        isActive: true,
-        path: '/test/dir/ext-one',
-        installMetadata: {
-          type: 'git',
-          autoUpdate: false,
-          source: 'https://github.com/some/extension.git',
-        },
-      };
-      const extensionTwo: GeminiCLIExtension = {
-        name: 'ext-two',
-        version: '1.0.0',
-        isActive: true,
-        path: '/test/dir/ext-two',
-        installMetadata: {
-          type: 'git',
-          autoUpdate: false,
-          source: 'https://github.com/some/extension.git',
-        },
-      };
-      mockGetExtensions.mockReturnValue([extensionOne, extensionTwo]);
-      mockContext.ui.extensionsUpdateState.set(
-        extensionOne.name,
-        ExtensionUpdateState.UPDATE_AVAILABLE,
+    it('should redact URL credentials in install error messages and causes', async () => {
+      mockParseInstallSource.mockRejectedValue(
+        new Error(
+          'Install source not found: https://user:token@example.com/test/extension',
+        ),
       );
-      mockContext.ui.extensionsUpdateState.set(
-        extensionTwo.name,
-        ExtensionUpdateState.UPDATE_AVAILABLE,
+
+      await installAction(
+        mockContext,
+        'https://user:token@example.com/test/extension',
       );
-      mockUpdateExtension
-        .mockResolvedValueOnce({
-          name: 'ext-one',
-          originalVersion: '1.0.0',
-          updatedVersion: '1.0.1',
-        })
-        .mockResolvedValueOnce({
-          name: 'ext-two',
-          originalVersion: '2.0.0',
-          updatedVersion: '2.0.1',
-        });
-      await updateAction(mockContext, 'ext-one ext-two');
-      expect(mockUpdateExtension).toHaveBeenCalledTimes(2);
-      expect(mockContext.ui.setPendingItem).toHaveBeenCalledWith({
-        type: MessageType.EXTENSIONS_LIST,
-      });
-      expect(mockContext.ui.setPendingItem).toHaveBeenCalledWith(null);
+
       expect(mockContext.ui.addItem).toHaveBeenCalledWith(
         {
-          type: MessageType.EXTENSIONS_LIST,
+          type: MessageType.ERROR,
+          text: 'Failed to install extension from "https://***REDACTED***@example.com/test/extension": Install source not found: https://***REDACTED***@example.com/test/extension',
         },
         expect.any(Number),
       );
-    });
-
-    describe('completion', () => {
-      const updateCompletion = extensionsCommand.subCommands?.find(
-        (cmd) => cmd.name === 'update',
-      )?.completion;
-
-      if (!updateCompletion) {
-        throw new Error('Update completion not found');
-      }
-
-      const extensionOne: GeminiCLIExtension = {
-        name: 'ext-one',
-        version: '1.0.0',
-        isActive: true,
-        path: '/test/dir/ext-one',
-        installMetadata: {
-          type: 'git',
-          autoUpdate: false,
-          source: 'https://github.com/some/extension.git',
-        },
-      };
-      const extensionTwo: GeminiCLIExtension = {
-        name: 'another-ext',
-        version: '1.0.0',
-        isActive: true,
-        path: '/test/dir/another-ext',
-        installMetadata: {
-          type: 'git',
-          autoUpdate: false,
-          source: 'https://github.com/some/extension.git',
-        },
-      };
-      const allExt: GeminiCLIExtension = {
-        name: 'all-ext',
-        version: '1.0.0',
-        isActive: true,
-        path: '/test/dir/all-ext',
-        installMetadata: {
-          type: 'git',
-          autoUpdate: false,
-          source: 'https://github.com/some/extension.git',
-        },
-      };
-
-      it.each([
-        {
-          description: 'should return matching extension names',
-          extensions: [extensionOne, extensionTwo],
-          partialArg: 'ext',
-          expected: ['ext-one'],
-        },
-        {
-          description: 'should return --all when partialArg matches',
-          extensions: [],
-          partialArg: '--al',
-          expected: ['--all'],
-        },
-        {
-          description:
-            'should return both extension names and --all when both match',
-          extensions: [allExt],
-          partialArg: 'all',
-          expected: ['--all', 'all-ext'],
-        },
-        {
-          description: 'should return an empty array if no matches',
-          extensions: [extensionOne],
-          partialArg: 'nomatch',
-          expected: [],
-        },
-      ])('$description', async ({ extensions, partialArg, expected }) => {
-        mockGetExtensions.mockReturnValue(extensions);
-        const suggestions = await updateCompletion(mockContext, partialArg);
-        expect(suggestions).toEqual(expected);
-      });
     });
   });
 });

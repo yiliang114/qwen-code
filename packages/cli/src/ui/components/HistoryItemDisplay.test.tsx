@@ -96,7 +96,7 @@ describe('<HistoryItemDisplay />', () => {
     const { lastFrame } = renderWithProviders(
       <HistoryItemDisplay {...baseItem} item={item} />,
     );
-    expect(lastFrame()).toContain('About Qwen Code');
+    expect(lastFrame()).toContain('Status');
   });
 
   it('renders ModelStatsDisplay for "model_stats" type', () => {
@@ -283,5 +283,24 @@ describe('<HistoryItemDisplay />', () => {
     );
 
     expect(lastFrame()).toMatchSnapshot();
+  });
+
+  it('renders tool_use_summary as a dim badge line in full mode', () => {
+    const item: HistoryItem = {
+      id: 1,
+      type: 'tool_use_summary',
+      summary: 'Read txt files',
+      precedingToolUseIds: ['c1', 'c2', 'c3', 'c4'],
+    };
+    const { lastFrame } = renderWithProviders(
+      <HistoryItemDisplay
+        {...baseItem}
+        item={item}
+        isPending={false}
+        terminalWidth={80}
+      />,
+    );
+    expect(lastFrame()).toContain('Read txt files');
+    expect(lastFrame()).toContain('●');
   });
 });

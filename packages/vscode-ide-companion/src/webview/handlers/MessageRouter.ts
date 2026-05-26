@@ -4,9 +4,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import type * as vscode from 'vscode';
 import type { IMessageHandler } from './BaseMessageHandler.js';
 import type { QwenAgentManager } from '../../services/qwenAgentManager.js';
 import type { ConversationStore } from '../../services/conversationStore.js';
+import type {
+  PermissionResponseMessage,
+  AskUserQuestionResponseMessage,
+} from '../../types/webviewMessageTypes.js';
 import { SessionMessageHandler } from './SessionMessageHandler.js';
 import { FileMessageHandler } from './FileMessageHandler.js';
 import { EditorMessageHandler } from './EditorMessageHandler.js';
@@ -20,9 +25,13 @@ export class MessageRouter {
   private handlers: IMessageHandler[] = [];
   private sessionHandler: SessionMessageHandler;
   private authHandler: AuthMessageHandler;
+  private fileHandler: FileMessageHandler;
   private currentConversationId: string | null = null;
   private permissionHandler:
-    | ((message: { type: string; data: { optionId: string } }) => void)
+    | ((message: PermissionResponseMessage) => void)
+    | null = null;
+  private askUserQuestionHandler:
+    | ((message: AskUserQuestionResponseMessage) => void)
     | null = null;
 
   constructor(
@@ -39,9 +48,10 @@ export class MessageRouter {
       conversationStore,
       currentConversationId,
       sendToWebView,
+      (id) => this.setCurrentConversationId(id),
     );
 
-    const fileHandler = new FileMessageHandler(
+    this.fileHandler = new FileMessageHandler(
       agentManager,
       conversationStore,
       currentConversationId,
@@ -65,10 +75,14 @@ export class MessageRouter {
     // Register handlers in order of priority
     this.handlers = [
       this.sessionHandler,
-      fileHandler,
+      this.fileHandler,
       editorHandler,
       this.authHandler,
     ];
+  }
+
+  setupFileWatchers(): vscode.Disposable {
+    return this.fileHandler.setupFileWatchers();
   }
 
   /**
@@ -80,9 +94,15 @@ export class MessageRouter {
     // Handle permission response specially
     if (message.type === 'permissionResponse') {
       if (this.permissionHandler) {
-        this.permissionHandler(
-          message as { type: string; data: { optionId: string } },
-        );
+        this.permissionHandler(message as PermissionResponseMessage);
+      }
+      return;
+    }
+
+    // Handle ask user question response specially
+    if (message.type === 'askUserQuestionResponse') {
+      if (this.askUserQuestionHandler) {
+        this.askUserQuestionHandler(message as AskUserQuestionResponseMessage);
       }
       return;
     }
@@ -131,17 +151,37 @@ export class MessageRouter {
    * Set permission handler
    */
   setPermissionHandler(
-    handler: (message: { type: string; data: { optionId: string } }) => void,
+    handler: (message: PermissionResponseMessage) => void,
   ): void {
     this.permissionHandler = handler;
   }
 
   /**
-   * Set login handler
+   * Set ask user question handler
    */
-  setLoginHandler(handler: () => Promise<void>): void {
-    this.authHandler.setLoginHandler(handler);
-    this.sessionHandler?.setLoginHandler?.(handler);
+  setAskUserQuestionHandler(
+    handler: (message: AskUserQuestionResponseMessage) => void,
+  ): void {
+    this.askUserQuestionHandler = handler;
+  }
+
+  /**
+   * Set auth interactive handler — interactive auth flow.
+   * Also registers the handler on the session handler so
+   * "Configure" prompts in session flows trigger the interactive flow.
+   */
+  setAuthInteractiveHandler(
+    handler: (
+      config: import('@qwen-code/qwen-code-core').ProviderConfig,
+      inputs: import('@qwen-code/qwen-code-core').ProviderSetupInputs,
+    ) => Promise<void>,
+  ): void {
+    this.authHandler.setAuthInteractiveHandler(handler);
+    // SessionMessageHandler's authHandler is a simple () => Promise<void>.
+    // Wrap so "Configure" prompts trigger the full interactive auth QuickPick.
+    this.sessionHandler?.setAuthHandler?.(() =>
+      this.authHandler.handle({ type: 'auth' }),
+    );
   }
 
   /**

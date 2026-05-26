@@ -6,14 +6,29 @@
 
 import { vi, type Mock, type MockInstance } from 'vitest';
 import type { Config } from '@qwen-code/qwen-code-core';
-import { OutputFormat, FatalInputError } from '@qwen-code/qwen-code-core';
 import {
+  OutputFormat,
+  FatalInputError,
+  ToolErrorType,
+} from '@qwen-code/qwen-code-core';
+import {
+  AlreadyReportedError,
+  _resetExitLatchForTest,
   getErrorMessage,
   handleError,
   handleToolError,
   handleCancellationError,
   handleMaxTurnsExceededError,
 } from './errors.js';
+import { _resetCleanupFunctionsForTest, registerCleanup } from './cleanup.js';
+
+const mockWriteStderrLine = vi.hoisted(() => vi.fn());
+const debugLoggerSpy = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
 
 // Mock the core modules
 vi.mock('@qwen-code/qwen-code-core', async (importOriginal) => {
@@ -22,6 +37,12 @@ vi.mock('@qwen-code/qwen-code-core', async (importOriginal) => {
 
   return {
     ...original,
+    createDebugLogger: () => ({
+      debug: debugLoggerSpy.debug,
+      info: debugLoggerSpy.info,
+      warn: debugLoggerSpy.warn,
+      error: debugLoggerSpy.error,
+    }),
     parseAndFormatApiError: vi.fn((error: unknown) => {
       if (error instanceof Error) {
         return `API Error: ${error.message}`;
@@ -62,17 +83,32 @@ vi.mock('@qwen-code/qwen-code-core', async (importOriginal) => {
   };
 });
 
+vi.mock('./stdioHelpers.js', () => ({
+  writeStderrLine: mockWriteStderrLine,
+  writeStdoutLine: vi.fn(),
+  clearScreen: vi.fn(),
+}));
+
 describe('errors', () => {
   let mockConfig: Config;
   let processExitSpy: MockInstance;
-  let consoleErrorSpy: MockInstance;
+  let processStderrWriteSpy: MockInstance;
 
   beforeEach(() => {
     // Reset mocks
     vi.clearAllMocks();
+    mockWriteStderrLine.mockClear();
+    debugLoggerSpy.debug.mockClear();
+    debugLoggerSpy.info.mockClear();
+    debugLoggerSpy.warn.mockClear();
+    debugLoggerSpy.error.mockClear();
+    _resetCleanupFunctionsForTest();
+    _resetExitLatchForTest();
 
-    // Mock console.error
-    consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // Mock process.stderr.write
+    processStderrWriteSpy = vi
+      .spyOn(process.stderr, 'write')
+      .mockImplementation(() => true);
 
     // Mock process.exit to throw instead of actually exiting
     processExitSpy = vi.spyOn(process, 'exit').mockImplementation((code) => {
@@ -84,11 +120,12 @@ describe('errors', () => {
       getOutputFormat: vi.fn().mockReturnValue(OutputFormat.TEXT),
       getContentGeneratorConfig: vi.fn().mockReturnValue({ authType: 'test' }),
       getDebugMode: vi.fn().mockReturnValue(true),
+      isInteractive: vi.fn().mockReturnValue(false),
     } as unknown as Config;
   });
 
   afterEach(() => {
-    consoleErrorSpy.mockRestore();
+    processStderrWriteSpy.mockRestore();
     processExitSpy.mockRestore();
   });
 
@@ -105,8 +142,33 @@ describe('errors', () => {
       expect(getErrorMessage(undefined)).toBe('undefined');
     });
 
-    it('should handle objects', () => {
-      const obj = { message: 'test' };
+    it('should extract message from error-like objects', () => {
+      const obj = { message: 'test error message' };
+      expect(getErrorMessage(obj)).toBe('test error message');
+    });
+
+    it('should stringify plain objects without message property', () => {
+      const obj = { code: 500, details: 'internal error' };
+      expect(getErrorMessage(obj)).toBe(
+        '{"code":500,"details":"internal error"}',
+      );
+    });
+
+    it('should handle empty objects', () => {
+      expect(getErrorMessage({})).toBe('{}');
+    });
+
+    it('should handle objects with non-string message property', () => {
+      const obj = { message: 123 };
+      expect(getErrorMessage(obj)).toBe('{"message":123}');
+    });
+
+    it('should fallback to String() when toJSON returns undefined', () => {
+      const obj = {
+        toJSON() {
+          return undefined;
+        },
+      };
       expect(getErrorMessage(obj)).toBe('[object Object]');
     });
   });
@@ -119,24 +181,44 @@ describe('errors', () => {
         ).mockReturnValue(OutputFormat.TEXT);
       });
 
-      it('should log error message and re-throw', () => {
+      it('should log error message and re-throw', async () => {
         const testError = new Error('Test error');
 
-        expect(() => {
-          handleError(testError, mockConfig);
-        }).toThrow(testError);
+        await expect(handleError(testError, mockConfig)).rejects.toThrow(
+          testError,
+        );
 
-        expect(consoleErrorSpy).toHaveBeenCalledWith('API Error: Test error');
+        expect(mockWriteStderrLine).toHaveBeenCalledWith(
+          'API Error: Test error',
+        );
       });
 
-      it('should handle non-Error objects', () => {
+      it('should handle non-Error objects', async () => {
         const testError = 'String error';
 
-        expect(() => {
-          handleError(testError, mockConfig);
-        }).toThrow(testError);
+        await expect(handleError(testError, mockConfig)).rejects.toThrow(
+          testError,
+        );
 
-        expect(consoleErrorSpy).toHaveBeenCalledWith('API Error: String error');
+        expect(mockWriteStderrLine).toHaveBeenCalledWith(
+          'API Error: String error',
+        );
+      });
+
+      it('does not reformat or reprint AlreadyReportedError', async () => {
+        // The non-interactive runner formats and prints the API error
+        // itself, then throws AlreadyReportedError as a marker. handleError
+        // must propagate that throw without producing a second stderr line
+        // (the bug this fix targets) or running parseAndFormatApiError on
+        // the already-formatted message (which would yield
+        // "[API Error: [API Error: ...]]").
+        const reported = new AlreadyReportedError(
+          '[API Error: 402 Model X is not available for billing.]',
+        );
+
+        await expect(handleError(reported, mockConfig)).rejects.toBe(reported);
+
+        expect(mockWriteStderrLine).not.toHaveBeenCalled();
       });
     });
 
@@ -147,14 +229,14 @@ describe('errors', () => {
         ).mockReturnValue(OutputFormat.JSON);
       });
 
-      it('should format error as JSON and exit with default code', () => {
+      it('should format error as JSON and exit with default code', async () => {
         const testError = new Error('Test error');
 
-        expect(() => {
-          handleError(testError, mockConfig);
-        }).toThrow('process.exit called with code: 1');
+        await expect(handleError(testError, mockConfig)).rejects.toThrow(
+          'process.exit called with code: 1',
+        );
 
-        expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect(mockWriteStderrLine).toHaveBeenCalledWith(
           JSON.stringify(
             {
               error: {
@@ -169,14 +251,41 @@ describe('errors', () => {
         );
       });
 
-      it('should use custom error code when provided', () => {
+      it('does not reformat or reprint AlreadyReportedError in JSON mode', async () => {
+        const reported = new AlreadyReportedError(
+          '[API Error: 402 Model X is not available for billing.]',
+          42,
+        );
+
+        await expect(handleError(reported, mockConfig)).rejects.toThrow(
+          'process.exit called with code: 42',
+        );
+
+        expect(mockWriteStderrLine).toHaveBeenCalledTimes(1);
+        expect(mockWriteStderrLine).toHaveBeenCalledWith(
+          JSON.stringify(
+            {
+              error: {
+                type: 'AlreadyReportedError',
+                message:
+                  '[API Error: 402 Model X is not available for billing.]',
+                code: 42,
+              },
+            },
+            null,
+            2,
+          ),
+        );
+      });
+
+      it('should use custom error code when provided', async () => {
         const testError = new Error('Test error');
 
-        expect(() => {
-          handleError(testError, mockConfig, 42);
-        }).toThrow('process.exit called with code: 42');
+        await expect(handleError(testError, mockConfig, 42)).rejects.toThrow(
+          'process.exit called with code: 42',
+        );
 
-        expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect(mockWriteStderrLine).toHaveBeenCalledWith(
           JSON.stringify(
             {
               error: {
@@ -191,14 +300,14 @@ describe('errors', () => {
         );
       });
 
-      it('should extract exitCode from FatalError instances', () => {
+      it('should extract exitCode from FatalError instances', async () => {
         const fatalError = new FatalInputError('Fatal error');
 
-        expect(() => {
-          handleError(fatalError, mockConfig);
-        }).toThrow('process.exit called with code: 42');
+        await expect(handleError(fatalError, mockConfig)).rejects.toThrow(
+          'process.exit called with code: 42',
+        );
 
-        expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect(mockWriteStderrLine).toHaveBeenCalledWith(
           JSON.stringify(
             {
               error: {
@@ -213,28 +322,28 @@ describe('errors', () => {
         );
       });
 
-      it('should handle error with code property', () => {
+      it('should handle error with code property', async () => {
         const errorWithCode = new Error('Error with code') as Error & {
           code: number;
         };
         errorWithCode.code = 404;
 
-        expect(() => {
-          handleError(errorWithCode, mockConfig);
-        }).toThrow('process.exit called with code: 404');
+        await expect(handleError(errorWithCode, mockConfig)).rejects.toThrow(
+          'process.exit called with code: 404',
+        );
       });
 
-      it('should handle error with status property', () => {
+      it('should handle error with status property', async () => {
         const errorWithStatus = new Error('Error with status') as Error & {
           status: string;
         };
         errorWithStatus.status = 'TIMEOUT';
 
-        expect(() => {
-          handleError(errorWithStatus, mockConfig);
-        }).toThrow('process.exit called with code: 1'); // string codes become 1
+        await expect(handleError(errorWithStatus, mockConfig)).rejects.toThrow(
+          'process.exit called with code: 1', // string codes become 1
+        );
 
-        expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect(mockWriteStderrLine).toHaveBeenCalledWith(
           JSON.stringify(
             {
               error: {
@@ -270,7 +379,7 @@ describe('errors', () => {
         it('should log error message to stderr and not exit', () => {
           handleToolError(toolName, toolError, mockConfig);
 
-          expect(consoleErrorSpy).toHaveBeenCalledWith(
+          expect(debugLoggerSpy.error).toHaveBeenCalledWith(
             'Error executing tool test-tool: Tool failed',
           );
           expect(processExitSpy).not.toHaveBeenCalled();
@@ -285,7 +394,7 @@ describe('errors', () => {
             'Custom display message',
           );
 
-          expect(consoleErrorSpy).toHaveBeenCalledWith(
+          expect(debugLoggerSpy.error).toHaveBeenCalledWith(
             'Error executing tool test-tool: Custom display message',
           );
           expect(processExitSpy).not.toHaveBeenCalled();
@@ -303,7 +412,7 @@ describe('errors', () => {
           handleToolError(toolName, toolError, mockConfig);
 
           // In JSON mode, should not exit (just log to stderr when debug mode is on)
-          expect(consoleErrorSpy).toHaveBeenCalledWith(
+          expect(debugLoggerSpy.error).toHaveBeenCalledWith(
             'Error executing tool test-tool: Tool failed',
           );
           expect(processExitSpy).not.toHaveBeenCalled();
@@ -313,7 +422,7 @@ describe('errors', () => {
           handleToolError(toolName, toolError, mockConfig, 'CUSTOM_TOOL_ERROR');
 
           // In JSON mode, should not exit (just log to stderr when debug mode is on)
-          expect(consoleErrorSpy).toHaveBeenCalledWith(
+          expect(debugLoggerSpy.error).toHaveBeenCalledWith(
             'Error executing tool test-tool: Tool failed',
           );
           expect(processExitSpy).not.toHaveBeenCalled();
@@ -323,7 +432,7 @@ describe('errors', () => {
           handleToolError(toolName, toolError, mockConfig, 500);
 
           // In JSON mode, should not exit (just log to stderr when debug mode is on)
-          expect(consoleErrorSpy).toHaveBeenCalledWith(
+          expect(debugLoggerSpy.error).toHaveBeenCalledWith(
             'Error executing tool test-tool: Tool failed',
           );
           expect(processExitSpy).not.toHaveBeenCalled();
@@ -339,7 +448,7 @@ describe('errors', () => {
           );
 
           // In JSON mode, should not exit (just log to stderr when debug mode is on)
-          expect(consoleErrorSpy).toHaveBeenCalledWith(
+          expect(debugLoggerSpy.error).toHaveBeenCalledWith(
             'Error executing tool test-tool: Display message',
           );
           expect(processExitSpy).not.toHaveBeenCalled();
@@ -357,7 +466,7 @@ describe('errors', () => {
           handleToolError(toolName, toolError, mockConfig);
 
           // Should not exit in STREAM_JSON mode (just log to stderr when debug mode is on)
-          expect(consoleErrorSpy).toHaveBeenCalledWith(
+          expect(debugLoggerSpy.error).toHaveBeenCalledWith(
             'Error executing tool test-tool: Tool failed',
           );
           expect(processExitSpy).not.toHaveBeenCalled();
@@ -370,36 +479,42 @@ describe('errors', () => {
         (mockConfig.getDebugMode as Mock).mockReturnValue(false);
       });
 
-      it('should not log and not exit in text mode', () => {
+      it('should log error and not exit in text mode', () => {
         (
           mockConfig.getOutputFormat as ReturnType<typeof vi.fn>
         ).mockReturnValue(OutputFormat.TEXT);
 
         handleToolError(toolName, toolError, mockConfig);
 
-        expect(consoleErrorSpy).not.toHaveBeenCalled();
+        expect(debugLoggerSpy.error).toHaveBeenCalledWith(
+          'Error executing tool test-tool: Tool failed',
+        );
         expect(processExitSpy).not.toHaveBeenCalled();
       });
 
-      it('should not log and not exit in JSON mode', () => {
+      it('should log error and not exit in JSON mode', () => {
         (
           mockConfig.getOutputFormat as ReturnType<typeof vi.fn>
         ).mockReturnValue(OutputFormat.JSON);
 
         handleToolError(toolName, toolError, mockConfig);
 
-        expect(consoleErrorSpy).not.toHaveBeenCalled();
+        expect(debugLoggerSpy.error).toHaveBeenCalledWith(
+          'Error executing tool test-tool: Tool failed',
+        );
         expect(processExitSpy).not.toHaveBeenCalled();
       });
 
-      it('should not log and not exit in STREAM_JSON mode', () => {
+      it('should log error and not exit in STREAM_JSON mode', () => {
         (
           mockConfig.getOutputFormat as ReturnType<typeof vi.fn>
         ).mockReturnValue(OutputFormat.STREAM_JSON);
 
         handleToolError(toolName, toolError, mockConfig);
 
-        expect(consoleErrorSpy).not.toHaveBeenCalled();
+        expect(debugLoggerSpy.error).toHaveBeenCalledWith(
+          'Error executing tool test-tool: Tool failed',
+        );
         expect(processExitSpy).not.toHaveBeenCalled();
       });
     });
@@ -432,6 +547,87 @@ describe('errors', () => {
         expect(processExitSpy).not.toHaveBeenCalled();
       });
     });
+
+    describe('permission denied warnings', () => {
+      it('should show warning when EXECUTION_DENIED in non-interactive text mode', () => {
+        (mockConfig.getDebugMode as Mock).mockReturnValue(false);
+        (mockConfig.isInteractive as Mock).mockReturnValue(false);
+        (
+          mockConfig.getOutputFormat as ReturnType<typeof vi.fn>
+        ).mockReturnValue(OutputFormat.TEXT);
+
+        handleToolError(
+          toolName,
+          toolError,
+          mockConfig,
+          ToolErrorType.EXECUTION_DENIED,
+        );
+
+        expect(processStderrWriteSpy).toHaveBeenCalledWith(
+          expect.stringContaining(
+            'Warning: Tool "test-tool" requires user approval',
+          ),
+        );
+        expect(processStderrWriteSpy).toHaveBeenCalledWith(
+          expect.stringContaining('use the -y flag (YOLO mode)'),
+        );
+        expect(processExitSpy).not.toHaveBeenCalled();
+      });
+
+      it('should not show warning when EXECUTION_DENIED in interactive mode', () => {
+        (mockConfig.getDebugMode as Mock).mockReturnValue(false);
+        (mockConfig.isInteractive as Mock).mockReturnValue(true);
+        (
+          mockConfig.getOutputFormat as ReturnType<typeof vi.fn>
+        ).mockReturnValue(OutputFormat.TEXT);
+
+        handleToolError(
+          toolName,
+          toolError,
+          mockConfig,
+          ToolErrorType.EXECUTION_DENIED,
+        );
+
+        expect(processStderrWriteSpy).not.toHaveBeenCalled();
+        expect(processExitSpy).not.toHaveBeenCalled();
+      });
+
+      it('should not show warning when EXECUTION_DENIED in JSON mode', () => {
+        (mockConfig.getDebugMode as Mock).mockReturnValue(false);
+        (mockConfig.isInteractive as Mock).mockReturnValue(false);
+        (
+          mockConfig.getOutputFormat as ReturnType<typeof vi.fn>
+        ).mockReturnValue(OutputFormat.JSON);
+
+        handleToolError(
+          toolName,
+          toolError,
+          mockConfig,
+          ToolErrorType.EXECUTION_DENIED,
+        );
+
+        expect(processStderrWriteSpy).not.toHaveBeenCalled();
+        expect(processExitSpy).not.toHaveBeenCalled();
+      });
+
+      it('should not show warning for non-EXECUTION_DENIED errors', () => {
+        (mockConfig.getDebugMode as Mock).mockReturnValue(false);
+        (mockConfig.isInteractive as Mock).mockReturnValue(false);
+        (
+          mockConfig.getOutputFormat as ReturnType<typeof vi.fn>
+        ).mockReturnValue(OutputFormat.TEXT);
+
+        handleToolError(
+          toolName,
+          toolError,
+          mockConfig,
+          ToolErrorType.FILE_NOT_FOUND,
+        );
+
+        expect(processStderrWriteSpy).not.toHaveBeenCalled();
+        expect(processExitSpy).not.toHaveBeenCalled();
+      });
+    });
   });
 
   describe('handleCancellationError', () => {
@@ -442,12 +638,14 @@ describe('errors', () => {
         ).mockReturnValue(OutputFormat.TEXT);
       });
 
-      it('should log cancellation message and exit with 130', () => {
-        expect(() => {
-          handleCancellationError(mockConfig);
-        }).toThrow('process.exit called with code: 130');
+      it('should log cancellation message and exit with 130', async () => {
+        await expect(handleCancellationError(mockConfig)).rejects.toThrow(
+          'process.exit called with code: 130',
+        );
 
-        expect(consoleErrorSpy).toHaveBeenCalledWith('Operation cancelled.');
+        expect(mockWriteStderrLine).toHaveBeenCalledWith(
+          'Operation cancelled.',
+        );
       });
     });
 
@@ -458,12 +656,12 @@ describe('errors', () => {
         ).mockReturnValue(OutputFormat.JSON);
       });
 
-      it('should format cancellation as JSON and exit with 130', () => {
-        expect(() => {
-          handleCancellationError(mockConfig);
-        }).toThrow('process.exit called with code: 130');
+      it('should format cancellation as JSON and exit with 130', async () => {
+        await expect(handleCancellationError(mockConfig)).rejects.toThrow(
+          'process.exit called with code: 130',
+        );
 
-        expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect(mockWriteStderrLine).toHaveBeenCalledWith(
           JSON.stringify(
             {
               error: {
@@ -488,12 +686,12 @@ describe('errors', () => {
         ).mockReturnValue(OutputFormat.TEXT);
       });
 
-      it('should log max turns message and exit with 53', () => {
-        expect(() => {
-          handleMaxTurnsExceededError(mockConfig);
-        }).toThrow('process.exit called with code: 53');
+      it('should log max turns message and exit with 53', async () => {
+        await expect(handleMaxTurnsExceededError(mockConfig)).rejects.toThrow(
+          'process.exit called with code: 53',
+        );
 
-        expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect(mockWriteStderrLine).toHaveBeenCalledWith(
           'Reached max session turns for this session. Increase the number of turns by specifying maxSessionTurns in settings.json.',
         );
       });
@@ -506,12 +704,12 @@ describe('errors', () => {
         ).mockReturnValue(OutputFormat.JSON);
       });
 
-      it('should format max turns error as JSON and exit with 53', () => {
-        expect(() => {
-          handleMaxTurnsExceededError(mockConfig);
-        }).toThrow('process.exit called with code: 53');
+      it('should format max turns error as JSON and exit with 53', async () => {
+        await expect(handleMaxTurnsExceededError(mockConfig)).rejects.toThrow(
+          'process.exit called with code: 53',
+        );
 
-        expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect(mockWriteStderrLine).toHaveBeenCalledWith(
           JSON.stringify(
             {
               error: {
@@ -526,6 +724,168 @@ describe('errors', () => {
           ),
         );
       });
+    });
+
+    describe('with --json-schema active', () => {
+      // When the structured-output run hits maxSessionTurns the generic
+      // "increase maxSessionTurns" message can be misleading: the real
+      // cause is usually that structured_output never got called (denied
+      // by permissions, unsatisfiable schema, prompt didn't instruct the
+      // model). Append a contextual hint so users debugging a stuck
+      // --json-schema run know where to look.
+      beforeEach(() => {
+        (mockConfig as unknown as { getJsonSchema: Mock }).getJsonSchema = vi
+          .fn()
+          .mockReturnValue({ type: 'object' });
+      });
+
+      it('appends a json-schema-specific hint in text mode', async () => {
+        (
+          mockConfig.getOutputFormat as ReturnType<typeof vi.fn>
+        ).mockReturnValue(OutputFormat.TEXT);
+
+        await expect(handleMaxTurnsExceededError(mockConfig)).rejects.toThrow(
+          'process.exit called with code: 53',
+        );
+
+        const written = mockWriteStderrLine.mock.calls[0]?.[0] as string;
+        expect(written).toMatch(/Reached max session turns for this session\./);
+        expect(written).toMatch(/--json-schema is active/);
+        expect(written).toMatch(/permissions\.deny.*--exclude-tools/);
+      });
+
+      it('appends a json-schema-specific hint inside the JSON error message', async () => {
+        (
+          mockConfig.getOutputFormat as ReturnType<typeof vi.fn>
+        ).mockReturnValue(OutputFormat.JSON);
+
+        await expect(handleMaxTurnsExceededError(mockConfig)).rejects.toThrow(
+          'process.exit called with code: 53',
+        );
+
+        const written = mockWriteStderrLine.mock.calls[0]?.[0] as string;
+        const parsed = JSON.parse(written) as {
+          error: { type: string; message: string; code: number };
+        };
+        expect(parsed.error.type).toBe('FatalTurnLimitedError');
+        expect(parsed.error.code).toBe(53);
+        expect(parsed.error.message).toMatch(/--json-schema is active/);
+      });
+    });
+  });
+
+  describe('cleanup-before-exit invariant', () => {
+    // Regression: previously these handlers called process.exit synchronously,
+    // bypassing the caller's runExitCleanup → flush() chain on SIGINT, max-
+    // turn, and fatal-error paths. Same family as the EPIPE/process.exit
+    // bug fixed for stdout in nonInteractiveCli.
+    it('handleCancellationError drains registered cleanups before exit', async () => {
+      const cleanupOrder: string[] = [];
+      registerCleanup(() => {
+        cleanupOrder.push('cleanup');
+      });
+      processExitSpy.mockImplementation((code) => {
+        cleanupOrder.push(`exit:${code}`);
+        throw new Error(`process.exit called with code: ${code}`);
+      });
+
+      await expect(handleCancellationError(mockConfig)).rejects.toThrow(
+        'process.exit called with code: 130',
+      );
+
+      expect(cleanupOrder).toEqual(['cleanup', 'exit:130']);
+    });
+
+    it('handleMaxTurnsExceededError drains registered cleanups before exit', async () => {
+      const cleanupOrder: string[] = [];
+      registerCleanup(() => {
+        cleanupOrder.push('cleanup');
+      });
+      processExitSpy.mockImplementation((code) => {
+        cleanupOrder.push(`exit:${code}`);
+        throw new Error(`process.exit called with code: ${code}`);
+      });
+
+      await expect(handleMaxTurnsExceededError(mockConfig)).rejects.toThrow(
+        'process.exit called with code: 53',
+      );
+
+      expect(cleanupOrder).toEqual(['cleanup', 'exit:53']);
+    });
+
+    it('handleError drains registered cleanups before exit (JSON mode)', async () => {
+      (mockConfig.getOutputFormat as ReturnType<typeof vi.fn>).mockReturnValue(
+        OutputFormat.JSON,
+      );
+      const cleanupOrder: string[] = [];
+      registerCleanup(() => {
+        cleanupOrder.push('cleanup');
+      });
+      processExitSpy.mockImplementation((code) => {
+        cleanupOrder.push(`exit:${code}`);
+        throw new Error(`process.exit called with code: ${code}`);
+      });
+
+      await expect(handleError(new Error('boom'), mockConfig)).rejects.toThrow(
+        'process.exit called with code: 1',
+      );
+
+      expect(cleanupOrder).toEqual(['cleanup', 'exit:1']);
+    });
+
+    it('a second terminating handler does not race the first into double-exit', async () => {
+      // Models the real concurrency: SIGINT → handleCancellationError fires
+      // while a stream rejection lands in the catch → handleError(JSON).
+      // Without the exit-once latch we'd get duplicate cleanup runs +
+      // duplicate process.exit calls + interleaved stderr writes.
+      // (Text-mode handleError throws instead of exiting, so it isn't part
+      // of the race — the latch lives on the exit path.)
+      (mockConfig.getOutputFormat as ReturnType<typeof vi.fn>).mockReturnValue(
+        OutputFormat.JSON,
+      );
+
+      let exitCalls = 0;
+      processExitSpy.mockImplementation((code) => {
+        exitCalls += 1;
+        throw new Error(`process.exit called with code: ${code}`);
+      });
+
+      const first = handleCancellationError(mockConfig);
+      const second = handleError(new Error('boom'), mockConfig);
+
+      await expect(first).rejects.toThrow('process.exit called with code: 130');
+
+      // The second handler is parked in the latch's unresolved promise.
+      let secondSettled = false;
+      void second.then(
+        () => {
+          secondSettled = true;
+        },
+        () => {
+          secondSettled = true;
+        },
+      );
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(exitCalls).toBe(1);
+      expect(secondSettled).toBe(false);
+    });
+
+    it('handleError drains registered cleanups before re-throw (text mode)', async () => {
+      // Text mode re-throws to the caller; we still want the queue drained
+      // first so the unhandled-rejection path doesn't lose records.
+      (mockConfig.getOutputFormat as ReturnType<typeof vi.fn>).mockReturnValue(
+        OutputFormat.TEXT,
+      );
+      const events: string[] = [];
+      registerCleanup(() => {
+        events.push('cleanup');
+      });
+
+      const original = new Error('boom');
+      await expect(handleError(original, mockConfig)).rejects.toBe(original);
+
+      expect(events).toEqual(['cleanup']);
     });
   });
 });

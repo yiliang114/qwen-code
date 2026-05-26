@@ -12,13 +12,16 @@ export default {
   },
   'integration-vscode': 'Visual Studio Code',
   'integration-zed': 'Zed IDE',
-  'integration-github-action': 'Github Actions',
+  'integration-jetbrains': 'JetBrains IDEs',
+  'integration-github-action': 'GitHub Actions',
+  'qwen-serve': 'Daemon mode (qwen serve)',
   'Code with Qwen Code': {
     type: 'separator',
     title: 'Code with Qwen Code', // Title is optional
   },
   features: 'Features',
   configuration: 'Configuration',
+  extension: 'Extension',
   reference: 'Reference',
   support: 'Support',
   // need refine

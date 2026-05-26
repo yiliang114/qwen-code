@@ -16,6 +16,7 @@ import type {
   CLIControlRequest,
   CLIControlResponse,
   ControlCancelRequest,
+  CLIControlInitializeRequest,
 } from '../../src/types/protocol.js';
 import { ControlRequestType } from '../../src/types/protocol.js';
 import { AbortError } from '../../src/types/errors.js';
@@ -261,6 +262,20 @@ function createControlCancel(requestId: string): ControlCancelRequest {
   };
 }
 
+async function respondToInitialize(
+  transport: MockTransport,
+  query: Query,
+): Promise<void> {
+  await vi.waitFor(() => {
+    expect(transport.writtenMessages.length).toBeGreaterThan(0);
+  });
+  const initRequest = transport.getLastWrittenMessage() as CLIControlRequest;
+  transport.simulateMessage(
+    createControlResponse(initRequest.request_id, true, {}),
+  );
+  await query.initialized;
+}
+
 describe('Query', () => {
   let transport: MockTransport;
 
@@ -295,6 +310,30 @@ describe('Query', () => {
       expect(initRequest.type).toBe('control_request');
       expect(initRequest.request.subtype).toBe('initialize');
 
+      await respondToInitialize(transport, query);
+      await query.close();
+    });
+
+    it('should include canUseTool timeout in initialize request', async () => {
+      const query = new Query(transport, {
+        cwd: '/test',
+        timeout: {
+          canUseTool: 120_000,
+        },
+      });
+
+      await vi.waitFor(() => {
+        expect(transport.writtenMessages.length).toBeGreaterThan(0);
+      });
+
+      const initRequest =
+        transport.getLastWrittenMessage() as CLIControlRequest;
+      expect(initRequest.request.subtype).toBe('initialize');
+      expect(
+        (initRequest.request as CLIControlInitializeRequest).timeout,
+      ).toEqual({ canUseTool: 120_000 });
+
+      await respondToInitialize(transport, query);
       await query.close();
     });
 
@@ -307,9 +346,24 @@ describe('Query', () => {
 
       expect(query1.getSessionId()).not.toBe(query2.getSessionId());
 
+      await respondToInitialize(transport, query1);
+      await respondToInitialize(transport2, query2);
       await query1.close();
       await query2.close();
       await transport2.close();
+    });
+
+    it('should use resume parameter as session ID if provided', async () => {
+      const resumeId = '123e4567-e89b-12d3-a456-426614174000';
+      const query = new Query(transport, {
+        cwd: '/test',
+        resume: resumeId,
+      });
+
+      expect(query.getSessionId()).toBe(resumeId);
+
+      await respondToInitialize(transport, query);
+      await query.close();
     });
 
     it('should handle initialization errors', async () => {
@@ -338,6 +392,8 @@ describe('Query', () => {
     it('should route user messages to output stream', async () => {
       const query = new Query(transport, { cwd: '/test' });
 
+      await respondToInitialize(transport, query);
+
       const userMsg = createUserMessage('Hello');
       transport.simulateMessage(userMsg);
 
@@ -350,6 +406,8 @@ describe('Query', () => {
 
     it('should route assistant messages to output stream', async () => {
       const query = new Query(transport, { cwd: '/test' });
+
+      await respondToInitialize(transport, query);
 
       const assistantMsg = createAssistantMessage('Response');
       transport.simulateMessage(assistantMsg);
@@ -364,6 +422,8 @@ describe('Query', () => {
     it('should route system messages to output stream', async () => {
       const query = new Query(transport, { cwd: '/test' });
 
+      await respondToInitialize(transport, query);
+
       const systemMsg = createSystemMessage('session_start');
       transport.simulateMessage(systemMsg);
 
@@ -376,6 +436,8 @@ describe('Query', () => {
 
     it('should route result messages to output stream', async () => {
       const query = new Query(transport, { cwd: '/test' });
+
+      await respondToInitialize(transport, query);
 
       const resultMsg = createResultMessage(true);
       transport.simulateMessage(resultMsg);
@@ -390,6 +452,8 @@ describe('Query', () => {
     it('should route partial assistant messages to output stream', async () => {
       const query = new Query(transport, { cwd: '/test' });
 
+      await respondToInitialize(transport, query);
+
       const partialMsg = createPartialMessage();
       transport.simulateMessage(partialMsg);
 
@@ -403,6 +467,8 @@ describe('Query', () => {
     it('should handle unknown message types', async () => {
       const query = new Query(transport, { cwd: '/test' });
 
+      await respondToInitialize(transport, query);
+
       const unknownMsg = { type: 'unknown', data: 'test' };
       transport.simulateMessage(unknownMsg);
 
@@ -415,6 +481,8 @@ describe('Query', () => {
 
     it('should yield messages in order', async () => {
       const query = new Query(transport, { cwd: '/test' });
+
+      await respondToInitialize(transport, query);
 
       const msg1 = createUserMessage('First');
       const msg2 = createAssistantMessage('Second');
@@ -445,6 +513,8 @@ describe('Query', () => {
         canUseTool,
       });
 
+      await respondToInitialize(transport, query);
+
       const controlReq = createControlRequest('can_use_tool');
       transport.simulateMessage(controlReq);
 
@@ -468,6 +538,8 @@ describe('Query', () => {
         cwd: '/test',
         canUseTool,
       });
+
+      await respondToInitialize(transport, query);
 
       const controlReq = createControlRequest('can_use_tool', 'perm-req-1');
       transport.simulateMessage(controlReq);
@@ -495,6 +567,8 @@ describe('Query', () => {
         canUseTool,
       });
 
+      await respondToInitialize(transport, query);
+
       const controlReq = createControlRequest('can_use_tool', 'perm-req-2');
       transport.simulateMessage(controlReq);
 
@@ -518,6 +592,8 @@ describe('Query', () => {
       const query = new Query(transport, {
         cwd: '/test',
       });
+
+      await respondToInitialize(transport, query);
 
       const controlReq = createControlRequest('can_use_tool', 'perm-req-3');
       transport.simulateMessage(controlReq);
@@ -554,6 +630,8 @@ describe('Query', () => {
         },
       });
 
+      await respondToInitialize(transport, query);
+
       const controlReq = createControlRequest('can_use_tool', 'perm-req-4');
       transport.simulateMessage(controlReq);
 
@@ -582,6 +660,8 @@ describe('Query', () => {
         cwd: '/test',
         canUseTool,
       });
+
+      await respondToInitialize(transport, query);
 
       const controlReq = createControlRequest('can_use_tool', 'perm-req-5');
       transport.simulateMessage(controlReq);
@@ -613,6 +693,8 @@ describe('Query', () => {
         canUseTool,
       });
 
+      await respondToInitialize(transport, query);
+
       const controlReq = createControlRequest('can_use_tool', 'perm-req-6');
       transport.simulateMessage(controlReq);
 
@@ -643,6 +725,8 @@ describe('Query', () => {
         cwd: '/test',
         canUseTool,
       });
+
+      await respondToInitialize(transport, query);
 
       const controlReq = createControlRequest('can_use_tool', 'perm-req-7');
       transport.simulateMessage(controlReq);
@@ -684,6 +768,8 @@ describe('Query', () => {
         canUseTool,
       });
 
+      await respondToInitialize(transport, query);
+
       const controlReq = createControlRequest('can_use_tool', 'cancel-req-1');
       transport.simulateMessage(controlReq);
 
@@ -703,6 +789,8 @@ describe('Query', () => {
         cwd: '/test',
       });
 
+      await respondToInitialize(transport, query);
+
       // Send cancel for non-existent request
       transport.simulateMessage(createControlCancel('unknown-req'));
 
@@ -717,24 +805,16 @@ describe('Query', () => {
     it('should support streamInput() for follow-up messages', async () => {
       const query = new Query(transport, { cwd: '/test' });
 
-      // Respond to initialize
-      await vi.waitFor(() => {
-        expect(transport.writtenMessages.length).toBeGreaterThan(0);
-      });
-      const initRequest =
-        transport.getLastWrittenMessage() as CLIControlRequest;
-      transport.simulateMessage(
-        createControlResponse(initRequest.request_id, true, {}),
-      );
-
-      await query.initialized;
+      await respondToInitialize(transport, query);
 
       async function* messageGenerator() {
         yield createUserMessage('Follow-up 1');
         yield createUserMessage('Follow-up 2');
       }
 
-      await query.streamInput(messageGenerator());
+      const streamPromise = query.streamInput(messageGenerator());
+      transport.simulateMessage(createResultMessage(true));
+      await streamPromise;
 
       const messages = transport.getAllWrittenMessages();
       const userMessages = messages.filter(
@@ -753,24 +833,16 @@ describe('Query', () => {
       const query = new Query(transport, { cwd: '/test' });
       const sessionId = query.getSessionId();
 
-      // Respond to initialize
-      await vi.waitFor(() => {
-        expect(transport.writtenMessages.length).toBeGreaterThan(0);
-      });
-      const initRequest =
-        transport.getLastWrittenMessage() as CLIControlRequest;
-      transport.simulateMessage(
-        createControlResponse(initRequest.request_id, true, {}),
-      );
-
-      await query.initialized;
+      await respondToInitialize(transport, query);
 
       async function* messageGenerator() {
         yield createUserMessage('Turn 1', sessionId);
         yield createUserMessage('Turn 2', sessionId);
       }
 
-      await query.streamInput(messageGenerator());
+      const streamPromise = query.streamInput(messageGenerator());
+      transport.simulateMessage(createResultMessage(true));
+      await streamPromise;
 
       const messages = transport.getAllWrittenMessages();
       const userMessages = messages.filter(
@@ -790,6 +862,7 @@ describe('Query', () => {
 
     it('should throw if streamInput() called on closed query', async () => {
       const query = new Query(transport, { cwd: '/test' });
+      await respondToInitialize(transport, query);
       await query.close();
 
       async function* messageGenerator() {
@@ -808,17 +881,7 @@ describe('Query', () => {
         abortController,
       });
 
-      // Respond to initialize
-      await vi.waitFor(() => {
-        expect(transport.writtenMessages.length).toBeGreaterThan(0);
-      });
-      const initRequest =
-        transport.getLastWrittenMessage() as CLIControlRequest;
-      transport.simulateMessage(
-        createControlResponse(initRequest.request_id, true, {}),
-      );
-
-      await query.initialized;
+      await respondToInitialize(transport, query);
 
       async function* messageGenerator() {
         yield createUserMessage('Message 1');
@@ -826,7 +889,9 @@ describe('Query', () => {
         yield createUserMessage('Message 2'); // Should not be sent
       }
 
-      await query.streamInput(messageGenerator());
+      const streamPromise = query.streamInput(messageGenerator());
+      transport.simulateMessage(createResultMessage(true));
+      await streamPromise;
 
       await query.close();
     });
@@ -835,6 +900,8 @@ describe('Query', () => {
   describe('Lifecycle Management', () => {
     it('should close transport on close()', async () => {
       const query = new Query(transport, { cwd: '/test' });
+
+      await respondToInitialize(transport, query);
       await query.close();
 
       expect(transport.closed).toBe(true);
@@ -842,6 +909,7 @@ describe('Query', () => {
 
     it('should mark query as closed', async () => {
       const query = new Query(transport, { cwd: '/test' });
+      await respondToInitialize(transport, query);
       expect(query.isClosed()).toBe(false);
 
       await query.close();
@@ -850,6 +918,8 @@ describe('Query', () => {
 
     it('should complete output stream on close()', async () => {
       const query = new Query(transport, { cwd: '/test' });
+
+      await respondToInitialize(transport, query);
 
       const iterationPromise = (async () => {
         const messages: SDKMessage[] = [];
@@ -869,6 +939,8 @@ describe('Query', () => {
     it('should be idempotent when closing multiple times', async () => {
       const query = new Query(transport, { cwd: '/test' });
 
+      await respondToInitialize(transport, query);
+
       await query.close();
       await query.close();
       await query.close();
@@ -882,6 +954,8 @@ describe('Query', () => {
         cwd: '/test',
         abortController,
       });
+
+      await respondToInitialize(transport, query);
 
       abortController.abort();
 
@@ -909,6 +983,8 @@ describe('Query', () => {
     it('should support for await loop', async () => {
       const query = new Query(transport, { cwd: '/test' });
 
+      await respondToInitialize(transport, query);
+
       const messages: SDKMessage[] = [];
       const iterationPromise = (async () => {
         for await (const msg of query) {
@@ -930,6 +1006,8 @@ describe('Query', () => {
 
     it('should complete iteration when query closes', async () => {
       const query = new Query(transport, { cwd: '/test' });
+
+      await respondToInitialize(transport, query);
 
       const messages: SDKMessage[] = [];
       const iterationPromise = (async () => {
@@ -953,6 +1031,8 @@ describe('Query', () => {
     it('should propagate transport errors', async () => {
       const query = new Query(transport, { cwd: '/test' });
 
+      await respondToInitialize(transport, query);
+
       const iterationPromise = (async () => {
         for await (const msg of query) {
           void msg;
@@ -971,17 +1051,7 @@ describe('Query', () => {
     it('should provide interrupt() method', async () => {
       const query = new Query(transport, { cwd: '/test' });
 
-      // Respond to initialize
-      await vi.waitFor(() => {
-        expect(transport.writtenMessages.length).toBeGreaterThan(0);
-      });
-      const initRequest =
-        transport.getLastWrittenMessage() as CLIControlRequest;
-      transport.simulateMessage(
-        createControlResponse(initRequest.request_id, true, {}),
-      );
-
-      await query.initialized;
+      await respondToInitialize(transport, query);
 
       const interruptPromise = query.interrupt();
 
@@ -1011,17 +1081,7 @@ describe('Query', () => {
     it('should provide setPermissionMode() method', async () => {
       const query = new Query(transport, { cwd: '/test' });
 
-      // Respond to initialize
-      await vi.waitFor(() => {
-        expect(transport.writtenMessages.length).toBeGreaterThan(0);
-      });
-      const initRequest =
-        transport.getLastWrittenMessage() as CLIControlRequest;
-      transport.simulateMessage(
-        createControlResponse(initRequest.request_id, true, {}),
-      );
-
-      await query.initialized;
+      await respondToInitialize(transport, query);
 
       const setModePromise = query.setPermissionMode('yolo');
 
@@ -1051,17 +1111,7 @@ describe('Query', () => {
     it('should provide setModel() method', async () => {
       const query = new Query(transport, { cwd: '/test' });
 
-      // Respond to initialize
-      await vi.waitFor(() => {
-        expect(transport.writtenMessages.length).toBeGreaterThan(0);
-      });
-      const initRequest =
-        transport.getLastWrittenMessage() as CLIControlRequest;
-      transport.simulateMessage(
-        createControlResponse(initRequest.request_id, true, {}),
-      );
-
-      await query.initialized;
+      await respondToInitialize(transport, query);
 
       const setModelPromise = query.setModel('new-model');
 
@@ -1091,17 +1141,7 @@ describe('Query', () => {
     it('should provide supportedCommands() method', async () => {
       const query = new Query(transport, { cwd: '/test' });
 
-      // Respond to initialize
-      await vi.waitFor(() => {
-        expect(transport.writtenMessages.length).toBeGreaterThan(0);
-      });
-      const initRequest =
-        transport.getLastWrittenMessage() as CLIControlRequest;
-      transport.simulateMessage(
-        createControlResponse(initRequest.request_id, true, {}),
-      );
-
-      await query.initialized;
+      await respondToInitialize(transport, query);
 
       const commandsPromise = query.supportedCommands();
 
@@ -1135,17 +1175,7 @@ describe('Query', () => {
     it('should provide mcpServerStatus() method', async () => {
       const query = new Query(transport, { cwd: '/test' });
 
-      // Respond to initialize
-      await vi.waitFor(() => {
-        expect(transport.writtenMessages.length).toBeGreaterThan(0);
-      });
-      const initRequest =
-        transport.getLastWrittenMessage() as CLIControlRequest;
-      transport.simulateMessage(
-        createControlResponse(initRequest.request_id, true, {}),
-      );
-
-      await query.initialized;
+      await respondToInitialize(transport, query);
 
       const statusPromise = query.mcpServerStatus();
 
@@ -1178,8 +1208,71 @@ describe('Query', () => {
       await query.close();
     });
 
+    it('should provide getContextUsage() method', async () => {
+      const query = new Query(transport, { cwd: '/test' });
+
+      await respondToInitialize(transport, query);
+
+      const usagePromise = query.getContextUsage(true);
+
+      await vi.waitFor(() => {
+        const messages = transport.getAllWrittenMessages();
+        const usageMsg = findControlRequest(
+          messages,
+          ControlRequestType.GET_CONTEXT_USAGE,
+        );
+        expect(usageMsg).toBeDefined();
+      });
+
+      // Respond with context usage data
+      const messages = transport.getAllWrittenMessages();
+      const usageMsg = findControlRequest(
+        messages,
+        ControlRequestType.GET_CONTEXT_USAGE,
+      )!;
+
+      expect((usageMsg.request as Record<string, unknown>).show_details).toBe(
+        true,
+      );
+
+      transport.simulateMessage(
+        createControlResponse(usageMsg.request_id, true, {
+          subtype: 'get_context_usage',
+          modelName: 'test-model',
+          totalTokens: 50000,
+          contextWindowSize: 200000,
+          breakdown: {
+            systemPrompt: 5000,
+            builtinTools: 10000,
+            mcpTools: 0,
+            memoryFiles: 2000,
+            skills: 3000,
+            messages: 25000,
+            freeSpace: 145000,
+            autocompactBuffer: 10000,
+          },
+          builtinTools: [{ name: 'Read', tokens: 500 }],
+          mcpTools: [],
+          memoryFiles: [],
+          skills: [],
+          showDetails: true,
+        }),
+      );
+
+      const result = await usagePromise;
+      expect(result).toMatchObject({
+        modelName: 'test-model',
+        totalTokens: 50000,
+        contextWindowSize: 200000,
+        showDetails: true,
+      });
+
+      await query.close();
+    });
+
     it('should throw if methods called on closed query', async () => {
       const query = new Query(transport, { cwd: '/test' });
+      await respondToInitialize(transport, query);
       await query.close();
 
       await expect(query.interrupt()).rejects.toThrow('Query is closed');
@@ -1191,12 +1284,15 @@ describe('Query', () => {
         'Query is closed',
       );
       await expect(query.mcpServerStatus()).rejects.toThrow('Query is closed');
+      await expect(query.getContextUsage()).rejects.toThrow('Query is closed');
     });
   });
 
   describe('Error Handling', () => {
     it('should propagate transport errors to stream', async () => {
       const query = new Query(transport, { cwd: '/test' });
+
+      await respondToInitialize(transport, query);
 
       const error = new Error('Transport failure');
       transport.simulateError(error);
@@ -1214,17 +1310,7 @@ describe('Query', () => {
         },
       });
 
-      // Respond to initialize
-      await vi.waitFor(() => {
-        expect(transport.writtenMessages.length).toBeGreaterThan(0);
-      });
-      const initRequest =
-        transport.getLastWrittenMessage() as CLIControlRequest;
-      transport.simulateMessage(
-        createControlResponse(initRequest.request_id, true, {}),
-      );
-
-      await query.initialized;
+      await respondToInitialize(transport, query);
 
       // Call interrupt but don't respond - should timeout
       const interruptPromise = query.interrupt();
@@ -1237,17 +1323,7 @@ describe('Query', () => {
     it('should handle malformed control responses', async () => {
       const query = new Query(transport, { cwd: '/test' });
 
-      // Respond to initialize
-      await vi.waitFor(() => {
-        expect(transport.writtenMessages.length).toBeGreaterThan(0);
-      });
-      const initRequest =
-        transport.getLastWrittenMessage() as CLIControlRequest;
-      transport.simulateMessage(
-        createControlResponse(initRequest.request_id, true, {}),
-      );
-
-      await query.initialized;
+      await respondToInitialize(transport, query);
 
       const interruptPromise = query.interrupt();
 
@@ -1284,6 +1360,8 @@ describe('Query', () => {
     it('should handle CLI sending error result message', async () => {
       const query = new Query(transport, { cwd: '/test' });
 
+      await respondToInitialize(transport, query);
+
       const errorResult = createResultMessage(false);
       transport.simulateMessage(errorResult);
 
@@ -1303,6 +1381,8 @@ describe('Query', () => {
         true, // singleTurn = true
       );
 
+      await respondToInitialize(transport, query);
+
       const resultMsg = createResultMessage(true);
       transport.simulateMessage(resultMsg);
 
@@ -1320,6 +1400,8 @@ describe('Query', () => {
         false, // singleTurn = false
       );
 
+      await respondToInitialize(transport, query);
+
       const resultMsg = createResultMessage(true);
       transport.simulateMessage(resultMsg);
 
@@ -1332,19 +1414,23 @@ describe('Query', () => {
   });
 
   describe('State Management', () => {
-    it('should track session ID', () => {
+    it('should track session ID', async () => {
       const query = new Query(transport, { cwd: '/test' });
       const sessionId = query.getSessionId();
 
       expect(sessionId).toBeTruthy();
       expect(typeof sessionId).toBe('string');
       expect(sessionId.length).toBeGreaterThan(0);
+
+      await respondToInitialize(transport, query);
+      await query.close();
     });
 
     it('should track closed state', async () => {
       const query = new Query(transport, { cwd: '/test' });
 
       expect(query.isClosed()).toBe(false);
+      await respondToInitialize(transport, query);
       await query.close();
       expect(query.isClosed()).toBe(true);
     });
@@ -1352,17 +1438,7 @@ describe('Query', () => {
     it('should provide endInput() method', async () => {
       const query = new Query(transport, { cwd: '/test' });
 
-      // Respond to initialize
-      await vi.waitFor(() => {
-        expect(transport.writtenMessages.length).toBeGreaterThan(0);
-      });
-      const initRequest =
-        transport.getLastWrittenMessage() as CLIControlRequest;
-      transport.simulateMessage(
-        createControlResponse(initRequest.request_id, true, {}),
-      );
-
-      await query.initialized;
+      await respondToInitialize(transport, query);
 
       query.endInput();
       expect(transport.endInputCalled).toBe(true);
@@ -1372,6 +1448,7 @@ describe('Query', () => {
 
     it('should throw if endInput() called on closed query', async () => {
       const query = new Query(transport, { cwd: '/test' });
+      await respondToInitialize(transport, query);
       await query.close();
 
       expect(() => query.endInput()).toThrow('Query is closed');
@@ -1381,6 +1458,8 @@ describe('Query', () => {
   describe('Edge Cases', () => {
     it('should handle empty message stream', async () => {
       const query = new Query(transport, { cwd: '/test' });
+
+      await respondToInitialize(transport, query);
 
       transport.simulateClose();
 
@@ -1392,6 +1471,8 @@ describe('Query', () => {
 
     it('should handle rapid message flow', async () => {
       const query = new Query(transport, { cwd: '/test' });
+
+      await respondToInitialize(transport, query);
 
       // Simulate rapid messages
       for (let i = 0; i < 100; i++) {
@@ -1413,6 +1494,8 @@ describe('Query', () => {
 
     it('should handle close during message iteration', async () => {
       const query = new Query(transport, { cwd: '/test' });
+
+      await respondToInitialize(transport, query);
 
       const iterationPromise = (async () => {
         const messages: SDKMessage[] = [];

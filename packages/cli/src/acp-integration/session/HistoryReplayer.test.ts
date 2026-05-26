@@ -37,6 +37,8 @@ describe('HistoryReplayer', () => {
     replayer = new HistoryReplayer(mockContext);
   });
 
+  const toEpochMs = (ts: string) => new Date(ts).getTime();
+
   const createUserRecord = (text: string): ChatRecord => ({
     uuid: 'user-uuid',
     parentUuid: null,
@@ -127,13 +129,15 @@ describe('HistoryReplayer', () => {
 
   describe('user message replay', () => {
     it('should emit user_message_chunk for user records', async () => {
-      const records = [createUserRecord('Hello, world!')];
+      const record = createUserRecord('Hello, world!');
+      const records = [record];
 
       await replayer.replay(records);
 
       expect(sendUpdateSpy).toHaveBeenCalledWith({
         sessionUpdate: 'user_message_chunk',
         content: { type: 'text', text: 'Hello, world!' },
+        _meta: { timestamp: toEpochMs(record.timestamp) },
       });
     });
 
@@ -147,28 +151,50 @@ describe('HistoryReplayer', () => {
 
       expect(sendUpdateSpy).not.toHaveBeenCalled();
     });
+
+    it('should replay mid-turn user messages using display text', async () => {
+      const record: ChatRecord = {
+        ...createUserRecord(
+          '\n[User message received during tool execution]: save logs',
+        ),
+        subtype: 'mid_turn_user_message',
+        systemPayload: { displayText: 'save logs' },
+      };
+
+      await replayer.replay([record]);
+
+      expect(sendUpdateSpy).toHaveBeenCalledWith({
+        sessionUpdate: 'user_message_chunk',
+        content: { type: 'text', text: 'save logs' },
+        _meta: { timestamp: toEpochMs(record.timestamp) },
+      });
+    });
   });
 
   describe('assistant message replay', () => {
     it('should emit agent_message_chunk for assistant records', async () => {
-      const records = [createAssistantRecord('I can help with that.')];
+      const record = createAssistantRecord('I can help with that.');
+      const records = [record];
 
       await replayer.replay(records);
 
       expect(sendUpdateSpy).toHaveBeenCalledWith({
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'I can help with that.' },
+        _meta: { timestamp: toEpochMs(record.timestamp) },
       });
     });
 
     it('should emit agent_thought_chunk for thought parts', async () => {
-      const records = [createAssistantRecord('Thinking about this...', true)];
+      const record = createAssistantRecord('Thinking about this...', true);
+      const records = [record];
 
       await replayer.replay(records);
 
       expect(sendUpdateSpy).toHaveBeenCalledWith({
         sessionUpdate: 'agent_thought_chunk',
         content: { type: 'text', text: 'Thinking about this...' },
+        _meta: { timestamp: toEpochMs(record.timestamp) },
       });
     });
 
@@ -191,14 +217,17 @@ describe('HistoryReplayer', () => {
       expect(sendUpdateSpy.mock.calls[0][0]).toEqual({
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'First part' },
+        _meta: { timestamp: toEpochMs(record.timestamp) },
       });
       expect(sendUpdateSpy.mock.calls[1][0]).toEqual({
         sessionUpdate: 'agent_thought_chunk',
         content: { type: 'text', text: 'Second part' },
+        _meta: { timestamp: toEpochMs(record.timestamp) },
       });
       expect(sendUpdateSpy.mock.calls[2][0]).toEqual({
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'Third part' },
+        _meta: { timestamp: toEpochMs(record.timestamp) },
       });
     });
   });
@@ -228,6 +257,10 @@ describe('HistoryReplayer', () => {
           status: 'in_progress',
           title: 'read_file',
           rawInput: { path: '/test.ts' },
+          _meta: {
+            toolName: 'read_file',
+            timestamp: toEpochMs(record.timestamp),
+          },
         }),
       );
     });
@@ -261,9 +294,8 @@ describe('HistoryReplayer', () => {
 
   describe('tool result replay', () => {
     it('should emit tool_call_update for tool result records', async () => {
-      const records = [
-        createToolResultRecord('read_file', 'File contents here'),
-      ];
+      const record = createToolResultRecord('read_file', 'File contents here');
+      const records = [record];
 
       await replayer.replay(records);
 
@@ -280,6 +312,10 @@ describe('HistoryReplayer', () => {
         ],
         // resultDisplay is included as rawOutput
         rawOutput: 'File contents here',
+        _meta: {
+          toolName: 'read_file',
+          timestamp: toEpochMs(record.timestamp),
+        },
       });
     });
 
@@ -439,17 +475,18 @@ describe('HistoryReplayer', () => {
       expect(sendUpdateSpy).toHaveBeenNthCalledWith(1, {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'Hello!' },
+        _meta: { timestamp: toEpochMs(record.timestamp) },
       });
       expect(sendUpdateSpy).toHaveBeenNthCalledWith(2, {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: '' },
         _meta: {
           usage: {
-            promptTokens: 100,
-            completionTokens: 50,
-            thoughtsTokens: undefined,
+            inputTokens: 100,
+            outputTokens: 50,
             totalTokens: 150,
-            cachedTokens: undefined,
+            thoughtTokens: undefined,
+            cachedReadTokens: undefined,
           },
         },
       });

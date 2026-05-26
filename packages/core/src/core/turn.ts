@@ -4,14 +4,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type {
-  Part,
-  PartListUnion,
-  GenerateContentResponse,
-  FunctionCall,
-  FunctionDeclaration,
+import {
   FinishReason,
-  GenerateContentResponseUsageMetadata,
+  type Part,
+  type PartListUnion,
+  type GenerateContentResponse,
+  type FunctionCall,
+  type FunctionDeclaration,
+  type GenerateContentResponseUsageMetadata,
 } from '@google/genai';
 import type {
   ToolCallConfirmationDetails,
@@ -27,11 +27,14 @@ import {
   toFriendlyError,
 } from '../utils/errors.js';
 import type { GeminiChat } from './geminiChat.js';
+import type { RetryInfo } from '../utils/rateLimit.js';
 import {
   getThoughtText,
   parseThought,
   type ThoughtSummary,
 } from '../utils/thoughtUtils.js';
+import type { LoopType } from '../telemetry/types.js';
+import type { ActiveGoal } from '../goals/activeGoalStore.js';
 
 // Define a structure for tools passed to the server
 export interface ServerTool {
@@ -42,10 +45,6 @@ export interface ServerTool {
     params: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<ToolResult>;
-  shouldConfirmExecute(
-    params: Record<string, unknown>,
-    abortSignal: AbortSignal,
-  ): Promise<ToolCallConfirmationDetails | false>;
 }
 
 export enum GeminiEventType {
@@ -63,10 +62,18 @@ export enum GeminiEventType {
   LoopDetected = 'loop_detected',
   Citation = 'citation',
   Retry = 'retry',
+  HookSystemMessage = 'hook_system_message',
+  UserPromptSubmitBlocked = 'user_prompt_submit_blocked',
+  StopHookLoop = 'stop_hook_loop',
+  ActiveGoal = 'active_goal',
 }
 
 export type ServerGeminiRetryEvent = {
   type: GeminiEventType.Retry;
+  retryInfo?: RetryInfo;
+  /** When true, the retry is a continuation (recovery) rather than a fresh
+   *  restart. The UI should keep accumulated text so the continuation appends. */
+  isContinuation?: boolean;
 };
 
 export interface StructuredError {
@@ -96,6 +103,8 @@ export interface ToolCallRequestInfo {
   isClientInitiated: boolean;
   prompt_id: string;
   response_id?: string;
+  /** Set to true when the LLM response was truncated due to max_tokens. */
+  wasOutputTruncated?: boolean;
 }
 
 export interface ToolCallResponseInfo {
@@ -104,8 +113,8 @@ export interface ToolCallResponseInfo {
   resultDisplay: ToolResultDisplay | undefined;
   error: Error | undefined;
   errorType: ToolErrorType | undefined;
-  outputFile?: string | undefined;
   contentLength?: number;
+  modelOverride?: string;
 }
 
 export interface ServerToolCallConfirmationDetails {
@@ -162,6 +171,19 @@ export enum CompressionStatus {
 
   /** The compression was not necessary and no action was taken */
   NOOP,
+
+  /**
+   * The compression call produced a summary, but the output hit
+   * COMPACT_MAX_OUTPUT_TOKENS, indicating likely truncation. The summary
+   * is dropped (newHistory=null) and the attempt is treated as a failure:
+   * `isCompressionFailureStatus` returns true so it counts toward the
+   * per-chat circuit breaker. Kept distinct from
+   * `COMPRESSION_FAILED_EMPTY_SUMMARY` so telemetry can separate
+   * prompt-quality failures (empty / nonsensical summary) from capacity
+   * failures (output cap hit, may need a higher cap or finer-grained
+   * splitter). (R5.2)
+   */
+  COMPRESSION_FAILED_OUTPUT_TRUNCATED,
 }
 
 export interface ChatCompressionInfo {
@@ -191,6 +213,12 @@ export type ServerGeminiFinishedEvent = {
 
 export type ServerGeminiLoopDetectedEvent = {
   type: GeminiEventType.LoopDetected;
+  // The loop type is optional so historical call sites that don't produce one
+  // (tests, fixtures) stay valid. Real emissions in client.ts always populate
+  // it so downstream consumers can surface a concrete reason to the user.
+  value?: {
+    loopType: LoopType;
+  };
 };
 
 export type ServerGeminiCitationEvent = {
@@ -198,13 +226,44 @@ export type ServerGeminiCitationEvent = {
   value: string;
 };
 
+export type ServerGeminiHookSystemMessageEvent = {
+  type: GeminiEventType.HookSystemMessage;
+  value: string;
+};
+
+export type ServerGeminiUserPromptSubmitBlockedEvent = {
+  type: GeminiEventType.UserPromptSubmitBlocked;
+  value: {
+    reason: string;
+    originalPrompt: string;
+  };
+};
+
+export type ServerGeminiStopHookLoopEvent = {
+  type: GeminiEventType.StopHookLoop;
+  value: {
+    iterationCount: number;
+    reasons: string[];
+    stopHookCount: number;
+  };
+};
+
+export type ServerGeminiActiveGoalEvent = {
+  type: GeminiEventType.ActiveGoal;
+  value: ActiveGoal | null;
+};
+
 // The original union type, now composed of the individual types
 export type ServerGeminiStreamEvent =
+  | ServerGeminiActiveGoalEvent
   | ServerGeminiChatCompressedEvent
   | ServerGeminiCitationEvent
   | ServerGeminiContentEvent
   | ServerGeminiErrorEvent
   | ServerGeminiFinishedEvent
+  | ServerGeminiHookSystemMessageEvent
+  | ServerGeminiUserPromptSubmitBlockedEvent
+  | ServerGeminiStopHookLoopEvent
   | ServerGeminiLoopDetectedEvent
   | ServerGeminiMaxSessionTurnsEvent
   | ServerGeminiThoughtEvent
@@ -253,10 +312,32 @@ export class Turn {
           return;
         }
 
-        // Handle the new RETRY event
+        // Handle the new RETRY event: clear accumulated state from the
+        // previous attempt to avoid duplicate tool calls and stale metadata.
         if (streamEvent.type === 'retry') {
-          yield { type: GeminiEventType.Retry };
+          this.pendingToolCalls.length = 0;
+          this.pendingCitations.clear();
+          this.debugResponses = [];
+          this.finishReason = undefined;
+          yield {
+            type: GeminiEventType.Retry,
+            retryInfo: streamEvent.retryInfo,
+            isContinuation: streamEvent.isContinuation,
+          };
           continue; // Skip to the next event in the stream
+        }
+
+        // Surface auto-compaction that fired inside chat.sendMessageStream
+        // as the top-level ChatCompressed event so existing UI handlers stay
+        // connected. This bridge is the primary path for auto-compaction
+        // events; manual /compress emits its own ChatCompressed in
+        // GeminiClient.tryCompressChat.
+        if (streamEvent.type === 'compressed') {
+          yield {
+            type: GeminiEventType.ChatCompressed,
+            value: streamEvent.info,
+          };
+          continue;
         }
 
         // Assuming other events are chunks with a `value` property
@@ -301,6 +382,14 @@ export class Turn {
 
         // This is the key change: Only yield 'Finished' if there is a finishReason.
         if (finishReason) {
+          // Mark pending tool calls so downstream can distinguish
+          // truncation from real parameter errors.
+          if (finishReason === FinishReason.MAX_TOKENS) {
+            for (const tc of this.pendingToolCalls) {
+              tc.wasOutputTruncated = true;
+            }
+          }
+
           if (this.pendingCitations.size > 0) {
             yield {
               type: GeminiEventType.Citation,

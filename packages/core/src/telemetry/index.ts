@@ -7,7 +7,6 @@
 export enum TelemetryTarget {
   GCP = 'gcp',
   LOCAL = 'local',
-  QWEN = 'qwen',
 }
 
 const DEFAULT_TELEMETRY_TARGET = TelemetryTarget.LOCAL;
@@ -17,6 +16,7 @@ export { DEFAULT_TELEMETRY_TARGET, DEFAULT_OTLP_ENDPOINT };
 export {
   initializeTelemetry,
   shutdownTelemetry,
+  refreshSessionContext,
   isTelemetrySdkInitialized,
 } from './sdk.js';
 export {
@@ -27,6 +27,7 @@ export {
 export {
   logStartSession,
   logUserPrompt,
+  logUserRetry,
   logToolCall,
   logApiRequest,
   logApiError,
@@ -41,16 +42,26 @@ export {
   logExtensionEnable,
   logExtensionInstallEvent,
   logExtensionUninstall,
+  logExtensionDisable,
+  logExtensionUpdateEvent,
   logRipgrepFallback,
   logNextSpeakerCheck,
   logAuth,
   logSkillLaunch,
+  logUserFeedback,
+  logArenaSessionStarted,
+  logArenaAgentCompleted,
+  logArenaSessionEnded,
+  logMemoryExtract,
+  logMemoryDream,
+  logMemoryRecall,
 } from './loggers.js';
 export type { SlashCommandEvent, ChatCompressionEvent } from './types.js';
 export {
   SlashCommandStatus,
   EndSessionEvent,
   UserPromptEvent,
+  UserRetryEvent,
   ApiRequestEvent,
   ApiErrorEvent,
   ApiResponseEvent,
@@ -65,8 +76,23 @@ export {
   NextSpeakerCheckEvent,
   AuthEvent,
   SkillLaunchEvent,
+  UserFeedbackEvent,
+  UserFeedbackRating,
+  makeArenaSessionStartedEvent,
+  makeArenaAgentCompletedEvent,
+  makeArenaSessionEndedEvent,
+  MemoryExtractEvent,
+  MemoryDreamEvent,
+  MemoryRecallEvent,
 } from './types.js';
 export { makeSlashCommandEvent, makeChatCompressionEvent } from './types.js';
+export type {
+  ArenaSessionStartedEvent,
+  ArenaAgentCompletedEvent,
+  ArenaSessionEndedEvent,
+  ArenaSessionEndedStatus,
+  ArenaAgentCompletedStatus,
+} from './types.js';
 export type { TelemetryEvent } from './types.js';
 export { SpanStatusCode, ValueType } from '@opentelemetry/api';
 export { SemanticAttributes } from '@opentelemetry/semantic-conventions';
@@ -93,6 +119,14 @@ export {
   recordPerformanceRegression,
   recordBaselineComparison,
   isPerformanceMonitoringActive,
+  // Arena metrics functions
+  recordArenaSessionStartedMetrics,
+  recordArenaAgentCompletedMetrics,
+  recordArenaSessionEndedMetrics,
+  // Auto-Memory metrics functions
+  recordMemoryExtractMetrics,
+  recordMemoryDreamMetrics,
+  recordMemoryRecallMetrics,
   // Performance monitoring types
   PerformanceMetricType,
   MemoryMetricType,
@@ -101,3 +135,41 @@ export {
   FileOperation,
 } from './metrics.js';
 export { QwenLogger } from './qwen-logger/qwen-logger.js';
+export { sanitizeHookName } from './sanitize.js';
+export {
+  startInteractionSpan,
+  endInteractionSpan,
+  startLLMRequestSpan,
+  endLLMRequestSpan,
+  startToolSpan,
+  endToolSpan,
+  runInToolSpanContext,
+  startToolExecutionSpan,
+  endToolExecutionSpan,
+  startToolBlockedOnUserSpan,
+  endToolBlockedOnUserSpan,
+  startHookSpan,
+  endHookSpan,
+  getActiveInteractionSpan,
+  truncateSpanError,
+} from './session-tracing.js';
+export type {
+  StartInteractionOptions,
+  EndInteractionOptions,
+  LLMRequestMetadata,
+  ToolSpanMetadata,
+  ToolBlockedDecision,
+  ToolBlockedSource,
+  HookEvent,
+  StartHookSpanOptions,
+  HookSpanMetadata,
+} from './session-tracing.js';
+export {
+  addUserPromptAttributes,
+  addSystemPromptAttributes,
+  addToolSchemaAttributes,
+  addModelOutputAttributes,
+  addToolInputAttributes,
+  addToolResultAttributes,
+  truncateContent,
+} from './detailed-span-attributes.js';

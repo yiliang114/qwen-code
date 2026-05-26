@@ -7,6 +7,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { ControlDispatcher } from './ControlDispatcher.js';
 import type { IControlContext } from './ControlContext.js';
+import { createMinimalSettings } from '../../config/settings.js';
 import type { SystemController } from './controllers/systemController.js';
 import type { StreamJsonOutputAdapter } from '../io/StreamJsonOutputAdapter.js';
 import type {
@@ -18,6 +19,7 @@ import type {
   CLIControlInterruptRequest,
   CLIControlSetModelRequest,
   CLIControlSupportedCommandsRequest,
+  CLIControlGetContextUsageRequest,
 } from '../types.js';
 
 /**
@@ -39,9 +41,11 @@ function createMockContext(debugMode: boolean = false): IControlContext {
     sessionId: 'test-session-id',
     abortSignal: abortController.signal,
     debugMode,
+    settings: createMinimalSettings(),
     permissionMode: 'default',
     sdkMcpServers: new Set<string>(),
     mcpClients: new Map(),
+    inputClosed: false,
   };
 }
 
@@ -236,6 +240,41 @@ describe('ControlDispatcher', () => {
         response: {
           subtype: 'success',
           request_id: 'req-4',
+          response: mockResponse,
+        },
+      });
+    });
+
+    it('should route get_context_usage request to system controller', async () => {
+      const request: CLIControlRequest = {
+        type: 'control_request',
+        request_id: 'req-ctx',
+        request: {
+          subtype: 'get_context_usage',
+          show_details: false,
+        } as CLIControlGetContextUsageRequest,
+      };
+
+      const mockResponse = {
+        subtype: 'get_context_usage',
+        totalTokens: 1000,
+      };
+
+      vi.mocked(mockSystemController.handleRequest).mockResolvedValue(
+        mockResponse,
+      );
+
+      await dispatcher.dispatch(request);
+
+      expect(mockSystemController.handleRequest).toHaveBeenCalledWith(
+        request.request,
+        'req-ctx',
+      );
+      expect(mockContext.streamJson.send).toHaveBeenCalledWith({
+        type: 'control_response',
+        response: {
+          subtype: 'success',
+          request_id: 'req-ctx',
           response: mockResponse,
         },
       });
@@ -456,9 +495,6 @@ describe('ControlDispatcher', () => {
 
     it('should handle response for non-existent request in debug mode', () => {
       const context = createMockContext(true);
-      const consoleSpy = vi
-        .spyOn(console, 'error')
-        .mockImplementation(() => {});
 
       const dispatcherWithDebug = new ControlDispatcher(context);
       const response: CLIControlResponse = {
@@ -470,15 +506,10 @@ describe('ControlDispatcher', () => {
         },
       };
 
-      dispatcherWithDebug.handleControlResponse(response);
-
-      expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining(
-          '[ControlDispatcher] No pending outgoing request for: non-existent',
-        ),
-      );
-
-      consoleSpy.mockRestore();
+      // Should not throw in debug mode
+      expect(() =>
+        dispatcherWithDebug.handleControlResponse(response),
+      ).not.toThrow();
     });
   });
 
@@ -598,11 +629,8 @@ describe('ControlDispatcher', () => {
       expect(() => dispatcher.handleCancel('non-existent')).not.toThrow();
     });
 
-    it('should log cancellation in debug mode', () => {
+    it('should cancel request in debug mode without throwing', () => {
       const context = createMockContext(true);
-      const consoleSpy = vi
-        .spyOn(console, 'error')
-        .mockImplementation(() => {});
 
       const dispatcherWithDebug = new ControlDispatcher(context);
       const requestId = 'cancel-req-debug';
@@ -625,15 +653,120 @@ describe('ControlDispatcher', () => {
         timeoutId,
       );
 
-      dispatcherWithDebug.handleCancel(requestId);
+      expect(() => dispatcherWithDebug.handleCancel(requestId)).not.toThrow();
+    });
+  });
 
-      expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining(
-          '[ControlDispatcher] Cancelled incoming request: cancel-req-debug',
-        ),
+  describe('markInputClosed', () => {
+    it('should reject all pending outgoing requests when input closes', () => {
+      const requestId1 = 'reject-req-1';
+      const requestId2 = 'reject-req-2';
+      const resolve1 = vi.fn();
+      const resolve2 = vi.fn();
+      const reject1 = vi.fn();
+      const reject2 = vi.fn();
+      const timeoutId1 = setTimeout(() => {}, 1000);
+      const timeoutId2 = setTimeout(() => {}, 1000);
+      const clearTimeoutSpy = vi.spyOn(global, 'clearTimeout');
+
+      const register = (
+        dispatcher as unknown as {
+          registerOutgoingRequest: (
+            id: string,
+            controller: string,
+            resolve: (response: ControlResponse) => void,
+            reject: (error: Error) => void,
+            timeoutId: NodeJS.Timeout,
+          ) => void;
+        }
+      ).registerOutgoingRequest.bind(dispatcher);
+
+      register(requestId1, 'SystemController', resolve1, reject1, timeoutId1);
+      register(requestId2, 'SystemController', resolve2, reject2, timeoutId2);
+
+      dispatcher.markInputClosed();
+
+      expect(reject1).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'Input closed' }),
+      );
+      expect(reject2).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'Input closed' }),
+      );
+      expect(clearTimeoutSpy).toHaveBeenCalledWith(timeoutId1);
+      expect(clearTimeoutSpy).toHaveBeenCalledWith(timeoutId2);
+    });
+
+    it('should mark input as closed on context', () => {
+      dispatcher.markInputClosed();
+      expect(mockContext.inputClosed).toBe(true);
+    });
+
+    it('should handle empty pending requests gracefully', () => {
+      expect(() => dispatcher.markInputClosed()).not.toThrow();
+    });
+
+    it('should be idempotent when called multiple times', () => {
+      const requestId = 'idempotent-req';
+      const resolve = vi.fn();
+      const reject = vi.fn();
+      const timeoutId = setTimeout(() => {}, 1000);
+
+      (
+        dispatcher as unknown as {
+          registerOutgoingRequest: (
+            id: string,
+            controller: string,
+            resolve: (response: ControlResponse) => void,
+            reject: (error: Error) => void,
+            timeoutId: NodeJS.Timeout,
+          ) => void;
+        }
+      ).registerOutgoingRequest(
+        requestId,
+        'SystemController',
+        resolve,
+        reject,
+        timeoutId,
       );
 
-      consoleSpy.mockRestore();
+      dispatcher.markInputClosed();
+      const firstRejectCount = vi.mocked(reject).mock.calls.length;
+
+      // Call again - should not reject again
+      dispatcher.markInputClosed();
+      const secondRejectCount = vi.mocked(reject).mock.calls.length;
+
+      expect(secondRejectCount).toBe(firstRejectCount);
+    });
+
+    it('should mark input closed in debug mode without throwing', () => {
+      const context = createMockContext(true);
+
+      const dispatcherWithDebug = new ControlDispatcher(context);
+      const requestId = 'reject-req-debug';
+      const resolve = vi.fn();
+      const reject = vi.fn();
+      const timeoutId = setTimeout(() => {}, 1000);
+
+      (
+        dispatcherWithDebug as unknown as {
+          registerOutgoingRequest: (
+            id: string,
+            controller: string,
+            resolve: (response: ControlResponse) => void,
+            reject: (error: Error) => void,
+            timeoutId: NodeJS.Timeout,
+          ) => void;
+        }
+      ).registerOutgoingRequest(
+        requestId,
+        'SystemController',
+        resolve,
+        reject,
+        timeoutId,
+      );
+
+      expect(() => dispatcherWithDebug.markInputClosed()).not.toThrow();
     });
   });
 
@@ -723,21 +856,12 @@ describe('ControlDispatcher', () => {
       expect(mockSystemController.cleanup).toHaveBeenCalled();
     });
 
-    it('should log shutdown in debug mode', () => {
+    it('should shutdown in debug mode without throwing', () => {
       const context = createMockContext(true);
-      const consoleSpy = vi
-        .spyOn(console, 'error')
-        .mockImplementation(() => {});
 
       const dispatcherWithDebug = new ControlDispatcher(context);
 
-      dispatcherWithDebug.shutdown();
-
-      expect(consoleSpy).toHaveBeenCalledWith(
-        '[ControlDispatcher] Shutting down',
-      );
-
-      consoleSpy.mockRestore();
+      expect(() => dispatcherWithDebug.shutdown()).not.toThrow();
     });
   });
 

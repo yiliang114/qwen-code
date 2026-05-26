@@ -4,22 +4,32 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-export const AGENT_METHODS = {
-  authenticate: 'authenticate',
-  initialize: 'initialize',
-  session_cancel: 'session/cancel',
-  session_list: 'session/list',
-  session_load: 'session/load',
-  session_new: 'session/new',
-  session_prompt: 'session/prompt',
-  session_save: 'session/save',
-  session_set_mode: 'session/set_mode',
+export {
+  AGENT_METHODS,
+  CLIENT_METHODS,
+  PROTOCOL_VERSION,
+} from '@agentclientprotocol/sdk';
+
+export { RequestError } from '@agentclientprotocol/sdk';
+
+// Local extension: authenticate/update is not part of the ACP spec.
+// It is routed as an extension notification by our CLI.
+export const EXT_CLIENT_METHODS = {
+  authenticate_update: 'authenticate/update',
 } as const;
 
-export const CLIENT_METHODS = {
-  fs_read_text_file: 'fs/read_text_file',
-  fs_write_text_file: 'fs/write_text_file',
-  authenticate_update: 'authenticate/update',
-  session_request_permission: 'session/request_permission',
-  session_update: 'session/update',
+// Re-export error codes in the shape that existing consumers expect.
+// The numeric values match the SDK's ErrorCode type.
+export const ACP_ERROR_CODES = {
+  PARSE_ERROR: -32700,
+  INVALID_REQUEST: -32600,
+  METHOD_NOT_FOUND: -32601,
+  INVALID_PARAMS: -32602,
+  INTERNAL_ERROR: -32603,
+  REQUEST_CANCELLED: -32800,
+  AUTH_REQUIRED: -32000,
+  RESOURCE_NOT_FOUND: -32002,
 } as const;
+
+export type AcpErrorCode =
+  (typeof ACP_ERROR_CODES)[keyof typeof ACP_ERROR_CODES];

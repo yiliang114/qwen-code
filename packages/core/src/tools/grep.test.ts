@@ -97,6 +97,9 @@ describe('GrepTool', () => {
   } as unknown as Config;
 
   beforeEach(async () => {
+    Object.assign(mockConfig, {
+      getTruncateToolOutputThreshold: () => 25000,
+    });
     tempRootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'grep-tool-root-'));
     grepTool = new GrepTool(mockConfig);
 
@@ -174,6 +177,21 @@ describe('GrepTool', () => {
         `Path is not a directory: ${filePath}`,
       );
     });
+
+    it.skipIf(process.platform === 'win32')(
+      'should unescape shell-escaped path',
+      async () => {
+        // Create a directory with a space so the unescaped path exists
+        const dirWithSpace = path.join(tempRootDir, 'sub dir');
+        await fs.mkdir(dirWithSpace);
+        const params: GrepToolParams = {
+          pattern: 'hello',
+          path: path.join(tempRootDir, 'sub\\ dir'),
+        };
+        expect(grepTool.validateToolParams(params)).toBeNull();
+        expect(params.path).toBe(dirWithSpace);
+      },
+    );
   });
 
   describe('execute', () => {
@@ -192,6 +210,73 @@ describe('GrepTool', () => {
       );
       expect(result.llmContent).toContain('L1: another world in sub dir');
       expect(result.returnDisplay).toBe('Found 3 matches');
+      expect(result.resultFilePaths).toEqual([
+        path.join(tempRootDir, 'fileA.txt'),
+        path.join(tempRootDir, 'sub', 'fileC.txt'),
+      ]);
+    });
+
+    it('normalizes CRLF fallback grep output without dropping result paths', () => {
+      const invocationForPrivateMethod = grepTool.build({
+        pattern: 'world',
+      }) as unknown as {
+        parseGrepOutput: (
+          output: string,
+          basePath: string,
+        ) => Array<{ absoluteFilePath: string; line: string }>;
+      };
+      const filePath = path.join(tempRootDir, 'crlf.txt');
+
+      const matches = invocationForPrivateMethod.parseGrepOutput(
+        `crlf.txt:1:hello world\r${os.EOL}`,
+        tempRootDir,
+      );
+
+      expect(matches[0]).toMatchObject({
+        absoluteFilePath: filePath,
+        line: 'hello world',
+      });
+    });
+
+    it('includes result paths for partially rendered match lines', async () => {
+      Object.assign(mockConfig, {
+        getTruncateToolOutputThreshold: () => 22,
+      });
+      await fs.writeFile(
+        path.join(tempRootDir, 'partial.ts'),
+        'partial marker',
+      );
+
+      const invocation = grepTool.build({ pattern: 'marker', glob: '*.ts' });
+      const result = await invocation.execute(abortSignal);
+
+      expect(result.returnDisplay).toContain('truncated');
+      expect(result.resultFilePaths).toEqual([
+        path.join(tempRootDir, 'partial.ts'),
+      ]);
+    });
+
+    it('only reports result paths for matches visible before character truncation', async () => {
+      Object.assign(mockConfig, {
+        getTruncateToolOutputThreshold: () => 30,
+      });
+      await fs.writeFile(path.join(tempRootDir, 'a.ts'), 'visible marker');
+      await fs.writeFile(path.join(tempRootDir, 'z.ts'), 'hidden marker');
+
+      const invocation = grepTool.build({ pattern: 'marker', glob: '*.ts' });
+      const result = await invocation.execute(abortSignal);
+
+      const allResultPaths = [
+        path.join(tempRootDir, 'a.ts'),
+        path.join(tempRootDir, 'z.ts'),
+      ];
+      expect(result.returnDisplay).toContain('truncated');
+      expect(result.resultFilePaths?.length).toBeLessThan(
+        allResultPaths.length,
+      );
+      for (const resultPath of result.resultFilePaths ?? []) {
+        expect(allResultPaths).toContain(resultPath);
+      }
     });
 
     it('should find matches in a specific path', async () => {
@@ -356,6 +441,75 @@ describe('GrepTool', () => {
 
       // Clean up
       await fs.rm(secondDir, { recursive: true, force: true });
+    });
+
+    it('should convert relative paths to absolute when searching multiple directories', async () => {
+      const secondDir = await fs.mkdtemp(
+        path.join(os.tmpdir(), 'grep-tool-second-'),
+      );
+      await fs.writeFile(
+        path.join(secondDir, 'extra.txt'),
+        'world content in second dir',
+      );
+
+      const multiDirConfig = {
+        getTargetDir: () => tempRootDir,
+        getWorkspaceContext: () =>
+          createMockWorkspaceContext(tempRootDir, [secondDir]),
+        getFileExclusions: () => ({
+          getGlobExcludes: () => [],
+        }),
+        getTruncateToolOutputThreshold: () => 25000,
+        getTruncateToolOutputLines: () => 1000,
+      } as unknown as Config;
+
+      const multiDirGrepTool = new GrepTool(multiDirConfig);
+
+      const params: GrepToolParams = { pattern: 'world' };
+      const invocation = multiDirGrepTool.build(params);
+      const result = await invocation.execute(abortSignal);
+
+      // Should show "across N workspace directories"
+      expect(result.llmContent).toContain('across 2 workspace directories');
+
+      // File paths from the second directory should be absolute
+      expect(result.llmContent).toContain(
+        `File: ${path.resolve(secondDir, 'extra.txt')}`,
+      );
+
+      // File paths from the first directory should also be absolute
+      expect(result.llmContent).toContain(
+        `File: ${path.resolve(tempRootDir, 'fileA.txt')}`,
+      );
+
+      await fs.rm(secondDir, { recursive: true, force: true });
+    });
+
+    it('should deduplicate matches from overlapping workspace directories', async () => {
+      // This tests the fix: when workspace dirs overlap (parent + child),
+      // the same file should appear only once in the results.
+      const subDir = path.join(tempRootDir, 'sub');
+
+      const multiDirConfig = {
+        getTargetDir: () => tempRootDir,
+        getWorkspaceContext: () =>
+          createMockWorkspaceContext(tempRootDir, [subDir]),
+        getFileExclusions: () => ({
+          getGlobExcludes: () => [],
+        }),
+        getTruncateToolOutputThreshold: () => 25000,
+        getTruncateToolOutputLines: () => 1000,
+      } as unknown as Config;
+
+      const multiDirGrepTool = new GrepTool(multiDirConfig);
+      // 'sub dir' exists only in sub/fileC.txt — a file that lives under both
+      // tempRootDir and subDir, so without deduplication it would appear twice.
+      const params: GrepToolParams = { pattern: 'sub dir' };
+      const invocation = multiDirGrepTool.build(params);
+      const result = await invocation.execute(abortSignal);
+
+      // sub/fileC.txt (or its absolute path equivalent) should appear only once
+      expect(result.llmContent).toContain('Found 1 match');
     });
   });
 

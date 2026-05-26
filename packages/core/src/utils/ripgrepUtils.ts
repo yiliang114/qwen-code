@@ -7,8 +7,12 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
+import { resolveBundleDir } from './bundlePaths.js';
 import { fileExists } from './fileUtils.js';
 import { execCommand, isCommandAvailable } from './shell-utils.js';
+import { createDebugLogger } from './debugLogger.js';
+
+const debugLogger = createDebugLogger('RIPGREP');
 
 const RIPGREP_COMMAND = 'rg';
 const RIPGREP_BUFFER_LIMIT = 20_000_000; // Keep buffers aligned with the original bundle.
@@ -54,9 +58,21 @@ function wslTimeout(): number {
     : RIPGREP_RUN_TIMEOUT_MS;
 }
 
-// Get the directory of the current module
+// Resolved at module load to the directory that should anchor sibling-asset
+// lookups (here: the vendored ripgrep binary copied to `dist/vendor/`). See
+// `resolveBundleDir` for the rationale behind stripping a trailing `chunks/`
+// segment when this module is hoisted into a shared esbuild chunk.
+//
+// `__filename` is needed separately by `getBuiltinRipgrep` to decide whether
+// it's running from source / transpiled / bundled output (each requires a
+// different `..`-traversal count). It is NOT just `path.join(__dirname,
+// basename)` because in bundled mode esbuild rewrites every bare `__filename`
+// reference to `__qwen_filename` (the shim chunk's path), which would make
+// the heuristic always pick `levelsUp = 0` by accident; the explicit local
+// shadow keeps the lookup correct in source/transpiled/dev modes too, where
+// node ESM leaves `__filename` undefined.
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __dirname = resolveBundleDir(import.meta.url);
 
 type Platform = 'darwin' | 'linux' | 'win32';
 type Architecture = 'x64' | 'arm64';
@@ -100,38 +116,23 @@ export function getBuiltinRipgrep(): string | null {
     return null;
   }
 
-  // Binary name includes .exe on Windows
   const binaryName = platform === 'win32' ? 'rg.exe' : 'rg';
 
-  // Path resolution:
-  // When running from transpiled code: dist/src/utils/ripgrepUtils.js -> ../../../vendor/ripgrep/
-  // When running from bundle: dist/index.js -> vendor/ripgrep/
+  // Determine levels to traverse up to reach package root where vendor/ lives:
+  // - Bundle (dist/index.js): vendor copied into dist/, 0 levels
+  // - Source (src/utils/*.ts): 2 levels up
+  // - Transpiled (dist/src/utils/*.js): 3 levels up
+  const inSrcUtils = __filename.includes(path.join('src', 'utils'));
+  const levelsUp = !inSrcUtils ? 0 : __filename.endsWith('.ts') ? 2 : 3;
 
-  // Detect if we're running from a bundle (single file)
-  // In bundle, __filename will be something like /path/to/dist/index.js
-  // In transpiled code, __filename will be /path/to/dist/src/utils/ripgrepUtils.js
-  const isBundled = !__filename.includes(path.join('src', 'utils'));
-
-  const vendorPath = isBundled
-    ? path.join(
-        __dirname,
-        'vendor',
-        'ripgrep',
-        `${arch}-${platform}`,
-        binaryName,
-      )
-    : path.join(
-        __dirname,
-        '..',
-        '..',
-        '..',
-        'vendor',
-        'ripgrep',
-        `${arch}-${platform}`,
-        binaryName,
-      );
-
-  return vendorPath;
+  return path.join(
+    __dirname,
+    ...Array<string>(levelsUp).fill('..'),
+    'vendor',
+    'ripgrep',
+    `${arch}-${platform}`,
+    binaryName,
+  );
 }
 
 /**
@@ -313,7 +314,7 @@ export async function runRipgrep(
 
         // Log warnings for abnormal exits (except syntax errors)
         if (!syntaxError && truncated) {
-          console.warn(
+          debugLogger.warn(
             `ripgrep exited abnormally (signal=${error.signal} code=${error.code}) with stderr:\n${stderr.trim() || '(empty)'}`,
           );
         }

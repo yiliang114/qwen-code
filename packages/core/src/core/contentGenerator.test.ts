@@ -5,7 +5,11 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { createContentGenerator, AuthType } from './contentGenerator.js';
+import {
+  createContentGenerator,
+  createContentGeneratorConfig,
+  AuthType,
+} from './contentGenerator.js';
 import { GoogleGenAI } from '@google/genai';
 import type { Config } from '../config/config.js';
 import { LoggingContentGenerator } from './loggingContentGenerator/index.js';
@@ -18,6 +22,8 @@ describe('createContentGenerator', () => {
       getUsageStatisticsEnabled: () => true,
       getContentGeneratorConfig: () => ({}),
       getCliVersion: () => '1.0.0',
+      getTelemetryEnabled: () => false,
+      getSessionId: () => 'test-session',
     } as unknown as Config;
 
     const mockGenerator = {
@@ -53,6 +59,8 @@ describe('createContentGenerator', () => {
       getUsageStatisticsEnabled: () => false,
       getContentGeneratorConfig: () => ({}),
       getCliVersion: () => '1.0.0',
+      getTelemetryEnabled: () => false,
+      getSessionId: () => 'test-session',
     } as unknown as Config;
     const mockGenerator = {
       models: {},
@@ -76,5 +84,34 @@ describe('createContentGenerator', () => {
       },
     });
     expect(generator).toBeInstanceOf(LoggingContentGenerator);
+  });
+});
+
+describe('createContentGeneratorConfig', () => {
+  const mockConfig = {
+    getProxy: () => undefined,
+  } as unknown as Config;
+
+  it('should preserve provided fields and set authType for QWEN_OAUTH', () => {
+    const cfg = createContentGeneratorConfig(mockConfig, AuthType.QWEN_OAUTH, {
+      model: 'coder-model',
+      apiKey: 'QWEN_OAUTH_DYNAMIC_TOKEN',
+    });
+    expect(cfg.authType).toBe(AuthType.QWEN_OAUTH);
+    expect(cfg.model).toBe('coder-model');
+    expect(cfg.apiKey).toBe('QWEN_OAUTH_DYNAMIC_TOKEN');
+  });
+
+  it('should not warn or fallback for QWEN_OAUTH (resolution handled by ModelConfigResolver)', () => {
+    const warnSpy = vi
+      .spyOn(console, 'warn')
+      .mockImplementation(() => undefined);
+    const cfg = createContentGeneratorConfig(mockConfig, AuthType.QWEN_OAUTH, {
+      model: 'some-random-model',
+    });
+    expect(cfg.model).toBe('some-random-model');
+    expect(cfg.apiKey).toBeUndefined();
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
   });
 });

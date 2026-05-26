@@ -10,12 +10,9 @@ import {
   type SlashCommand,
   CommandKind,
 } from './types.js';
-import { MessageType } from '../types.js';
+import { MessageType, type HistoryItem } from '../types.js';
 import { getExtendedSystemInfo } from '../../utils/systemInfo.js';
-import {
-  getSystemInfoFields,
-  getFieldValue,
-} from '../../utils/systemInfoFields.js';
+import { getSystemInfoFields } from '../../utils/systemInfoFields.js';
 import { t } from '../../i18n/index.js';
 
 export const bugCommand: SlashCommand = {
@@ -24,17 +21,17 @@ export const bugCommand: SlashCommand = {
     return t('submit a bug report');
   },
   kind: CommandKind.BUILT_IN,
+  argumentHint: '<description>',
+  supportedModes: ['interactive', 'non_interactive', 'acp'] as const,
   action: async (context: CommandContext, args?: string): Promise<void> => {
     const bugDescription = (args || '').trim();
     const systemInfo = await getExtendedSystemInfo(context);
 
     const fields = getSystemInfoFields(systemInfo);
 
-    // Generate bug report info using the same field configuration
-    let info = '\n';
-    for (const field of fields) {
-      info += `* **${field.label}:** ${getFieldValue(field, systemInfo)}\n`;
-    }
+    const info = fields
+      .map((field) => `${field.label}: ${field.value}`)
+      .join('\n');
 
     let bugReportUrl =
       'https://github.com/QwenLM/qwen-code/issues/new?template=bug_report.yml&title={title}&info={info}';
@@ -46,15 +43,16 @@ export const bugCommand: SlashCommand = {
 
     bugReportUrl = bugReportUrl
       .replace('{title}', encodeURIComponent(bugDescription))
-      .replace('{info}', encodeURIComponent(info));
+      .replace('{info}', encodeURIComponent(`\n${info}\n`));
 
-    context.ui.addItem(
-      {
-        type: MessageType.INFO,
-        text: `To submit your bug report, please open the following URL in your browser:\n${bugReportUrl}`,
-      },
-      Date.now(),
-    );
+    const bugReportItem: Omit<Extract<HistoryItem, { type: 'info' }>, 'id'> = {
+      type: MessageType.INFO,
+      text: 'To submit your bug report, please open the following URL in your browser:',
+      linkUrl: bugReportUrl,
+      linkText: 'Open GitHub bug report form',
+    };
+
+    context.ui.addItem(bugReportItem, Date.now());
 
     try {
       await open(bugReportUrl);

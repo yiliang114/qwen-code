@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import * as path from 'node:path';
 import type { Part, FunctionCall } from '@google/genai';
 import type {
   ResumedSessionData,
@@ -12,8 +13,13 @@ import type {
   AnyDeclarativeTool,
   ToolResultDisplay,
   SlashCommandRecordPayload,
+  AtCommandRecordPayload,
 } from '@qwen-code/qwen-code-core';
-import type { HistoryItem, HistoryItemWithoutId } from '../types.js';
+import type {
+  HistoryItem,
+  HistoryItemWithoutId,
+  IndividualToolCallDisplay,
+} from '../types.js';
 import { ToolCallStatus } from '../types.js';
 
 /**
@@ -76,7 +82,11 @@ function extractFunctionCalls(
   return calls;
 }
 
-function getTool(config: Config, name: string): AnyDeclarativeTool | undefined {
+function getTool(
+  config: Config | null,
+  name: string,
+): AnyDeclarativeTool | undefined {
+  if (!config) return undefined;
   const toolRegistry = config.getToolRegistry();
   return toolRegistry.getTool(name);
 }
@@ -94,6 +104,10 @@ function formatToolDescription(
     const invocation = tool.build(args);
     return invocation.getDescription();
   } catch {
+    // Fallback: use the description arg directly if available
+    if (typeof args['description'] === 'string') {
+      return args['description'];
+    }
     return '';
   }
 }
@@ -134,9 +148,11 @@ function restoreHistoryItem(raw: unknown): HistoryItemWithoutId | undefined {
  */
 function convertToHistoryItems(
   conversation: ConversationRecord,
-  config: Config,
+  config: Config | null,
 ): HistoryItemWithoutId[] {
   const items: HistoryItemWithoutId[] = [];
+  const pendingAtCommands: AtCommandRecordPayload[] = [];
+  let atCommandCounter = 0;
 
   // Track pending tool calls for grouping with results
   const pendingToolCalls = new Map<
@@ -151,6 +167,59 @@ function convertToHistoryItems(
     status: ToolCallStatus;
     confirmationDetails: undefined;
   }> = [];
+
+  const buildAtCommandDisplays = (
+    payload: AtCommandRecordPayload,
+  ): IndividualToolCallDisplay[] => {
+    // Error case: single "Read File(s)" with error message
+    if (payload.status === 'error') {
+      atCommandCounter += 1;
+      const filesLabel = payload.filesRead?.length
+        ? payload.filesRead.join(', ')
+        : 'files';
+      return [
+        {
+          callId: `at-command-${atCommandCounter}`,
+          name: 'Read File(s)',
+          description: 'Error attempting to read files',
+          status: ToolCallStatus.Error,
+          resultDisplay:
+            payload.message || `Error reading files (${filesLabel})`,
+          confirmationDetails: undefined,
+        },
+      ];
+    }
+
+    // Success case: individual tool calls for each file
+    if (!payload.filesRead?.length) {
+      atCommandCounter += 1;
+      return [
+        {
+          callId: `at-command-${atCommandCounter}`,
+          name: 'Read File',
+          description: 'Read File(s)',
+          status: ToolCallStatus.Success,
+          resultDisplay: undefined,
+          confirmationDetails: undefined,
+        },
+      ];
+    }
+
+    return payload.filesRead.map((filePath) => {
+      atCommandCounter += 1;
+      const isDir = filePath.endsWith('/');
+      return {
+        callId: `at-command-${atCommandCounter}`,
+        name: isDir ? 'Read Directory' : 'Read File',
+        description: isDir
+          ? `Read directory ${path.basename(filePath)}`
+          : `Read file ${path.basename(filePath)}`,
+        status: ToolCallStatus.Success,
+        resultDisplay: undefined,
+        confirmationDetails: undefined,
+      };
+    });
+  };
 
   for (const record of conversation.messages) {
     if (record.type === 'system') {
@@ -180,10 +249,75 @@ function convertToHistoryItems(
           }
         }
       }
+      if (record.subtype === 'at_command') {
+        const payload = record.systemPayload as
+          | AtCommandRecordPayload
+          | undefined;
+        if (!payload) continue;
+        pendingAtCommands.push(payload);
+      }
+      if (record.subtype === 'rewind') {
+        items.push({ type: 'info', text: 'Conversation rewound.' });
+      }
       continue;
     }
     switch (record.type) {
       case 'user': {
+        // Restore notification items (background agent completions and cron fires)
+        if (record.subtype === 'notification' || record.subtype === 'cron') {
+          const payload = record.systemPayload as
+            | { displayText?: string }
+            | undefined;
+          const fallback =
+            record.subtype === 'cron'
+              ? 'Cron job fired'
+              : 'Background agent completed';
+          const text =
+            payload?.displayText ||
+            extractTextFromParts(record.message?.parts as Part[]) ||
+            fallback;
+          items.push({ type: 'notification', text });
+          break;
+        }
+        if (record.subtype === 'mid_turn_user_message') {
+          const payload = record.systemPayload as
+            | { displayText?: string }
+            | undefined;
+          const text =
+            payload?.displayText ||
+            extractTextFromParts(record.message?.parts as Part[]);
+          if (text) {
+            items.push({ type: 'user', text });
+          }
+          break;
+        }
+        if (pendingAtCommands.length > 0) {
+          // Flush any pending tool group before user message
+          if (currentToolGroup.length > 0) {
+            items.push({
+              type: 'tool_group',
+              tools: [...currentToolGroup],
+            });
+            currentToolGroup = [];
+          }
+
+          const payload = pendingAtCommands.shift()!;
+          const text =
+            payload.userText ||
+            extractTextFromParts(record.message?.parts as Part[]);
+          if (text) {
+            items.push({ type: 'user', text });
+          }
+
+          const toolDisplays = buildAtCommandDisplays(payload);
+          if (toolDisplays.length > 0) {
+            items.push({
+              type: 'tool_group',
+              tools: toolDisplays,
+            });
+          }
+          break;
+        }
         // Flush any pending tool group before user message
         if (currentToolGroup.length > 0) {
           items.push({
@@ -203,12 +337,13 @@ function convertToHistoryItems(
       case 'assistant': {
         const parts = record.message?.parts as Part[] | undefined;
 
-        // Extract thought content
-        const thoughtText = !config
-          .getContentGenerator()
-          .useSummarizedThinking()
-          ? extractThoughtTextFromParts(parts)
-          : '';
+        // Extract thought content. With no config (standalone picker preview),
+        // default to showing thoughts verbatim (same path as
+        // `!useSummarizedThinking()`).
+        const thoughtText =
+          !config || !config.getContentGenerator().useSummarizedThinking()
+            ? extractThoughtTextFromParts(parts)
+            : '';
 
         // Extract text content (non-function-call, non-thought)
         const text = extractTextFromParts(parts);
@@ -290,6 +425,31 @@ function convertToHistoryItems(
     }
   }
 
+  if (pendingAtCommands.length > 0) {
+    for (const payload of pendingAtCommands) {
+      // Flush any pending tool group before standalone @-command
+      if (currentToolGroup.length > 0) {
+        items.push({
+          type: 'tool_group',
+          tools: [...currentToolGroup],
+        });
+        currentToolGroup = [];
+      }
+
+      const text = payload.userText;
+      if (text) {
+        items.push({ type: 'user', text });
+      }
+      const toolDisplays = buildAtCommandDisplays(payload);
+      if (toolDisplays.length > 0) {
+        items.push({
+          type: 'tool_group',
+          tools: toolDisplays,
+        });
+      }
+    }
+  }
+
   // Flush any remaining tool group
   if (currentToolGroup.length > 0) {
     items.push({
@@ -308,13 +468,16 @@ function convertToHistoryItems(
  * and assigns unique IDs to each item for use with loadHistory.
  *
  * @param sessionData The resumed session data from SessionService
- * @param config The config object for accessing tool registry
+ * @param config The config object for accessing tool registry. Pass `null`
+ *   to render in "preview" mode (no tool metadata lookup, thoughts shown
+ *   verbatim) — used by the standalone resume picker that runs before
+ *   `loadCliConfig`.
  * @param baseTimestamp Base timestamp for generating unique IDs
  * @returns Array of HistoryItem with proper IDs
  */
 export function buildResumedHistoryItems(
   sessionData: ResumedSessionData,
-  config: Config,
+  config: Config | null,
   baseTimestamp: number = Date.now(),
 ): HistoryItem[] {
   const items: HistoryItem[] = [];

@@ -1,6 +1,6 @@
 # Approval Mode
 
-Qwen Code offers three distinct permission modes that allow you to flexibly control how AI interacts with your code and system based on task complexity and risk level.
+Qwen Code offers five distinct permission modes that allow you to flexibly control how AI interacts with your code and system based on task complexity and risk level.
 
 ## Permission Modes Comparison
 
@@ -9,6 +9,7 @@ Qwen Code offers three distinct permission modes that allow you to flexibly cont
 | **Plan**​      | ❌ Read-only analysis only  | ❌ Not executed             | • Code exploration <br>• Planning complex changes <br>• Safe code review                               | Lowest     |
 | **Default**​   | ✅ Manual approval required | ✅ Manual approval required | • New/unfamiliar codebases <br>• Critical systems <br>• Team collaboration <br>• Learning and teaching | Low        |
 | **Auto-Edit**​ | ✅ Auto-approved            | ❌ Manual approval required | • Daily development tasks <br>• Refactoring and code improvements <br>• Safe automation                | Medium     |
+| **Auto**​      | ✅ Classifier-evaluated     | ✅ Classifier-evaluated     | • Long autonomous sessions <br>• When Auto-Edit is too cautious but YOLO is too risky                  | Medium     |
 | **YOLO**​      | ✅ Auto-approved            | ✅ Auto-approved            | • Trusted personal projects <br>• Automated scripts/CI/CD <br>• Batch processing tasks                 | Highest    |
 
 ### Quick Reference Guide
@@ -16,11 +17,14 @@ Qwen Code offers three distinct permission modes that allow you to flexibly cont
 - **Start in Plan Mode**: Great for understanding before making changes
 - **Work in Default Mode**: The balanced choice for most development work
 - **Switch to Auto-Edit**: When you're making lots of safe code changes
+- **Try Auto Mode**: When you want fewer interruptions but still want safety on shell commands and network calls — an LLM classifier evaluates each call
 - **Use YOLO sparingly**: Only for trusted automation in controlled environments
 
 > [!tip]
 >
-> You can quickly cycle through modes during a session using **Shift+Tab**. The terminal status bar shows your current mode, so you always know what permissions Qwen Code has.
+> You can quickly cycle through modes during a session using **Shift+Tab** (or **Tab** on Windows). The terminal status bar shows your current mode, so you always know what permissions Qwen Code has.
+
+> The cycle order is: **plan → default → auto-edit → auto → yolo → plan → ...**
 
 ## 1. Use Plan Mode for safe code analysis
 
@@ -36,9 +40,21 @@ Plan Mode instructs Qwen Code to create a plan by analyzing the codebase with **
 
 **Turn on Plan Mode during a session**
 
-You can switch into Plan Mode during a session using **Shift+Tab** to cycle through permission modes.
+You can switch into Plan Mode during a session using **Shift+Tab** (or **Tab** on Windows) to cycle through permission modes.
 
-If you are in Normal Mode, **Shift+Tab** first switches into `auto-edits` Mode, indicated by `⏵⏵ accept edits on` at the bottom of the terminal. A subsequent **Shift+Tab** will switch into Plan Mode, indicated by `⏸ plan mode`.
+If you are in Normal Mode, **Shift+Tab** (or **Tab** on Windows) first switches into `auto-edits` Mode, indicated by `⏵⏵ accept edits on` at the bottom of the terminal. A subsequent **Shift+Tab** (or **Tab** on Windows) will switch into Plan Mode, indicated by `⏸ plan mode`.
+
+**Use the `/plan` command**
+
+The `/plan` command provides a quick shortcut for entering and exiting Plan Mode:
+
+```bash
+/plan                          # Enter plan mode
+/plan refactor the auth module # Enter plan mode and start planning
+/plan exit                     # Exit plan mode, restore previous mode
+```
+
+When you exit Plan Mode with `/plan exit`, your previous approval mode is automatically restored (e.g., if you were in Auto-Edit before entering Plan Mode, you'll return to Auto-Edit).
 
 **Start a new session in Plan Mode**
 
@@ -59,14 +75,10 @@ qwen --prompt "What is machine learning?"
 ### Example: Planning a complex refactor
 
 ```bash
-/approval-mode plan
+/plan I need to refactor our authentication system to use OAuth2. Create a detailed migration plan.
 ```
 
-```
-I need to refactor our authentication system to use OAuth2. Create a detailed migration plan.
-```
-
-Qwen Code analyzes the current implementation and create a comprehensive plan. Refine with follow-ups:
+Qwen Code enters Plan Mode and analyzes the current implementation to create a comprehensive plan. Refine with follow-ups:
 
 ```
 What about backward compatibility?
@@ -100,7 +112,7 @@ Default Mode is the standard way to work with Qwen Code. In this mode, you maint
 
 **Turn on Default Mode during a session**
 
-You can switch into Default Mode during a session using **Shift+Tab**​ to cycle through permission modes. If you're in any other mode, pressing **Shift+Tab**​ will eventually cycle back to Default Mode, indicated by the absence of any mode indicator at the bottom of the terminal.
+You can switch into Default Mode during a session using **Shift+Tab**​ (or **Tab** on Windows) to cycle through permission modes. If you're in any other mode, pressing **Shift+Tab** (or **Tab** on Windows) will eventually cycle back to Default Mode, indicated by the absence of any mode indicator at the bottom of the terminal.
 
 **Start a new session in Default Mode**
 
@@ -151,6 +163,8 @@ You can review each proposed change and approve or reject it individually.
 
 Auto-Edit Mode instructs Qwen Code to automatically approve file edits while requiring manual approval for shell commands, ideal for accelerating development workflows while maintaining system safety.
 
+Auto-approved edit tools include `edit`, `write_file`, and `notebook_edit`.
+
 ### When to use Auto-Accept Edits Mode
 
 - **Daily development**: Ideal for most coding tasks
@@ -164,7 +178,7 @@ Auto-Edit Mode instructs Qwen Code to automatically approve file edits while req
 /approval-mode auto-edit
 
 # Or use keyboard shortcut
-Shift+Tab  # Switch from other modes
+Shift+Tab (or Tab on Windows) # Switch from other modes
 ```
 
 ### Workflow Example
@@ -174,7 +188,118 @@ Shift+Tab  # Switch from other modes
 3. **Automatically**​ applies all file changes without confirmation
 4. If tests need to be run, it will **request approval**​ to execute `npm test`
 
-## 4. YOLO Mode - Full Automation
+## 4. Auto Mode - Classifier-Driven Approval
+
+Auto Mode sits between Auto-Edit and YOLO. An LLM classifier evaluates each
+shell command, network call, and out-of-workspace edit and auto-approves
+the ones it judges safe while blocking risky ones. Most read-only operations
+and in-workspace edits skip the classifier for speed.
+
+See [auto-mode.md](./auto-mode.md) for the full reference (hints
+configuration, troubleshooting, FAQ).
+
+### When to use Auto Mode
+
+- **Long autonomous sessions**: When Default Mode interrupts too often but
+  YOLO is too risky.
+- **Trusted projects**: Internal codebases where the agent should keep
+  moving but you still want a guardrail on destructive shell commands and
+  outbound network calls.
+- **Headless / scheduled runs**: Where Auto-Edit isn't enough (the agent
+  needs to run shell commands too) but you want safety on `rm -rf /`,
+  `curl ... | sh`, credential exfiltration, etc.
+
+### How to use Auto Mode
+
+**Turn on Auto Mode during a session**
+
+Press **Shift+Tab** (or **Tab** on Windows) to cycle into Auto Mode. The
+status bar shows the active mode.
+
+**Use the `/approval-mode` command**
+
+```
+/approval-mode auto
+```
+
+The first time you enter Auto Mode, an information message explains how it
+works. The notice does not appear again.
+
+**Start a new session in Auto Mode**
+
+```jsonc
+// .qwen/settings.json
+{
+  "tools": {
+    "approvalMode": "auto",
+  },
+}
+```
+
+### What Auto Mode auto-approves vs blocks
+
+The classifier is biased toward blocking when uncertain. Defaults:
+
+- **Auto-approved**: read-only commands (ls, cat, git status, grep, find),
+  package install in cwd, build/test commands, file edits inside the
+  workspace, local-only operations.
+- **Blocked**: irreversible destruction (rm -rf /, fdisk, mkfs),
+  code-from-external execution (curl | sh, eval of remote content),
+  credential exfiltration, unauthorized persistence (.bashrc edits,
+  crontab), security weakening, force-push to main/master.
+
+You can customize the classifier's judgement via natural-language hints in
+settings.json. See [auto-mode.md](./auto-mode.md#configuring-hints).
+
+### Safety guardrails
+
+- **Hard rules remain in force**: `permissions.deny` rules block actions
+  before the classifier ever runs.
+- **Over-broad allow rules are stripped while in Auto Mode**: e.g.
+  `permissions.allow: ["Bash"]` (allow every shell command) defeats the
+  classifier; entering Auto Mode temporarily disables such rules so the
+  classifier can do its job. The rules are restored when you leave Auto
+  Mode. Settings on disk are never modified.
+- **Fail-closed**: when the classifier API is unreachable, the action is
+  blocked rather than allowed. After two consecutive unavailable calls,
+  the next tool call falls back to manual approval.
+- **Loop guard**: after three consecutive policy blocks, the next call
+  also falls back to manual approval so the agent isn't stuck cycling on
+  a dead-end approach.
+
+### Example
+
+```
+/approval-mode auto
+Refactor the auth module to use OAuth2. Run the full test suite afterwards.
+```
+
+Qwen Code makes the file edits (in-workspace edits skip the classifier),
+runs `npm test` (classifier judges safe), and surfaces a block if it ever
+tries something risky like `rm -rf /Users/me/.aws`. You can review the
+reason inline and decide whether to switch to Default Mode for that step.
+
+### Configure Auto Mode as default
+
+```jsonc
+// .qwen/settings.json
+{
+  "tools": {
+    "approvalMode": "auto",
+  },
+  "permissions": {
+    "autoMode": {
+      "hints": {
+        "allow": ["Running pytest, mypy, and ruff on this Python repo"],
+        "deny": ["Any network call to intranet.example.com"],
+      },
+      "environment": ["Open-source monorepo; commits are signed"],
+    },
+  },
+}
+```
+
+## 5. YOLO Mode - Full Automation
 
 YOLO Mode grants Qwen Code the highest permissions, automatically approving all tool calls including file editing and shell commands.
 
@@ -235,7 +360,7 @@ qwen --prompt "Run the test suite, fix all failing tests, then commit changes"
 
 ### Keyboard Shortcut Switching
 
-During a Qwen Code session, use **Shift+Tab**​ to quickly cycle through the three modes:
+During a Qwen Code session, use **Shift+Tab**​ (or **Tab** on Windows) to quickly cycle through the four modes:
 
 ```
 Default Mode → Auto-Edit Mode → YOLO Mode → Plan Mode → Default Mode

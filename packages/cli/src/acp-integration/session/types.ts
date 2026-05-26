@@ -6,14 +6,26 @@
 
 import type { Config } from '@qwen-code/qwen-code-core';
 import type { Part } from '@google/genai';
-import type * as acp from '../acp.js';
+import type {
+  SessionUpdate,
+  ToolCallLocation,
+  ToolKind,
+} from '@agentclientprotocol/sdk';
+import type { MessageRewriteMiddleware } from './rewrite/index.js';
+
+export type ApprovalModeValue =
+  | 'plan'
+  | 'default'
+  | 'auto-edit'
+  | 'auto'
+  | 'yolo';
 
 /**
  * Interface for sending session updates to the ACP client.
  * Implemented by Session class and used by all emitters.
  */
 export interface SessionUpdateSender {
-  sendUpdate(update: acp.SessionUpdate): Promise<void>;
+  sendUpdate(update: SessionUpdate): Promise<void>;
 }
 
 /**
@@ -23,6 +35,19 @@ export interface SessionUpdateSender {
 export interface SessionContext extends SessionUpdateSender {
   readonly sessionId: string;
   readonly config: Config;
+  /** Optional message rewrite middleware for ACP message transformation.
+   *  Installed after history replay to avoid rewriting historical messages. */
+  messageRewriter?: MessageRewriteMiddleware;
+}
+
+/**
+ * Subagent metadata for tracking parent tool call context.
+ */
+export interface SubagentMeta {
+  /** ID of the parent AgentTool call that created this subagent */
+  parentToolCallId?: string;
+  /** Type of subagent (from AgentParams.subagent_type) */
+  subagentType?: string;
 }
 
 /**
@@ -37,6 +62,10 @@ export interface ToolCallStartParams {
   args?: Record<string, unknown>;
   /** Status of the tool call */
   status?: 'pending' | 'in_progress' | 'completed' | 'failed';
+  /** Optional subagent metadata */
+  subagentMeta?: SubagentMeta;
+  /** Server-side timestamp (ISO string or ms) for message ordering */
+  timestamp?: string | number;
 }
 
 /**
@@ -57,6 +86,10 @@ export interface ToolCallResultParams {
   error?: Error;
   /** Original args (fallback for TodoWriteTool todos extraction) */
   args?: Record<string, unknown>;
+  /** Optional subagent metadata */
+  subagentMeta?: SubagentMeta;
+  /** Server-side timestamp (ISO string or ms) for message ordering */
+  timestamp?: string | number;
 }
 
 /**
@@ -73,6 +106,6 @@ export interface TodoItem {
  */
 export interface ResolvedToolMetadata {
   title: string;
-  locations: acp.ToolCallLocation[];
-  kind: acp.ToolKind;
+  locations: ToolCallLocation[];
+  kind: ToolKind;
 }
