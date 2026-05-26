@@ -8,11 +8,17 @@ import {
   query,
   isSDKAssistantMessage,
   isSDKSystemMessage,
+  isSDKResultMessage,
   type SDKUserMessage,
 } from '@qwen-code/sdk';
-import { SDKTestHelper, createSharedTestOptions } from './test-helper.js';
+import {
+  SDKTestHelper,
+  createSharedTestOptions,
+  createResultWaiter,
+} from './test-helper.js';
 
 const SHARED_TEST_OPTIONS = createSharedTestOptions();
+const MODEL_RESPONSE_TIMEOUT_MS = process.env['CI'] ? 30000 : 15000;
 
 /**
  * Factory function that creates a streaming input with a control point.
@@ -26,6 +32,7 @@ const SHARED_TEST_OPTIONS = createSharedTestOptions();
 function createStreamingInputWithControlPoint(
   firstMessage: string,
   secondMessage: string,
+  resultWaiter: { waitForResult: (index: number) => Promise<void> },
 ): {
   generator: AsyncIterable<SDKUserMessage>;
   resume: () => void;
@@ -48,7 +55,7 @@ function createStreamingInputWithControlPoint(
       parent_tool_use_id: null,
     } as SDKUserMessage;
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await resultWaiter.waitForResult(0);
 
     await resumePromise;
 
@@ -63,6 +70,8 @@ function createStreamingInputWithControlPoint(
       },
       parent_tool_use_id: null,
     } as SDKUserMessage;
+
+    await resultWaiter.waitForResult(1);
   })();
 
   const resume = () => {
@@ -89,9 +98,11 @@ describe('System Control (E2E)', () => {
 
   describe('setModel API', () => {
     it('should change model dynamically during streaming input', async () => {
+      const resultWaiter = createResultWaiter(2);
       const { generator, resume } = createStreamingInputWithControlPoint(
-        'Tell me the model name.',
-        'Tell me the model name now again.',
+        'Reply with exactly FIRST.',
+        'Reply with exactly SECOND.',
+        resultWaiter,
       );
 
       const q = query({
@@ -126,6 +137,9 @@ describe('System Control (E2E)', () => {
             if (isSDKSystemMessage(message)) {
               systemMessages.push({ model: message.model });
             }
+            if (isSDKResultMessage(message)) {
+              resultWaiter.notifyResult();
+            }
             if (isSDKAssistantMessage(message)) {
               if (!firstResponseReceived) {
                 firstResponseReceived = true;
@@ -144,7 +158,7 @@ describe('System Control (E2E)', () => {
           new Promise((_, reject) =>
             setTimeout(
               () => reject(new Error('Timeout waiting for first response')),
-              15000,
+              MODEL_RESPONSE_TIMEOUT_MS,
             ),
           ),
         ]);
@@ -163,7 +177,7 @@ describe('System Control (E2E)', () => {
           new Promise((_, reject) =>
             setTimeout(
               () => reject(new Error('Timeout waiting for second response')),
-              10000,
+              MODEL_RESPONSE_TIMEOUT_MS,
             ),
           ),
         ]);
@@ -181,6 +195,7 @@ describe('System Control (E2E)', () => {
 
     it('should handle multiple model changes in sequence', async () => {
       const sessionId = crypto.randomUUID();
+      const resultWaiter = createResultWaiter(3);
       let resumeResolve1: (() => void) | null = null;
       let resumeResolve2: (() => void) | null = null;
       const resumePromise1 = new Promise<void>((resolve) => {
@@ -198,7 +213,7 @@ describe('System Control (E2E)', () => {
           parent_tool_use_id: null,
         } as SDKUserMessage;
 
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await resultWaiter.waitForResult(0);
         await resumePromise1;
         await new Promise((resolve) => setTimeout(resolve, 200));
 
@@ -209,7 +224,7 @@ describe('System Control (E2E)', () => {
           parent_tool_use_id: null,
         } as SDKUserMessage;
 
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await resultWaiter.waitForResult(1);
         await resumePromise2;
         await new Promise((resolve) => setTimeout(resolve, 200));
 
@@ -219,6 +234,8 @@ describe('System Control (E2E)', () => {
           message: { role: 'user', content: 'Third message' },
           parent_tool_use_id: null,
         } as SDKUserMessage;
+
+        await resultWaiter.waitForResult(2);
       })();
 
       const q = query({
@@ -233,7 +250,7 @@ describe('System Control (E2E)', () => {
 
       try {
         const systemMessages: Array<{ model?: string }> = [];
-        let responseCount = 0;
+        let turnCount = 0;
         const resolvers: Array<() => void> = [];
         const responsePromises = [
           new Promise<void>((resolve) => resolvers.push(resolve)),
@@ -246,10 +263,13 @@ describe('System Control (E2E)', () => {
             if (isSDKSystemMessage(message)) {
               systemMessages.push({ model: message.model });
             }
-            if (isSDKAssistantMessage(message)) {
-              if (responseCount < resolvers.length) {
-                resolvers[responseCount]?.();
-                responseCount++;
+            if (isSDKResultMessage(message)) {
+              resultWaiter.notifyResult();
+              // Resolve on result (one per turn), not assistant message
+              // (which may fire multiple times per turn: thinking + text)
+              if (turnCount < resolvers.length) {
+                resolvers[turnCount]?.();
+                turnCount++;
               }
             }
           }
@@ -259,7 +279,10 @@ describe('System Control (E2E)', () => {
         await Promise.race([
           responsePromises[0],
           new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Timeout 1')), 10000),
+            setTimeout(
+              () => reject(new Error('Timeout 1')),
+              MODEL_RESPONSE_TIMEOUT_MS,
+            ),
           ),
         ]);
 
@@ -271,7 +294,10 @@ describe('System Control (E2E)', () => {
         await Promise.race([
           responsePromises[1],
           new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Timeout 2')), 10000),
+            setTimeout(
+              () => reject(new Error('Timeout 2')),
+              MODEL_RESPONSE_TIMEOUT_MS,
+            ),
           ),
         ]);
 
@@ -283,7 +309,10 @@ describe('System Control (E2E)', () => {
         await Promise.race([
           responsePromises[2],
           new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Timeout 3')), 10000),
+            setTimeout(
+              () => reject(new Error('Timeout 3')),
+              MODEL_RESPONSE_TIMEOUT_MS,
+            ),
           ),
         ]);
 
@@ -318,6 +347,7 @@ describe('System Control (E2E)', () => {
   describe('supportedCommands API', () => {
     it('should return list of supported slash commands', async () => {
       const sessionId = crypto.randomUUID();
+      const resultWaiter = createResultWaiter(1);
       const generator = (async function* () {
         yield {
           type: 'user',
@@ -325,6 +355,8 @@ describe('System Control (E2E)', () => {
           message: { role: 'user', content: 'Hello' },
           parent_tool_use_id: null,
         } as SDKUserMessage;
+
+        await resultWaiter.waitForResult(0);
       })();
 
       const q = query({
@@ -343,6 +375,9 @@ describe('System Control (E2E)', () => {
         const messageConsumer = (async () => {
           try {
             for await (const _message of q) {
+              if (isSDKResultMessage(_message)) {
+                resultWaiter.notifyResult();
+              }
               // Just consume messages
             }
           } catch (error) {

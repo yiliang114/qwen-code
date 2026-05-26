@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import * as fs from 'node:fs';
 import type {
   Settings,
   SettingScope,
@@ -17,6 +18,7 @@ import type {
 } from '../config/settingsSchema.js';
 import { getSettingsSchema } from '../config/settingsSchema.js';
 import { t } from '../i18n/index.js';
+import { isAutoLanguage } from './languageUtils.js';
 
 // The schema is now nested, but many parts of the UI and logic work better
 // with a flattened structure and dot-notation keys. This section flattens the
@@ -125,6 +127,13 @@ export function getNestedValue(
     return getNestedValue(value as Record<string, unknown>, rest);
   }
   return undefined;
+}
+
+export function getNestedProperty(
+  obj: Record<string, unknown>,
+  path: string,
+): unknown {
+  return getNestedValue(obj, path.split('.'));
 }
 
 /**
@@ -249,12 +258,80 @@ export function getDialogSettingsByType(
 }
 
 /**
- * Get all setting keys that should be shown in the dialog
+ * Explicit display order for settings shown in the Settings Dialog.
+ * Settings are ordered by importance and logical grouping:
+ * 1. Workflow control (most impactful)
+ * 2. Localization
+ * 3. Editor/Shell experience
+ * 4. Display preferences
+ * 5. Git behavior
+ * 6. File filtering
+ * 7. System settings (rarely changed)
+ *
+ * New settings with showInDialog: true that are not listed here
+ * will appear at the end of the list.
+ */
+const SETTINGS_DIALOG_ORDER: readonly string[] = [
+  // Workflow Control - most impactful setting
+  'tools.approvalMode',
+
+  // Localization - users often set this first
+  'general.language',
+  'general.outputLanguage',
+
+  // Theme
+  'ui.theme',
+
+  // Editor/Shell Experience
+  'general.vimMode',
+  'tools.shell.enableInteractiveShell',
+
+  // Display Preferences
+  'general.preferredEditor',
+  'ide.enabled',
+  'ui.showLineNumbers',
+  'ui.hideTips',
+  'general.terminalBell',
+  'ui.enableWelcomeBack',
+
+  // Git Behavior
+  'general.gitCoAuthor.commit',
+  'general.gitCoAuthor.pr',
+
+  // File Filtering
+  'context.fileFiltering.respectGitIgnore',
+  'context.fileFiltering.respectQwenIgnore',
+
+  // System Settings - rarely changed
+  'general.disableAutoUpdate',
+
+  // Privacy
+  'privacy.usageStatisticsEnabled',
+] as const;
+
+/**
+ * Get all setting keys that should be shown in the dialog, sorted by display order
  */
 export function getDialogSettingKeys(): string[] {
-  return Object.values(getFlattenedSchema())
-    .filter((definition) => definition.showInDialog !== false)
+  const dialogSettings = Object.values(getFlattenedSchema())
+    .filter((definition) => definition.showInDialog === true)
     .map((definition) => definition.key);
+
+  // Sort by explicit order; settings not in the order array appear at the end
+  return dialogSettings.sort((a, b) => {
+    const indexA = SETTINGS_DIALOG_ORDER.indexOf(a);
+    const indexB = SETTINGS_DIALOG_ORDER.indexOf(b);
+
+    // If both are in the order array, sort by their position
+    if (indexA !== -1 && indexB !== -1) {
+      return indexA - indexB;
+    }
+    // If only one is in the array, prioritize the one in the array
+    if (indexA !== -1) return -1;
+    if (indexB !== -1) return 1;
+    // If neither is in the array, maintain original order
+    return 0;
+  });
 }
 
 // ============================================================================
@@ -314,29 +391,92 @@ export function settingExistsInScope(
 }
 
 /**
- * Recursively sets a value in a nested object using a key path array.
+ * True if any dotted-path segment would let a write climb into the prototype
+ * chain. Defense in depth at the utility level: callers like
+ * migrateProviderMetadata feed `field` names straight from Object.entries on
+ * user-editable settings.json, and JSON.parse preserves `__proto__` as an own
+ * property — a crafted file could otherwise pollute Object.prototype here.
+ * Inline literal === comparisons (not Set.has) so CodeQL recognises this as a
+ * prototype-pollution sanitiser.
  */
-function setNestedValue(
+function pathHasUnsafeSegment(keys: string[]): boolean {
+  for (const key of keys) {
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function setNestedPropertyForce(
   obj: Record<string, unknown>,
-  path: string[],
+  path: string,
   value: unknown,
-): Record<string, unknown> {
-  const [first, ...rest] = path;
-  if (!first) {
-    return obj;
+): void {
+  const keys = path.split('.');
+  // Refuse prototype-chain segments (see pathHasUnsafeSegment). Silent skip
+  // rather than throw: callers iterate user data and a poisoned key should
+  // be ignored, not crash the operation.
+  if (pathHasUnsafeSegment(keys)) return;
+  const lastKey = keys.pop();
+  if (!lastKey) return;
+
+  let current: Record<string, unknown> = obj;
+  for (const key of keys) {
+    if (!current[key] || typeof current[key] !== 'object') {
+      current[key] = {};
+    }
+    current = current[key] as Record<string, unknown>;
   }
 
-  if (rest.length === 0) {
-    obj[first] = value;
-    return obj;
+  current[lastKey] = value;
+}
+
+export function setNestedPropertySafe(
+  obj: Record<string, unknown>,
+  path: string,
+  value: unknown,
+): void {
+  const keys = path.split('.');
+  // Refuse prototype-chain segments (see pathHasUnsafeSegment).
+  if (pathHasUnsafeSegment(keys)) return;
+  const lastKey = keys.pop();
+  if (!lastKey) return;
+
+  let current: Record<string, unknown> = obj;
+  for (const key of keys) {
+    if (current[key] === undefined) {
+      current[key] = {};
+    }
+    const next = current[key];
+    if (typeof next === 'object' && next !== null) {
+      current = next as Record<string, unknown>;
+    } else {
+      return;
+    }
   }
 
-  if (!obj[first] || typeof obj[first] !== 'object') {
-    obj[first] = {};
+  current[lastKey] = value;
+}
+
+export function deleteNestedPropertySafe(
+  obj: Record<string, unknown>,
+  path: string,
+): void {
+  const keys = path.split('.');
+  const lastKey = keys.pop();
+  if (!lastKey) return;
+
+  let current: Record<string, unknown> = obj;
+  for (const key of keys) {
+    const next = current[key];
+    if (typeof next !== 'object' || next === null) {
+      return;
+    }
+    current = next as Record<string, unknown>;
   }
 
-  setNestedValue(obj[first] as Record<string, unknown>, rest, value);
-  return obj;
+  delete current[lastKey];
 }
 
 /**
@@ -347,9 +487,8 @@ export function setPendingSettingValue(
   value: boolean,
   pendingSettings: Settings,
 ): Settings {
-  const path = key.split('.');
   const newSettings = JSON.parse(JSON.stringify(pendingSettings));
-  setNestedValue(newSettings, path, value);
+  setNestedPropertyForce(newSettings, key, value);
   return newSettings;
 }
 
@@ -361,9 +500,8 @@ export function setPendingSettingValueAny(
   value: SettingsValue,
   pendingSettings: Settings,
 ): Settings {
-  const path = key.split('.');
   const newSettings = structuredClone(pendingSettings);
-  setNestedValue(newSettings, path, value);
+  setNestedPropertyForce(newSettings, key, value);
   return newSettings;
 }
 
@@ -401,14 +539,20 @@ export function saveModifiedSettings(
       path,
     );
 
-    if (value === undefined) {
-      return;
-    }
-
     const existsInOriginalFile = settingExistsInScope(
       settingKey,
       loadedSettings.forScope(scope).settings,
     );
+
+    if (value === undefined) {
+      // Treat `undefined` as "unset" when the key exists in the scope file.
+      // LoadedSettings.setValue(..., undefined) is used elsewhere in the codebase
+      // to remove optional settings from disk.
+      if (existsInOriginalFile) {
+        loadedSettings.setValue(scope, settingKey, undefined);
+      }
+      return;
+    }
 
     const isDefaultValue = value === getDefaultValue(settingKey);
 
@@ -445,7 +589,10 @@ export function getDisplayValue(
 
   let valueString = String(value);
 
-  if (definition?.type === 'enum' && definition.options) {
+  // Special handling for outputLanguage 'auto' value
+  if (key === 'general.outputLanguage' && isAutoLanguage(value as string)) {
+    valueString = t('Auto (detect from system)');
+  } else if (definition?.type === 'enum' && definition.options) {
     const option = definition.options?.find((option) => option.value === value);
     if (option?.label) {
       valueString = t(option.label) || option.label;
@@ -498,6 +645,67 @@ export function getEffectiveDisplayValue(
   mergedSettings: Settings,
 ): boolean {
   return getSettingValue(key, settings, mergedSettings);
+}
+
+/**
+ * Backup a settings file before modification.
+ * Always creates a fresh backup with `.orig` suffix (overwrites any stale backup).
+ * @param filePath - Path to the settings file to backup
+ * @returns boolean indicating whether a backup was created
+ */
+export function backupSettingsFile(filePath: string): boolean {
+  try {
+    if (fs.existsSync(filePath)) {
+      const backupPath = `${filePath}.orig`;
+      fs.copyFileSync(filePath, backupPath);
+      return true;
+    }
+  } catch (_e) {
+    // Ignore backup errors, proceed without backup
+  }
+  return false;
+}
+
+/**
+ * Restore a settings file from its `.orig` backup created by {@link backupSettingsFile}.
+ * Removes the backup file after a successful restore.
+ * @param filePath - Path to the settings file to restore
+ * @returns boolean indicating whether the restore succeeded
+ */
+export function restoreSettingsFromBackup(filePath: string): boolean {
+  try {
+    const backupPath = `${filePath}.orig`;
+    if (fs.existsSync(backupPath)) {
+      fs.copyFileSync(backupPath, filePath);
+      fs.unlinkSync(backupPath);
+      return true;
+    }
+  } catch (err) {
+    // Caller handles the boolean failure, but log the underlying cause so
+    // EACCES / disk full / file-locked don't all look identical from
+    // upstream — the adapter's own warning then has something to point at.
+    // eslint-disable-next-line no-console -- best-effort rollback path
+    console.error(
+      `[settingsUtils] restoreSettingsFromBackup(${filePath}) failed:`,
+      err,
+    );
+  }
+  return false;
+}
+
+/**
+ * Remove the `.orig` backup after a successful operation.
+ * @param filePath - Path to the settings file whose backup should be removed
+ */
+export function cleanupSettingsBackup(filePath: string): void {
+  try {
+    const backupPath = `${filePath}.orig`;
+    if (fs.existsSync(backupPath)) {
+      fs.unlinkSync(backupPath);
+    }
+  } catch (_e) {
+    // Ignore cleanup errors — non-critical
+  }
 }
 
 export const TEST_ONLY = { clearFlattenedSchema };

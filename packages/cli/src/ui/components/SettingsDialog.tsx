@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import type React from 'react';
+import { useState, useEffect } from 'react';
 import { Box, Text } from 'ink';
 import { theme } from '../semantic-colors.js';
 import type { LoadedSettings, Settings } from '../../config/settings.js';
@@ -16,7 +17,6 @@ import {
   getDialogSettingKeys,
   setPendingSettingValue,
   getDisplayValue,
-  hasRestartRequiredSettings,
   saveModifiedSettings,
   getSettingDefinition,
   isDefaultValue,
@@ -27,9 +27,13 @@ import {
   getNestedValue,
   getEffectiveValue,
 } from '../../utils/settingsUtils.js';
+import { updateOutputLanguageFile } from '../../utils/languageUtils.js';
 import { useVimMode } from '../contexts/VimModeContext.js';
-import { type Config } from '@qwen-code/qwen-code-core';
+import { useCompactMode } from '../contexts/CompactModeContext.js';
+import { useUIActions } from '../contexts/UIActionsContext.js';
+import { createDebugLogger, type Config } from '@qwen-code/qwen-code-core';
 import { useKeypress } from '../hooks/useKeypress.js';
+import { keyMatchers, Command } from '../keyMatchers.js';
 import chalk from 'chalk';
 import { cpSlice, cpLen, stripUnsafeCharacters } from '../utils/textUtils.js';
 import {
@@ -45,6 +49,8 @@ interface SettingsDialogProps {
   config?: Config;
 }
 
+const debugLogger = createDebugLogger('SETTINGS_DIALOG');
+
 const maxItemsToShow = 8;
 
 export function SettingsDialog({
@@ -56,11 +62,12 @@ export function SettingsDialog({
 }: SettingsDialogProps): React.JSX.Element {
   // Get vim mode context to sync vim mode changes
   const { vimEnabled, toggleVimEnabled } = useVimMode();
+  // Get compact mode context to sync compact mode changes
+  const { compactMode, setCompactMode } = useCompactMode();
+  const uiActions = useUIActions();
 
-  // Focus state: 'settings' or 'scope'
-  const [focusSection, setFocusSection] = useState<'settings' | 'scope'>(
-    'settings',
-  );
+  // Mode state: 'settings' or 'scope' (view switching like ThemeDialog)
+  const [mode, setMode] = useState<'settings' | 'scope'>('settings');
   // Scope selector state (User by default)
   const [selectedScope, setSelectedScope] = useState<SettingScope>(
     SettingScope.User,
@@ -69,7 +76,6 @@ export function SettingsDialog({
   const [activeSettingIndex, setActiveSettingIndex] = useState(0);
   // Scroll offset for settings
   const [scrollOffset, setScrollOffset] = useState(0);
-  const [showRestartPrompt, setShowRestartPrompt] = useState(false);
 
   // Local pending settings state for the selected scope
   const [pendingSettings, setPendingSettings] = useState<Settings>(() =>
@@ -89,33 +95,33 @@ export function SettingsDialog({
   >(new Map());
 
   // Track restart-required settings across scope changes
-  const [_restartRequiredSettings, setRestartRequiredSettings] = useState<
+  const [restartRequiredSettings, setRestartRequiredSettings] = useState<
     Set<string>
   >(new Set());
+
+  const showRestartPrompt = restartRequiredSettings.size > 0;
 
   useEffect(() => {
     // Base settings for selected scope
     let updated = structuredClone(settings.forScope(selectedScope).settings);
     // Overlay globally pending (unsaved) changes so user sees their modifications in any scope
     const newModified = new Set<string>();
-    const newRestartRequired = new Set<string>();
     for (const [key, value] of globalPendingChanges.entries()) {
       const def = getSettingDefinition(key);
       if (def?.type === 'boolean' && typeof value === 'boolean') {
         updated = setPendingSettingValue(key, value, updated);
       } else if (
         (def?.type === 'number' && typeof value === 'number') ||
-        (def?.type === 'string' && typeof value === 'string')
+        (def?.type === 'string' && typeof value === 'string') ||
+        (def?.type === 'enum' &&
+          (typeof value === 'string' || typeof value === 'number'))
       ) {
         updated = setPendingSettingValueAny(key, value, updated);
       }
       newModified.add(key);
-      if (requiresRestart(key)) newRestartRequired.add(key);
     }
     setPendingSettings(updated);
     setModifiedSettings(newModified);
-    setRestartRequiredSettings(newRestartRequired);
-    setShowRestartPrompt(newRestartRequired.size > 0);
   }, [selectedScope, settings, globalPendingChanges]);
 
   const generateSettingsItems = () => {
@@ -130,6 +136,9 @@ export function SettingsDialog({
           : key,
         value: key,
         type: definition?.type,
+        description: definition?.description
+          ? t(definition.description) || definition.description
+          : undefined,
         toggle: () => {
           if (!TOGGLE_TYPES.has(definition?.type)) {
             return;
@@ -156,10 +165,6 @@ export function SettingsDialog({
             );
           }
 
-          setPendingSettings((prev) =>
-            setPendingSettingValue(key, newValue as boolean, prev),
-          );
-
           if (!requiresRestart(key)) {
             const immediateSettings = new Set([key]);
             const immediateSettingsObject = setPendingSettingValueAny(
@@ -168,7 +173,7 @@ export function SettingsDialog({
               {} as Settings,
             );
 
-            console.log(
+            debugLogger.debug(
               `[DEBUG SettingsDialog] Saving ${key} immediately with value:`,
               newValue,
             );
@@ -183,8 +188,15 @@ export function SettingsDialog({
             if (key === 'general.vimMode' && newValue !== vimEnabled) {
               // Call toggleVimEnabled to sync the VimModeContext local state
               toggleVimEnabled().catch((error) => {
-                console.error('Failed to toggle vim mode:', error);
+                debugLogger.error('Failed to toggle vim mode:', error);
               });
+            }
+
+            // Special handling for compact mode to sync with CompactModeContext
+            // and refresh static content so already-rendered history updates.
+            if (key === 'ui.compactMode' && newValue !== compactMode) {
+              setCompactMode?.(newValue as boolean);
+              uiActions.refreshStatic();
             }
 
             // Special handling for approval mode to apply to current session
@@ -195,7 +207,7 @@ export function SettingsDialog({
               try {
                 config?.setApprovalMode(settings.merged.tools.approvalMode);
               } catch (error) {
-                console.error(
+                debugLogger.error(
                   'Failed to apply approval mode to current session:',
                   error,
                 );
@@ -229,31 +241,22 @@ export function SettingsDialog({
               structuredClone(settings.forScope(selectedScope).settings),
             );
           } else {
-            // For restart-required settings, track as modified
-            setModifiedSettings((prev) => {
-              const updated = new Set(prev).add(key);
-              const needsRestart = hasRestartRequiredSettings(updated);
-              console.log(
-                `[DEBUG SettingsDialog] Modified settings:`,
-                Array.from(updated),
-                'Needs restart:',
-                needsRestart,
-              );
-              if (needsRestart) {
-                setShowRestartPrompt(true);
-                setRestartRequiredSettings((prevRestart) =>
-                  new Set(prevRestart).add(key),
-                );
-              }
-              return updated;
-            });
+            // For restart-required settings, save immediately but show restart prompt
+            const immediateSettings = new Set([key]);
+            const immediateSettingsObject = setPendingSettingValueAny(
+              key,
+              newValue,
+              {} as Settings,
+            );
+            saveModifiedSettings(
+              immediateSettings,
+              immediateSettingsObject,
+              settings,
+              selectedScope,
+            );
 
-            // Add/update pending change globally so it persists across scopes
-            setGlobalPendingChanges((prev) => {
-              const next = new Map(prev);
-              next.set(key, newValue as PendingValue);
-              return next;
-            });
+            // Mark as needing restart and show prompt
+            setRestartRequiredSettings((prev) => new Set(prev).add(key));
           }
         },
       };
@@ -296,7 +299,7 @@ export function SettingsDialog({
       return;
     }
 
-    let parsed: string | number;
+    let parsed: string | number | undefined;
     if (type === 'number') {
       const numParsed = Number(editBuffer.trim());
       if (Number.isNaN(numParsed)) {
@@ -309,19 +312,32 @@ export function SettingsDialog({
       parsed = numParsed;
     } else {
       // For strings, use the buffer as is.
-      parsed = editBuffer;
+      // Special handling for outputLanguage: empty input means 'auto'
+      if (key === 'general.outputLanguage') {
+        const trimmed = editBuffer.trim();
+        parsed = trimmed === '' ? 'auto' : trimmed;
+      } else {
+        parsed = editBuffer;
+      }
     }
 
     // Update pending
-    setPendingSettings((prev) => setPendingSettingValueAny(key, parsed, prev));
+    setPendingSettings((prev) =>
+      parsed === undefined
+        ? setPendingSettingValueAny(
+            key,
+            undefined as unknown as SettingsValue,
+            prev,
+          )
+        : setPendingSettingValueAny(key, parsed, prev),
+    );
 
     if (!requiresRestart(key)) {
       const immediateSettings = new Set([key]);
-      const immediateSettingsObject = setPendingSettingValueAny(
-        key,
-        parsed,
-        {} as Settings,
-      );
+      const immediateSettingsObject =
+        parsed === undefined
+          ? ({} as Settings)
+          : setPendingSettingValueAny(key, parsed, {} as Settings);
       saveModifiedSettings(
         immediateSettings,
         immediateSettingsObject,
@@ -349,25 +365,26 @@ export function SettingsDialog({
         return next;
       });
     } else {
-      // Mark as modified and needing restart
-      setModifiedSettings((prev) => {
-        const updated = new Set(prev).add(key);
-        const needsRestart = hasRestartRequiredSettings(updated);
-        if (needsRestart) {
-          setShowRestartPrompt(true);
-          setRestartRequiredSettings((prevRestart) =>
-            new Set(prevRestart).add(key),
-          );
-        }
-        return updated;
-      });
+      // For restart-required settings, save immediately but show restart prompt
+      const immediateSettings = new Set([key]);
+      const immediateSettingsObject =
+        parsed === undefined
+          ? ({} as Settings)
+          : setPendingSettingValueAny(key, parsed, {} as Settings);
+      saveModifiedSettings(
+        immediateSettings,
+        immediateSettingsObject,
+        settings,
+        selectedScope,
+      );
 
-      // Record pending change globally for persistence across scopes
-      setGlobalPendingChanges((prev) => {
-        const next = new Map(prev);
-        next.set(key, parsed as PendingValue);
-        return next;
-      });
+      // Update output language rule file immediately (no restart needed for LLM effect)
+      if (key === 'general.outputLanguage' && typeof parsed === 'string') {
+        updateOutputLanguageFile(parsed);
+      }
+
+      // Mark as needing restart and show prompt
+      setRestartRequiredSettings((prev) => new Set(prev).add(key));
     }
 
     setEditingKey(null);
@@ -381,15 +398,20 @@ export function SettingsDialog({
 
   const handleScopeSelect = (scope: SettingScope) => {
     handleScopeHighlight(scope);
-    setFocusSection('settings');
+    setMode('settings');
   };
+
+  // Get the description for the currently active setting
+  const activeDescription =
+    mode === 'settings' && items[activeSettingIndex]?.description
+      ? items[activeSettingIndex].description
+      : undefined;
 
   // Height constraint calculations similar to ThemeDialog
   const DIALOG_PADDING = 2;
   const SETTINGS_TITLE_HEIGHT = 2; // "Settings" title + spacing
   const SCROLL_ARROWS_HEIGHT = 2; // Up and down arrows
-  const SPACING_HEIGHT = 1; // Space between settings list and scope
-  const SCOPE_SELECTION_HEIGHT = 4; // Apply To section height
+  const DESCRIPTION_HEIGHT = 2; // Description line + margin
   const BOTTOM_HELP_TEXT_HEIGHT = 1; // Help text
   const RESTART_PROMPT_HEIGHT = showRestartPrompt ? 1 : 0;
 
@@ -397,70 +419,28 @@ export function SettingsDialog({
     availableTerminalHeight ?? Number.MAX_SAFE_INTEGER;
   currentAvailableTerminalHeight -= 2; // Top and bottom borders
 
-  // Start with basic fixed height (without scope selection)
-  let totalFixedHeight =
+  // Calculate fixed height (scope selection is now in a separate view, not included here)
+  const totalFixedHeight =
     DIALOG_PADDING +
     SETTINGS_TITLE_HEIGHT +
     SCROLL_ARROWS_HEIGHT +
-    SPACING_HEIGHT +
+    DESCRIPTION_HEIGHT +
     BOTTOM_HELP_TEXT_HEIGHT +
     RESTART_PROMPT_HEIGHT;
 
   // Calculate how much space we have for settings
-  let availableHeightForSettings = Math.max(
+  const availableHeightForSettings = Math.max(
     1,
     currentAvailableTerminalHeight - totalFixedHeight,
   );
 
-  // Each setting item takes 2 lines (the setting row + spacing)
-  let maxVisibleItems = Math.max(1, Math.floor(availableHeightForSettings / 2));
-
-  // Decide whether to show scope selection based on remaining space
-  let showScopeSelection = true;
-
-  // If we have limited height, prioritize showing more settings over scope selection
-  if (availableTerminalHeight && availableTerminalHeight < 25) {
-    // For very limited height, hide scope selection to show more settings
-    const totalWithScope = totalFixedHeight + SCOPE_SELECTION_HEIGHT;
-    const availableWithScope = Math.max(
-      1,
-      currentAvailableTerminalHeight - totalWithScope,
-    );
-    const maxItemsWithScope = Math.max(1, Math.floor(availableWithScope / 2));
-
-    // If hiding scope selection allows us to show significantly more settings, do it
-    if (maxVisibleItems > maxItemsWithScope + 1) {
-      showScopeSelection = false;
-    } else {
-      // Otherwise include scope selection and recalculate
-      totalFixedHeight += SCOPE_SELECTION_HEIGHT;
-      availableHeightForSettings = Math.max(
-        1,
-        currentAvailableTerminalHeight - totalFixedHeight,
-      );
-      maxVisibleItems = Math.max(1, Math.floor(availableHeightForSettings / 2));
-    }
-  } else {
-    // For normal height, include scope selection
-    totalFixedHeight += SCOPE_SELECTION_HEIGHT;
-    availableHeightForSettings = Math.max(
-      1,
-      currentAvailableTerminalHeight - totalFixedHeight,
-    );
-    maxVisibleItems = Math.max(1, Math.floor(availableHeightForSettings / 2));
-  }
+  // Each setting item takes 1 line
+  const maxVisibleItems = Math.max(1, availableHeightForSettings);
 
   // Use the calculated maxVisibleItems or fall back to the original maxItemsToShow
   const effectiveMaxItemsToShow = availableTerminalHeight
     ? Math.min(maxVisibleItems, items.length)
     : maxItemsToShow;
-
-  // Ensure focus stays on settings when scope selection is hidden
-  React.useEffect(() => {
-    if (!showScopeSelection && focusSection === 'scope') {
-      setFocusSection('settings');
-    }
-  }, [showScopeSelection, focusSection]);
 
   // Scroll logic for settings
   const visibleItems = items.slice(
@@ -474,10 +454,10 @@ export function SettingsDialog({
   useKeypress(
     (key) => {
       const { name, ctrl } = key;
-      if (name === 'tab' && showScopeSelection) {
-        setFocusSection((prev) => (prev === 'settings' ? 'scope' : 'settings'));
+      if (name === 'tab') {
+        setMode((prev) => (prev === 'settings' ? 'scope' : 'settings'));
       }
-      if (focusSection === 'settings') {
+      if (mode === 'settings') {
         // If editing, capture input and control keys
         if (editingKey) {
           const definition = getSettingDefinition(editingKey);
@@ -567,8 +547,8 @@ export function SettingsDialog({
           // Block other keys while editing
           return;
         }
-        if (name === 'up' || name === 'k') {
-          // If editing, commit first
+        if (keyMatchers[Command.SELECTION_UP](key)) {
+          // ↑/k/Ctrl+P all move selection up. If editing, commit first.
           if (editingKey) {
             commitEdit(editingKey);
           }
@@ -583,8 +563,8 @@ export function SettingsDialog({
           } else if (newIndex < scrollOffset) {
             setScrollOffset(newIndex);
           }
-        } else if (name === 'down' || name === 'j') {
-          // If editing, commit first
+        } else if (keyMatchers[Command.SELECTION_DOWN](key)) {
+          // ↓/j/Ctrl+N all move selection down. If editing, commit first.
           if (editingKey) {
             commitEdit(editingKey);
           }
@@ -599,6 +579,24 @@ export function SettingsDialog({
           }
         } else if (name === 'return' || name === 'space') {
           const currentItem = items[activeSettingIndex];
+          if (currentItem?.value === 'ui.theme') {
+            if (name === 'return') {
+              onSelect('ui.theme', selectedScope);
+            }
+            return;
+          }
+          if (currentItem?.value === 'general.preferredEditor') {
+            if (name === 'return') {
+              onSelect('general.preferredEditor', selectedScope);
+            }
+            return;
+          }
+          if (currentItem?.value === 'fastModel') {
+            if (name === 'return') {
+              onSelect('fastModel', selectedScope);
+            }
+            return;
+          }
           if (
             currentItem?.type === 'number' ||
             currentItem?.type === 'string'
@@ -606,6 +604,16 @@ export function SettingsDialog({
             startEditing(currentItem.value);
           } else {
             currentItem?.toggle();
+          }
+        } else if (name === 'right') {
+          // Right arrow opens sub-dialog settings (like a sub-menu)
+          const currentItem = items[activeSettingIndex];
+          if (
+            currentItem?.value === 'ui.theme' ||
+            currentItem?.value === 'general.preferredEditor' ||
+            currentItem?.value === 'fastModel'
+          ) {
+            onSelect(currentItem.value, selectedScope);
           }
         } else if (/^[0-9]$/.test(key.sequence || '') && !editingKey) {
           const currentItem = items[activeSettingIndex];
@@ -697,7 +705,7 @@ export function SettingsDialog({
                 try {
                   config?.setApprovalMode(settings.merged.tools.approvalMode);
                 } catch (error) {
-                  console.error(
+                  debugLogger.error(
                     'Failed to apply approval mode to current session:',
                     error,
                   );
@@ -727,6 +735,9 @@ export function SettingsDialog({
                   return next;
                 });
               }
+              setRestartRequiredSettings((prev) =>
+                new Set(prev).add(currentSetting.value),
+              );
             }
           }
         }
@@ -756,7 +767,6 @@ export function SettingsDialog({
           });
         }
 
-        setShowRestartPrompt(false);
         setRestartRequiredSettings(new Set()); // Clear restart-required settings
         if (onRestartRequest) onRestartRequest();
       }
@@ -775,97 +785,106 @@ export function SettingsDialog({
     <Box
       borderStyle="round"
       borderColor={theme.border.default}
-      flexDirection="row"
+      flexDirection="column"
       padding={1}
       width="100%"
-      height="100%"
     >
-      <Box flexDirection="column" flexGrow={1}>
-        <Text bold={focusSection === 'settings'} wrap="truncate">
-          {focusSection === 'settings' ? '> ' : '  '}
-          {t('Settings')}
-        </Text>
-        <Box height={1} />
-        {showScrollUp && <Text color={theme.text.secondary}>▲</Text>}
-        {visibleItems.map((item, idx) => {
-          const isActive =
-            focusSection === 'settings' &&
-            activeSettingIndex === idx + scrollOffset;
+      {mode === 'settings' ? (
+        <Box flexDirection="column" flexGrow={1}>
+          <Text bold={mode === 'settings'} wrap="truncate">
+            {mode === 'settings' ? '> ' : '  '}
+            {t('Settings')}
+          </Text>
+          <Box height={1} />
+          {showScrollUp && <Text color={theme.text.secondary}>▲</Text>}
+          {visibleItems.map((item, idx) => {
+            const isActive =
+              mode === 'settings' && activeSettingIndex === idx + scrollOffset;
 
-          const scopeSettings = settings.forScope(selectedScope).settings;
-          const mergedSettings = settings.merged;
+            const scopeSettings = settings.forScope(selectedScope).settings;
+            const mergedSettings = settings.merged;
 
-          let displayValue: string;
-          if (editingKey === item.value) {
-            // Show edit buffer with advanced cursor highlighting
-            if (cursorVisible && editCursorPos < cpLen(editBuffer)) {
-              // Cursor is in the middle or at start of text
-              const beforeCursor = cpSlice(editBuffer, 0, editCursorPos);
-              const atCursor = cpSlice(
-                editBuffer,
-                editCursorPos,
-                editCursorPos + 1,
+            let displayValue: string;
+            if (editingKey === item.value) {
+              // Show edit buffer with advanced cursor highlighting
+              if (cursorVisible && editCursorPos < cpLen(editBuffer)) {
+                // Cursor is in the middle or at start of text
+                const beforeCursor = cpSlice(editBuffer, 0, editCursorPos);
+                const atCursor = cpSlice(
+                  editBuffer,
+                  editCursorPos,
+                  editCursorPos + 1,
+                );
+                const afterCursor = cpSlice(editBuffer, editCursorPos + 1);
+                displayValue =
+                  beforeCursor + chalk.inverse(atCursor) + afterCursor;
+              } else if (cursorVisible && editCursorPos >= cpLen(editBuffer)) {
+                // Cursor is at the end - show inverted space
+                displayValue = editBuffer + chalk.inverse(' ');
+              } else {
+                // Cursor not visible
+                displayValue = editBuffer;
+              }
+            } else if (item.type === 'number' || item.type === 'string') {
+              // Settings that open a sub-dialog on Enter
+              const isSubDialogSetting =
+                item.value === 'ui.theme' ||
+                item.value === 'general.preferredEditor' ||
+                item.value === 'fastModel';
+
+              // For numbers/strings, get the actual current value from pending settings
+              const path = item.value.split('.');
+              const currentValue = getNestedValue(pendingSettings, path);
+
+              const defaultValue = getDefaultValue(item.value);
+
+              if (currentValue !== undefined && currentValue !== null) {
+                displayValue = String(currentValue);
+              } else {
+                displayValue =
+                  defaultValue !== undefined && defaultValue !== null
+                    ? String(defaultValue)
+                    : '';
+              }
+
+              // Add * if value differs from default OR if currently being modified
+              const isModified = modifiedSettings.has(item.value);
+              const effectiveCurrentValue =
+                currentValue !== undefined && currentValue !== null
+                  ? currentValue
+                  : defaultValue;
+              const isDifferentFromDefault =
+                effectiveCurrentValue !== defaultValue;
+
+              if (isDifferentFromDefault || isModified) {
+                displayValue += '*';
+              }
+
+              // Append ▸ for sub-dialog settings to hint Enter opens a picker
+              if (isSubDialogSetting) {
+                displayValue = displayValue ? displayValue + ' ▸' : '▸';
+              }
+            } else {
+              // For booleans and other types, use existing logic
+              displayValue = getDisplayValue(
+                item.value,
+                scopeSettings,
+                mergedSettings,
+                modifiedSettings,
+                pendingSettings,
               );
-              const afterCursor = cpSlice(editBuffer, editCursorPos + 1);
-              displayValue =
-                beforeCursor + chalk.inverse(atCursor) + afterCursor;
-            } else if (cursorVisible && editCursorPos >= cpLen(editBuffer)) {
-              // Cursor is at the end - show inverted space
-              displayValue = editBuffer + chalk.inverse(' ');
-            } else {
-              // Cursor not visible
-              displayValue = editBuffer;
             }
-          } else if (item.type === 'number' || item.type === 'string') {
-            // For numbers/strings, get the actual current value from pending settings
-            const path = item.value.split('.');
-            const currentValue = getNestedValue(pendingSettings, path);
+            const shouldBeGreyedOut = isDefaultValue(item.value, scopeSettings);
 
-            const defaultValue = getDefaultValue(item.value);
-
-            if (currentValue !== undefined && currentValue !== null) {
-              displayValue = String(currentValue);
-            } else {
-              displayValue =
-                defaultValue !== undefined && defaultValue !== null
-                  ? String(defaultValue)
-                  : '';
-            }
-
-            // Add * if value differs from default OR if currently being modified
-            const isModified = modifiedSettings.has(item.value);
-            const effectiveCurrentValue =
-              currentValue !== undefined && currentValue !== null
-                ? currentValue
-                : defaultValue;
-            const isDifferentFromDefault =
-              effectiveCurrentValue !== defaultValue;
-
-            if (isDifferentFromDefault || isModified) {
-              displayValue += '*';
-            }
-          } else {
-            // For booleans and other types, use existing logic
-            displayValue = getDisplayValue(
+            // Generate scope message for this setting
+            const scopeMessage = getScopeMessageForSetting(
               item.value,
-              scopeSettings,
-              mergedSettings,
-              modifiedSettings,
-              pendingSettings,
+              selectedScope,
+              settings,
             );
-          }
-          const shouldBeGreyedOut = isDefaultValue(item.value, scopeSettings);
 
-          // Generate scope message for this setting
-          const scopeMessage = getScopeMessageForSetting(
-            item.value,
-            selectedScope,
-            settings,
-          );
-
-          return (
-            <React.Fragment key={item.value}>
-              <Box flexDirection="row" alignItems="center">
+            return (
+              <Box key={item.value} flexDirection="row" alignItems="center">
                 <Box minWidth={2} flexShrink={0}>
                   <Text
                     color={
@@ -875,9 +894,10 @@ export function SettingsDialog({
                     {isActive ? '●' : ''}
                   </Text>
                 </Box>
-                <Box minWidth={50}>
+                <Box flexGrow={1} flexShrink={1}>
                   <Text
                     color={isActive ? theme.status.success : theme.text.primary}
+                    wrap="truncate"
                   >
                     {item.label}
                     {scopeMessage && (
@@ -885,53 +905,54 @@ export function SettingsDialog({
                     )}
                   </Text>
                 </Box>
-                <Box minWidth={3} />
-                <Text
-                  color={
-                    isActive
-                      ? theme.status.success
-                      : shouldBeGreyedOut
-                        ? theme.text.secondary
-                        : theme.text.primary
-                  }
-                >
-                  {displayValue}
-                </Text>
+                <Box marginLeft={1} flexShrink={0}>
+                  <Text
+                    color={
+                      isActive
+                        ? theme.status.success
+                        : shouldBeGreyedOut
+                          ? theme.text.secondary
+                          : theme.text.primary
+                    }
+                    wrap="truncate"
+                  >
+                    {displayValue}
+                  </Text>
+                </Box>
               </Box>
-              <Box height={1} />
-            </React.Fragment>
-          );
-        })}
-        {showScrollDown && <Text color={theme.text.secondary}>▼</Text>}
-
-        <Box height={1} />
-
-        {/* Scope Selection - conditionally visible based on height constraints */}
-        {showScopeSelection && (
-          <Box marginTop={1}>
-            <ScopeSelector
-              onSelect={handleScopeSelect}
-              onHighlight={handleScopeHighlight}
-              isFocused={focusSection === 'scope'}
-              initialScope={selectedScope}
-            />
-          </Box>
-        )}
-
-        <Box height={1} />
-        <Text color={theme.text.secondary}>
-          {t('(Use Enter to select{{tabText}})', {
-            tabText: showScopeSelection ? t(', Tab to change focus') : '',
+            );
           })}
-        </Text>
-        {showRestartPrompt && (
-          <Text color={theme.status.warning}>
-            {t(
-              'To see changes, Qwen Code must be restarted. Press r to exit and apply changes now.',
-            )}
+          {showScrollDown && <Text color={theme.text.secondary}>▼</Text>}
+        </Box>
+      ) : (
+        <ScopeSelector
+          onSelect={handleScopeSelect}
+          onHighlight={handleScopeHighlight}
+          isFocused={mode === 'scope'}
+          initialScope={selectedScope}
+        />
+      )}
+      {activeDescription && mode === 'settings' && (
+        <Box marginTop={1}>
+          <Text color={theme.text.secondary} wrap="truncate-end" italic>
+            {activeDescription}
           </Text>
-        )}
+        </Box>
+      )}
+      <Box marginTop={activeDescription && mode === 'settings' ? 0 : 1}>
+        <Text color={theme.text.secondary} wrap="truncate">
+          {mode === 'settings'
+            ? t('(Use Enter to select, Tab to configure scope)')
+            : t('(Use Enter to apply scope, Tab to go back)')}
+        </Text>
       </Box>
+      {showRestartPrompt && (
+        <Text color={theme.status.warning}>
+          {t(
+            'To see changes, Qwen Code must be restarted. Press r to exit and apply changes now.',
+          )}
+        </Text>
+      )}
     </Box>
   );
 }

@@ -5,7 +5,7 @@
  */
 
 import { useState, useCallback } from 'react';
-import { themeManager } from '../themes/theme-manager.js';
+import { themeManager, AUTO_THEME_NAME } from '../themes/theme-manager.js';
 import type { LoadedSettings, SettingScope } from '../../config/settings.js'; // Import LoadedSettings, AppSettings, MergedSetting
 import { type HistoryItem, MessageType } from '../types.js';
 import process from 'node:process';
@@ -29,6 +29,9 @@ export const useThemeCommand = (
 ): UseThemeCommandReturn => {
   const [isThemeDialogOpen, setIsThemeDialogOpen] =
     useState(!!initialThemeError);
+  const [themeBeforeDialogOpen, setThemeBeforeDialogOpen] = useState<
+    string | undefined
+  >(themeManager.getActiveTheme().name);
 
   const openThemeDialog = useCallback(() => {
     if (process.env['NO_COLOR']) {
@@ -43,6 +46,9 @@ export const useThemeCommand = (
       );
       return;
     }
+    // The theme may temporarily change while navigating the list; keep the
+    // original value to restore it if user cancels with Esc/Ctrl+C.
+    setThemeBeforeDialogOpen(themeManager.getActiveTheme().name);
     setIsThemeDialogOpen(true);
   }, [addItem]);
 
@@ -72,16 +78,25 @@ export const useThemeCommand = (
 
   const handleThemeSelect = useCallback(
     (themeName: string | undefined, scope: SettingScope) => {
+      // Undefined means "cancel": close dialog and restore original theme.
+      if (themeName === undefined) {
+        applyTheme(themeBeforeDialogOpen);
+        setThemeError(null);
+        setIsThemeDialogOpen(false);
+        return;
+      }
+
       try {
         // Merge user and workspace custom themes (workspace takes precedence)
         const mergedCustomThemes = {
           ...(loadedSettings.user.settings.ui?.customThemes || {}),
           ...(loadedSettings.workspace.settings.ui?.customThemes || {}),
         };
-        // Only allow selecting themes available in the merged custom themes or built-in themes
+        // Only allow selecting themes available in the merged custom themes, built-in themes, or 'auto'
+        const isAuto = themeName === AUTO_THEME_NAME;
         const isBuiltIn = themeManager.findThemeByName(themeName);
         const isCustom = themeName && mergedCustomThemes[themeName];
-        if (!isBuiltIn && !isCustom) {
+        if (!isAuto && !isBuiltIn && !isCustom) {
           setThemeError(
             t('Theme "{{themeName}}" not found in selected scope.', {
               themeName: themeName ?? '',
@@ -100,7 +115,7 @@ export const useThemeCommand = (
         setIsThemeDialogOpen(false); // Close the dialog
       }
     },
-    [applyTheme, loadedSettings, setThemeError],
+    [applyTheme, loadedSettings, setThemeError, themeBeforeDialogOpen],
   );
 
   return {

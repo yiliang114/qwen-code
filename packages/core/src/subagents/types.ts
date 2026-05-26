@@ -4,21 +4,39 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { Content, FunctionDeclaration } from '@google/genai';
+/**
+ * @fileoverview Subagent configuration types.
+ *
+ * Agent runtime types (PromptConfig, ModelConfig, RunConfig, ToolConfig,
+ * AgentTerminateMode) are canonically defined in agents/runtime/agent-types.ts.
+ */
+
+import type {
+  ModelConfig,
+  RunConfig,
+  PromptConfig,
+  ToolConfig,
+} from '../agents/runtime/agent-types.js';
 
 /**
  * Represents the storage level for a subagent configuration.
+ * - 'session': Session-level agents provided at runtime, read-only (highest priority)
  * - 'project': Stored in `.qwen/agents/` within the project directory
  * - 'user': Stored in `~/.qwen/agents/` in the user's home directory
- * - 'builtin': Built-in agents embedded in the codebase, always available
- * - 'session': Session-level agents provided at runtime, read-only
+ * - 'extension': Provided by an installed extension
+ * - 'builtin': Built-in agents embedded in the codebase, always available (lowest priority)
  */
-export type SubagentLevel = 'project' | 'user' | 'builtin' | 'session';
+export type SubagentLevel =
+  | 'session'
+  | 'project'
+  | 'user'
+  | 'extension'
+  | 'builtin';
 
 /**
  * Core configuration for a subagent as stored in Markdown files.
  * This interface represents the file-based configuration that gets
- * converted to runtime configuration for SubAgentScope.
+ * converted to runtime configuration for AgentHeadless.
  */
 export interface SubagentConfig {
   /** Unique name identifier for the subagent */
@@ -34,6 +52,23 @@ export interface SubagentConfig {
   tools?: string[];
 
   /**
+   * Optional list of tool names that this subagent is NOT allowed to use.
+   * Applied after the allowlist (`tools`) and MCP bypass. Supports
+   * MCP server-level patterns (e.g., "mcp__server" blocks all tools
+   * from that server).
+   */
+  disallowedTools?: string[];
+
+  /**
+   * Optional permission mode for this subagent.
+   * Controls how tool calls are approved during execution.
+   * Valid values: 'default', 'plan', 'auto-edit', 'yolo'.
+   * If omitted, the resolved mode depends on the parent's mode
+   * (permissive parent modes win; otherwise defaults to 'auto-edit').
+   */
+  approvalMode?: string;
+
+  /**
    * System prompt content that defines the subagent's behavior.
    * Supports ${variable} templating via ContextState.
    */
@@ -46,10 +81,14 @@ export interface SubagentConfig {
   filePath?: string;
 
   /**
-   * Optional model configuration. If not provided, uses defaults.
-   * Can specify model name, temperature, and top_p values.
+   * Optional model selector.
+   * - Omitted or 'inherit': use the main conversation model
+   * - 'fast': use the configured fast model when available; supports
+   *   authType-qualified fastModel settings and silently inherits otherwise
+   * - 'model-id': use the given model with the main conversation authType
+   * - 'authType:model-id': use the given authType and model ID
    */
-  modelConfig?: Partial<ModelConfig>;
+  model?: string;
 
   /**
    * Optional runtime configuration. If not provided, uses defaults.
@@ -64,27 +103,39 @@ export interface SubagentConfig {
   color?: string;
 
   /**
+   * When true, this agent always runs as a background task when spawned.
+   * OR'd with the `run_in_background` tool parameter — if either is true,
+   * the agent runs in the background.
+   */
+  background?: boolean;
+
+  /**
    * Indicates whether this is a built-in agent.
    * Built-in agents cannot be modified or deleted.
    */
   readonly isBuiltin?: boolean;
+
+  /**
+   * For extension-level subagents: the name of the providing extension
+   */
+  extensionName?: string;
 }
 
 /**
- * Runtime configuration that converts file-based config to existing SubAgentScope.
+ * Runtime configuration that converts file-based config to AgentHeadless.
  * This interface maps SubagentConfig to the existing runtime interfaces.
  */
 export interface SubagentRuntimeConfig {
-  /** Prompt configuration for SubAgentScope */
+  /** Prompt configuration for AgentHeadless */
   promptConfig: PromptConfig;
 
-  /** Model configuration for SubAgentScope */
+  /** Model configuration for AgentHeadless */
   modelConfig: ModelConfig;
 
-  /** Runtime execution configuration for SubAgentScope */
+  /** Runtime execution configuration for AgentHeadless */
   runConfig: RunConfig;
 
-  /** Optional tool configuration for SubAgentScope */
+  /** Optional tool configuration for AgentHeadless */
   toolConfig?: ToolConfig;
 }
 
@@ -165,97 +216,3 @@ export const SubagentErrorCode = {
 
 export type SubagentErrorCode =
   (typeof SubagentErrorCode)[keyof typeof SubagentErrorCode];
-
-/**
- * Describes the possible termination modes for a subagent.
- * This enum provides a clear indication of why a subagent's execution might have ended.
- */
-export enum SubagentTerminateMode {
-  /**
-   * Indicates that the subagent's execution terminated due to an unrecoverable error.
-   */
-  ERROR = 'ERROR',
-  /**
-   * Indicates that the subagent's execution terminated because it exceeded the maximum allowed working time.
-   */
-  TIMEOUT = 'TIMEOUT',
-  /**
-   * Indicates that the subagent's execution successfully completed all its defined goals.
-   */
-  GOAL = 'GOAL',
-  /**
-   * Indicates that the subagent's execution terminated because it exceeded the maximum number of turns.
-   */
-  MAX_TURNS = 'MAX_TURNS',
-  /**
-   * Indicates that the subagent's execution was cancelled via an abort signal.
-   */
-  CANCELLED = 'CANCELLED',
-}
-
-/**
- * Configures the initial prompt for the subagent.
- */
-export interface PromptConfig {
-  /**
-   * A single system prompt string that defines the subagent's persona and instructions.
-   * Note: You should use either `systemPrompt` or `initialMessages`, but not both.
-   */
-  systemPrompt?: string;
-
-  /**
-   * An array of user/model content pairs to seed the chat history for few-shot prompting.
-   * Note: You should use either `systemPrompt` or `initialMessages`, but not both.
-   */
-  initialMessages?: Content[];
-}
-
-/**
- * Configures the tools available to the subagent during its execution.
- */
-export interface ToolConfig {
-  /**
-   * A list of tool names (from the tool registry) or full function declarations
-   * that the subagent is permitted to use.
-   */
-  tools: Array<string | FunctionDeclaration>;
-}
-
-/**
- * Configures the generative model parameters for the subagent.
- * This interface specifies the model to be used and its associated generation settings,
- * such as temperature and top-p values, which influence the creativity and diversity of the model's output.
- */
-export interface ModelConfig {
-  /**
-   * The name or identifier of the model to be used (e.g., 'qwen3-coder-plus').
-   *
-   * TODO: In the future, this needs to support 'auto' or some other string to support routing use cases.
-   */
-  model?: string;
-  /**
-   * The temperature for the model's sampling process.
-   */
-  temp?: number;
-  /**
-   * The top-p value for nucleus sampling.
-   */
-  top_p?: number;
-}
-
-/**
- * Configures the execution environment and constraints for the subagent.
- * This interface defines parameters that control the subagent's runtime behavior,
- * such as maximum execution time, to prevent infinite loops or excessive resource consumption.
- *
- * TODO: Consider adding max_tokens as a form of budgeting.
- */
-export interface RunConfig {
-  /** The maximum execution time for the subagent in minutes. */
-  max_time_minutes?: number;
-  /**
-   * The maximum number of conversational turns (a user message + model response)
-   * before the execution is terminated. Helps prevent infinite loops.
-   */
-  max_turns?: number;
-}

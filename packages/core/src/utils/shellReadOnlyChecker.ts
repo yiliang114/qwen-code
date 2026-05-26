@@ -4,6 +4,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+/**
+ * @deprecated Use `isShellCommandReadOnlyAST` from `./shellAstParser.js` instead.
+ * This module uses regex + shell-quote for command parsing and has known edge-case
+ * limitations. The AST-based replacement provides accurate parsing via tree-sitter-bash.
+ */
+
 import { parse } from 'shell-quote';
 import {
   detectCommandSubstitution,
@@ -91,6 +97,30 @@ const BLOCKED_GIT_BRANCH_FLAGS = new Set([
 ]);
 
 const BLOCKED_SED_PREFIXES = ['-i'];
+
+// AWK side-effect patterns that can execute commands or write files
+const AWK_SIDE_EFFECT_PATTERNS = [
+  /system\s*\(/, // system() function calls
+  /print\s+[^>|]*>\s*"[^"]*"/, // print > "file"
+  /printf\s+[^>|]*>\s*"[^"]*"/, // printf > "file"
+  /print\s+[^>|]*>>\s*"[^"]*"/, // print >> "file"
+  /printf\s+[^>|]*>>\s*"[^"]*"/, // printf >> "file"
+  /print\s+[^|]*\|\s*"[^"]*"/, // print | "command"
+  /printf\s+[^|]*\|\s*"[^"]*"/, // printf | "command"
+  /getline\s*<\s*"[^"]*"/, // getline < "command"
+  /"[^"]*"\s*\|\s*getline/, // "command" | getline
+  /close\s*\(/, // close() can trigger command execution
+];
+
+// SED side-effect patterns
+const SED_SIDE_EFFECT_PATTERNS = [
+  /[^\\]e\s/, // e command (execute)
+  /^e\s/, // e command at start
+  /[^\\]w\s/, // w command (write)
+  /^w\s/, // w command at start
+  /[^\\]r\s/, // r command (read file)
+  /^r\s/, // r command at start
+];
 
 const ENV_ASSIGNMENT_REGEX = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
@@ -182,6 +212,31 @@ function evaluateSedCommand(tokens: string[]): boolean {
       return false;
     }
   }
+
+  // Check for side-effect patterns in sed script
+  const scriptContent = rest.join(' ');
+  for (const pattern of SED_SIDE_EFFECT_PATTERNS) {
+    if (pattern.test(scriptContent)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function evaluateAwkCommand(tokens: string[]): boolean {
+  const [, ...rest] = tokens;
+
+  // Join all arguments to check for awk script content
+  const scriptContent = rest.join(' ');
+
+  // Check for dangerous side-effect patterns
+  for (const pattern of AWK_SIDE_EFFECT_PATTERNS) {
+    if (pattern.test(scriptContent)) {
+      return false;
+    }
+  }
+
   return true;
 }
 
@@ -276,6 +331,10 @@ function evaluateShellSegment(segment: string): boolean {
     return evaluateSedCommand([normalizedRoot, ...args]);
   }
 
+  if (normalizedRoot === 'awk') {
+    return evaluateAwkCommand([normalizedRoot, ...args]);
+  }
+
   if (normalizedRoot === 'git') {
     return evaluateGitCommand([normalizedRoot, ...args]);
   }
@@ -283,18 +342,23 @@ function evaluateShellSegment(segment: string): boolean {
   return true;
 }
 
+/**
+ * @deprecated Use `isShellCommandReadOnlyAST` from `./shellAstParser.js` instead.
+ * This function uses regex + shell-quote for command parsing with known edge-case
+ * limitations. The AST-based replacement provides accurate parsing via tree-sitter-bash.
+ */
 export function isShellCommandReadOnly(command: string): boolean {
   if (typeof command !== 'string' || !command.trim()) {
     return false;
   }
 
   const segments = splitCommands(command);
+
   for (const segment of segments) {
-    const isAllowed = evaluateShellSegment(segment);
-    if (!isAllowed) {
+    if (!evaluateShellSegment(segment)) {
       return false;
     }
   }
 
-  return true;
+  return segments.length > 0;
 }

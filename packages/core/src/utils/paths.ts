@@ -15,11 +15,52 @@ export const QWEN_DIR = '.qwen';
 export const GOOGLE_ACCOUNTS_FILENAME = 'google_accounts.json';
 
 /**
+ * Cache for `validatePath`'s isDirectory check. Only positive results are
+ * cached — ENOENT and other errors fall through every time so a freshly
+ * created file is picked up immediately. Same path validated by back-to-back
+ * tool calls (very common: model reads several files in one dir) used to
+ * cost one syscall each.
+ *
+ * **Known tradeoff:** if a path is deleted and recreated as a different
+ * type (dir→file or file→dir) within the same process, the cache returns
+ * the stale type. The downstream tool will then hit a meaningful error
+ * (e.g., "not a directory") instead of a clean "does not exist", but no
+ * files are corrupted. This is rare enough in model-driven workflows that
+ * we accept the staleness for the common-case perf win.
+ */
+const isDirectoryCache = new Map<string, boolean>();
+const VALIDATE_PATH_CACHE_MAX = 1024;
+
+/**
+ * Test-only: clear the validatePath stat cache. Module-level state would
+ * otherwise leak across vitest cases — `beforeEach(() => _resetValidatePathCacheForTest())`.
+ */
+export function _resetValidatePathCacheForTest(): void {
+  isDirectoryCache.clear();
+}
+
+/**
  * Special characters that need to be escaped in file paths for shell compatibility.
  * Includes: spaces, parentheses, brackets, braces, semicolons, ampersands, pipes,
  * asterisks, question marks, dollar signs, backticks, quotes, hash, and other shell metacharacters.
  */
 export const SHELL_SPECIAL_CHARS = /[ \t()[\]{};|*?$`'"#&<>!~]/;
+
+// Single shared list of path-argument keys used across file tools.
+// file_path (Edit, ReadFile, WriteFile), path (Glob, Grep, Ls, RipGrep),
+// filePath (Lsp), notebook_path.
+export const PATH_ARG_KEYS = [
+  'file_path',
+  'path',
+  'filePath',
+  'notebook_path',
+] as const;
+
+/** Compiled regex for unescapePath — hoisted to avoid re-compilation per call. */
+const UNESCAPE_REGEX = (() => {
+  const inner = SHELL_SPECIAL_CHARS.source.slice(1, -1);
+  return new RegExp(`\\\\([${inner}])`, 'g');
+})();
 
 /**
  * Replaces the home directory with a tilde.
@@ -35,7 +76,26 @@ export function tildeifyPath(path: string): string {
 }
 
 /**
+ * Expands tilde (~) and Windows-style %userprofile% to the full home directory path.
+ * @param p - The path to expand.
+ * @returns The expanded path.
+ */
+export function expandHomeDir(p: string): string {
+  if (!p) {
+    return '';
+  }
+  let expandedPath = p;
+  if (p.toLowerCase().startsWith('%userprofile%')) {
+    expandedPath = os.homedir() + p.substring('%userprofile%'.length);
+  } else if (p === '~' || p.startsWith('~/')) {
+    expandedPath = os.homedir() + p.substring(1);
+  }
+  return path.normalize(expandedPath);
+}
+
+/**
  * Shortens a path string if it exceeds maxLen, prioritizing the start and end segments.
+ * Shows root + first segment + "..." + end segments when middle segments are omitted.
  * Example: /path/to/a/very/long/file.txt -> /path/.../long/file.txt
  */
 export function shortenPath(filePath: string, maxLen: number = 80): string {
@@ -43,65 +103,82 @@ export function shortenPath(filePath: string, maxLen: number = 80): string {
     return filePath;
   }
 
+  const separator = path.sep;
+  const ellipsis = '...';
+
+  // Simple fallback for very short maxLen
+  if (maxLen < 10) {
+    return filePath.substring(0, maxLen - 3) + ellipsis;
+  }
+
   const parsedPath = path.parse(filePath);
   const root = parsedPath.root;
-  const separator = path.sep;
-
-  // Get segments of the path *after* the root
   const relativePath = filePath.substring(root.length);
-  const segments = relativePath.split(separator).filter((s) => s !== ''); // Filter out empty segments
+  const segments = relativePath.split(separator).filter((s) => s !== '');
 
-  // Handle cases with no segments after root (e.g., "/", "C:\") or only one segment
-  if (segments.length <= 1) {
-    // Fall back to simple start/end truncation for very short paths or single segments
-    const keepLen = Math.floor((maxLen - 3) / 2);
-    // Ensure keepLen is not negative if maxLen is very small
-    if (keepLen <= 0) {
-      return filePath.substring(0, maxLen - 3) + '...';
+  // Handle edge cases: no segments or single segment
+  if (segments.length === 0) {
+    return root.length <= maxLen
+      ? root
+      : root.substring(0, maxLen - 3) + ellipsis;
+  }
+
+  if (segments.length === 1) {
+    const full = root + segments[0];
+    if (full.length <= maxLen) {
+      return full;
     }
+    const keepLen = Math.floor((maxLen - 3) / 2);
+    const start = full.substring(0, keepLen);
+    const end = full.substring(full.length - keepLen);
+    return `${start}${ellipsis}${end}`;
+  }
+
+  // For 2+ segments: build from start and end, insert "..." if there's a gap
+  const startPart = root + segments[0]; // Always include root and first segment
+
+  // Collect segments from the end, working backwards
+  const endSegments: string[] = [];
+
+  for (let i = segments.length - 1; i >= 1; i--) {
+    const segment = segments[i];
+
+    // Calculate what the total would be if we add this segment
+    const endPart = [segment, ...endSegments].join(separator);
+    const needsEllipsis = i > 1; // If we're not at segment[1], there's a gap
+
+    let candidateResult: string;
+    if (needsEllipsis) {
+      candidateResult = startPart + separator + ellipsis + separator + endPart;
+    } else {
+      candidateResult = startPart + separator + endPart;
+    }
+
+    if (candidateResult.length <= maxLen) {
+      endSegments.unshift(segment);
+
+      // If we've reached segment[1], we have all segments - return immediately
+      if (i === 1) {
+        return candidateResult;
+      }
+    } else {
+      break; // Can't add more segments
+    }
+  }
+
+  // Build final result
+  if (endSegments.length === 0) {
+    // Couldn't fit any end segments - use simple truncation
+    const keepLen = Math.floor((maxLen - 3) / 2);
     const start = filePath.substring(0, keepLen);
     const end = filePath.substring(filePath.length - keepLen);
-    return `${start}...${end}`;
+    return `${start}${ellipsis}${end}`;
   }
 
-  const firstDir = segments[0];
-  const lastSegment = segments[segments.length - 1];
-  const startComponent = root + firstDir;
-
-  const endPartSegments: string[] = [];
-  // Base length: separator + "..." + lastDir
-  let currentLength = separator.length + lastSegment.length;
-
-  // Iterate backwards through segments (excluding the first one)
-  for (let i = segments.length - 2; i >= 0; i--) {
-    const segment = segments[i];
-    // Length needed if we add this segment: current + separator + segment
-    const lengthWithSegment = currentLength + separator.length + segment.length;
-
-    if (lengthWithSegment <= maxLen) {
-      endPartSegments.unshift(segment); // Add to the beginning of the end part
-      currentLength = lengthWithSegment;
-    } else {
-      break;
-    }
-  }
-
-  let result = endPartSegments.join(separator) + separator + lastSegment;
-
-  if (currentLength > maxLen) {
-    return result;
-  }
-
-  // Construct the final path
-  result = startComponent + separator + result;
-
-  // As a final check, if the result is somehow still too long
-  // truncate the result string from the beginning, prefixing with "...".
-  if (result.length > maxLen) {
-    return '...' + result.substring(result.length - maxLen - 3);
-  }
-
-  return result;
+  // We have some end segments but not all - there's a gap, insert ellipsis
+  return (
+    startPart + separator + ellipsis + separator + endSegments.join(separator)
+  );
 }
 
 /**
@@ -162,21 +239,50 @@ export function escapePath(filePath: string): string {
 /**
  * Unescapes special characters in a file path.
  * Removes backslash escaping from shell metacharacters.
+ *
+ * On Windows, backslashes are path separators, not shell escape characters
+ * (PowerShell uses backtick, cmd.exe uses caret). Skipping unescaping on
+ * win32 avoids corrupting valid absolute paths like C:\(v2)\file.txt.
  */
 export function unescapePath(filePath: string): string {
-  return filePath.replace(
-    new RegExp(`\\\\([${SHELL_SPECIAL_CHARS.source.slice(1, -1)}])`, 'g'),
-    '$1',
-  );
+  if (os.platform() === 'win32') {
+    return filePath;
+  }
+  const unescaped = filePath.replace(UNESCAPE_REGEX, '$1');
+  return unescaped;
 }
 
 /**
  * Generates a unique hash for a project based on its root path.
+ * On Windows, paths are case-insensitive, so we normalize to lowercase
+ * to ensure the same physical path always produces the same hash.
  * @param projectRoot The absolute path to the project's root directory.
  * @returns A SHA256 hash of the project root path.
  */
 export function getProjectHash(projectRoot: string): string {
-  return crypto.createHash('sha256').update(projectRoot).digest('hex');
+  // On Windows, normalize path to lowercase for case-insensitive matching
+  const normalizedPath =
+    os.platform() === 'win32' ? projectRoot.toLowerCase() : projectRoot;
+  return crypto.createHash('sha256').update(normalizedPath).digest('hex');
+}
+
+/**
+ * Sanitizes a directory path to create a safe project ID.
+ *
+ * - On Windows: normalizes to lowercase for case-insensitive matching
+ * - Replaces all non-alphanumeric characters with hyphens
+ *
+ * This is used for:
+ * - Creating project-specific directories
+ * - Generating session IDs for debug logging during startup
+ *
+ * @param cwd - The directory path to sanitize
+ * @returns A sanitized string safe for use as a project identifier
+ */
+export function sanitizeCwd(cwd: string): string {
+  // On Windows, normalize to lowercase for case-insensitive matching
+  const normalizedCwd = os.platform() === 'win32' ? cwd.toLowerCase() : cwd;
+  return normalizedCwd.replace(/[^a-zA-Z0-9]/g, '-');
 }
 
 /**
@@ -197,6 +303,10 @@ export function isSubpath(parentPath: string, childPath: string): boolean {
     relative !== '..' &&
     !pathModule.isAbsolute(relative)
   );
+}
+
+export function isSubpaths(parentPath: string[], childPath: string): boolean {
+  return parentPath.some((p) => isSubpath(p, childPath));
 }
 
 /**
@@ -230,6 +340,13 @@ export interface PathValidationOptions {
    * If true, allows both files and directories. If false (default), only allows directories.
    */
   allowFiles?: boolean;
+
+  /**
+   * If true, allows paths outside the workspace boundaries.
+   * The caller is responsible for adjusting permissions (e.g. 'ask') for
+   * external paths.
+   */
+  allowExternalPaths?: boolean;
 }
 
 /**
@@ -245,23 +362,40 @@ export function validatePath(
   resolvedPath: string,
   options: PathValidationOptions = {},
 ): void {
-  const { allowFiles = false } = options;
+  const { allowFiles = false, allowExternalPaths = false } = options;
   const workspaceContext = config.getWorkspaceContext();
+  const isWithinWorkspace =
+    workspaceContext.isPathWithinWorkspace(resolvedPath);
 
-  if (!workspaceContext.isPathWithinWorkspace(resolvedPath)) {
+  if (!allowExternalPaths && !isWithinWorkspace) {
     throw new Error('Path is not within workspace');
   }
 
-  try {
-    const stats = fs.statSync(resolvedPath);
-    if (!allowFiles && !stats.isDirectory()) {
-      throw new Error(`Path is not a directory: ${resolvedPath}`);
+  // For external paths where allowExternalPaths is true, skip filesystem checks.
+  // The path may not exist locally on the current machine, and permissions for
+  // external paths are handled at runtime rather than at validation time.
+  if (allowExternalPaths && !isWithinWorkspace) {
+    return;
+  }
+
+  let isDirectory = isDirectoryCache.get(resolvedPath);
+  if (isDirectory === undefined) {
+    try {
+      isDirectory = fs.statSync(resolvedPath).isDirectory();
+    } catch (error: unknown) {
+      if (isNodeError(error) && error.code === 'ENOENT') {
+        throw new Error(`Path does not exist: ${resolvedPath}`);
+      }
+      throw error;
     }
-  } catch (error: unknown) {
-    if (isNodeError(error) && error.code === 'ENOENT') {
-      throw new Error(`Path does not exist: ${resolvedPath}`);
+    if (isDirectoryCache.size >= VALIDATE_PATH_CACHE_MAX) {
+      const oldest = isDirectoryCache.keys().next().value;
+      if (oldest !== undefined) isDirectoryCache.delete(oldest);
     }
-    throw error;
+    isDirectoryCache.set(resolvedPath, isDirectory);
+  }
+  if (!allowFiles && !isDirectory) {
+    throw new Error(`Path is not a directory: ${resolvedPath}`);
   }
 }
 

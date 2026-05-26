@@ -13,7 +13,7 @@ import type {
   AnyDeclarativeTool,
   AnyToolInvocation,
 } from '@qwen-code/qwen-code-core';
-import { Kind, TodoWriteTool } from '@qwen-code/qwen-code-core';
+import { Kind, ToolNames } from '@qwen-code/qwen-code-core';
 import type { Part } from '@google/genai';
 
 // Helper to create mock message parts for tests
@@ -77,6 +77,7 @@ describe('ToolCallEmitter', () => {
         locations: [],
         kind: 'other',
         rawInput: { arg1: 'value1' },
+        _meta: { toolName: 'unknown_tool' },
       });
     });
 
@@ -100,12 +101,13 @@ describe('ToolCallEmitter', () => {
         locations: [{ path: '/test/file.ts', line: 10 }],
         kind: 'edit',
         rawInput: { path: '/test.ts' },
+        _meta: { toolName: 'edit_file' },
       });
     });
 
     it('should skip emit for TodoWriteTool and return false', async () => {
       const result = await emitter.emitStart({
-        toolName: TodoWriteTool.Name,
+        toolName: ToolNames.TODO_WRITE,
         callId: 'call-todo',
         args: { todos: [] },
       });
@@ -123,6 +125,7 @@ describe('ToolCallEmitter', () => {
       expect(sendUpdateSpy).toHaveBeenCalledWith(
         expect.objectContaining({
           rawInput: {},
+          _meta: { toolName: 'test_tool' },
         }),
       );
     });
@@ -150,6 +153,7 @@ describe('ToolCallEmitter', () => {
         locations: [], // Fallback to empty
         kind: 'other', // Fallback to other
         rawInput: { invalid: true },
+        _meta: { toolName: 'failing_tool' },
       });
     });
   });
@@ -170,6 +174,7 @@ describe('ToolCallEmitter', () => {
           toolCallId: 'call-123',
           status: 'completed',
           rawOutput: 'Tool completed successfully',
+          _meta: { toolName: 'test_tool' },
         }),
       );
     });
@@ -193,6 +198,7 @@ describe('ToolCallEmitter', () => {
             content: { type: 'text', text: 'Something went wrong' },
           },
         ],
+        _meta: { toolName: 'test_tool' },
       });
     });
 
@@ -222,6 +228,42 @@ describe('ToolCallEmitter', () => {
               newText: 'new content',
             },
           ],
+          _meta: { toolName: 'edit_file' },
+        }),
+      );
+    });
+
+    it('should not replay truncated session previews as full diffs', async () => {
+      await emitter.emitResult({
+        toolName: 'edit_file',
+        callId: 'call-edit',
+        success: true,
+        message: [],
+        resultDisplay: {
+          fileName: '/test/file.ts',
+          originalContent: 'old preview',
+          newContent: 'new preview',
+          truncatedForSession: true,
+          fileDiffLength: 200000,
+          fileDiffTruncated: true,
+        },
+      });
+
+      expect(sendUpdateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'call-edit',
+          status: 'completed',
+          content: [
+            {
+              type: 'content',
+              content: {
+                type: 'text',
+                text: 'Full diff omitted from saved session history for /test/file.ts. Original fileDiff length: 200000 chars.',
+              },
+            },
+          ],
+          _meta: { toolName: 'edit_file' },
         }),
       );
     });
@@ -247,6 +289,7 @@ describe('ToolCallEmitter', () => {
             },
           ],
           rawOutput: 'raw output',
+          _meta: { toolName: 'test_tool' },
         }),
       );
     });
@@ -264,13 +307,14 @@ describe('ToolCallEmitter', () => {
         toolCallId: 'call-empty',
         status: 'completed',
         content: [],
+        _meta: { toolName: 'test_tool' },
       });
     });
 
     describe('TodoWriteTool handling', () => {
       it('should emit plan update instead of tool_call_update for TodoWriteTool', async () => {
         await emitter.emitResult({
-          toolName: TodoWriteTool.Name,
+          toolName: ToolNames.TODO_WRITE,
           callId: 'call-todo',
           success: true,
           message: [],
@@ -295,7 +339,7 @@ describe('ToolCallEmitter', () => {
 
       it('should use args as fallback for TodoWriteTool todos', async () => {
         await emitter.emitResult({
-          toolName: TodoWriteTool.Name,
+          toolName: ToolNames.TODO_WRITE,
           callId: 'call-todo',
           success: true,
           message: [],
@@ -315,7 +359,7 @@ describe('ToolCallEmitter', () => {
 
       it('should not emit anything for TodoWriteTool with empty todos', async () => {
         await emitter.emitResult({
-          toolName: TodoWriteTool.Name,
+          toolName: ToolNames.TODO_WRITE,
           callId: 'call-todo',
           success: true,
           message: [],
@@ -327,7 +371,7 @@ describe('ToolCallEmitter', () => {
 
       it('should not emit anything for TodoWriteTool with no extractable todos', async () => {
         await emitter.emitResult({
-          toolName: TodoWriteTool.Name,
+          toolName: ToolNames.TODO_WRITE,
           callId: 'call-todo',
           success: true,
           message: [],
@@ -343,7 +387,7 @@ describe('ToolCallEmitter', () => {
     it('should emit tool_call_update with failed status and error message', async () => {
       const error = new Error('Connection timeout');
 
-      await emitter.emitError('call-123', error);
+      await emitter.emitError('call-123', 'test_tool', error);
 
       expect(sendUpdateSpy).toHaveBeenCalledWith({
         sessionUpdate: 'tool_call_update',
@@ -355,13 +399,14 @@ describe('ToolCallEmitter', () => {
             content: { type: 'text', text: 'Connection timeout' },
           },
         ],
+        _meta: { toolName: 'test_tool' },
       });
     });
   });
 
   describe('isTodoWriteTool', () => {
-    it('should return true for TodoWriteTool.Name', () => {
-      expect(emitter.isTodoWriteTool(TodoWriteTool.Name)).toBe(true);
+    it('should return true for ToolNames.TODO_WRITE', () => {
+      expect(emitter.isTodoWriteTool(ToolNames.TODO_WRITE)).toBe(true);
     });
 
     it('should return false for other tool names', () => {
@@ -498,6 +543,7 @@ describe('ToolCallEmitter', () => {
               },
             ],
             rawOutput: { unknownField: 'value', nested: { data: 123 } },
+            _meta: { toolName: 'test_tool' },
           }),
         );
       });
@@ -519,6 +565,7 @@ describe('ToolCallEmitter', () => {
             toolCallId: 'call-extra',
             status: 'completed',
             rawOutput: 'Result text',
+            _meta: { toolName: 'test_tool' },
           }),
         );
       });
@@ -533,6 +580,7 @@ describe('ToolCallEmitter', () => {
 
         const call = sendUpdateSpy.mock.calls[0][0];
         expect(call.rawOutput).toBeUndefined();
+        expect(call._meta).toEqual({ toolName: 'test_tool' });
       });
     });
 
@@ -565,7 +613,7 @@ describe('ToolCallEmitter', () => {
     describe('Fix 6: Empty plan emission when args has todos', () => {
       it('should emit empty plan when args had todos but result has none', async () => {
         await emitter.emitResult({
-          toolName: TodoWriteTool.Name,
+          toolName: ToolNames.TODO_WRITE,
           callId: 'call-todo-empty',
           success: true,
           message: [],
@@ -583,7 +631,7 @@ describe('ToolCallEmitter', () => {
 
       it('should emit empty plan when result todos is empty but args had todos', async () => {
         await emitter.emitResult({
-          toolName: TodoWriteTool.Name,
+          toolName: ToolNames.TODO_WRITE,
           callId: 'call-todo-cleared',
           success: true,
           message: [],
@@ -623,6 +671,7 @@ describe('ToolCallEmitter', () => {
               content: { type: 'text', text: 'Text content from message' },
             },
           ],
+          _meta: { toolName: 'test_tool' },
         });
       });
 
@@ -654,6 +703,7 @@ describe('ToolCallEmitter', () => {
               },
             ],
             rawOutput: 'raw result',
+            _meta: { toolName: 'test_tool' },
           }),
         );
       });

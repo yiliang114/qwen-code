@@ -12,13 +12,23 @@ import { globStream } from 'glob';
 import type { ToolInvocation, ToolResult } from './tools.js';
 import { BaseDeclarativeTool, BaseToolInvocation, Kind } from './tools.js';
 import { ToolNames, ToolDisplayNames } from './tool-names.js';
-import { resolveAndValidatePath } from '../utils/paths.js';
+import { createDebugLogger } from '../utils/debugLogger.js';
+import {
+  resolveAndValidatePath,
+  isSubpath,
+  unescapePath,
+} from '../utils/paths.js';
+
+import { getMemoryBaseDir } from '../memory/paths.js';
 import { getErrorMessage, isNodeError } from '../utils/errors.js';
 import { isGitRepository } from '../utils/gitUtils.js';
 import type { Config } from '../config/config.js';
+import type { PermissionDecision } from '../permissions/types.js';
 import type { FileExclusions } from '../utils/ignorePatterns.js';
 import { ToolErrorType } from './tool-error.js';
 import { isCommandAvailable } from '../utils/shell-utils.js';
+
+const debugLogger = createDebugLogger('GREP');
 
 // --- Interfaces ---
 
@@ -52,6 +62,7 @@ export interface GrepToolParams {
  */
 interface GrepMatch {
   filePath: string;
+  absoluteFilePath: string;
   lineNumber: number;
   line: string;
 }
@@ -70,27 +81,88 @@ class GrepToolInvocation extends BaseToolInvocation<
     this.fileExclusions = config.getFileExclusions();
   }
 
+  /**
+   * Returns 'ask' for paths outside the workspace, so that external grep
+   * searches require user confirmation.
+   */
+  override async getDefaultPermission(): Promise<PermissionDecision> {
+    if (!this.params.path) {
+      return 'allow'; // Default workspace directory
+    }
+    const workspaceContext = this.config.getWorkspaceContext();
+    const resolvedPath = path.resolve(
+      this.config.getTargetDir(),
+      this.params.path,
+    );
+    if (
+      workspaceContext.isPathWithinWorkspace(resolvedPath) ||
+      isSubpath(getMemoryBaseDir(), resolvedPath)
+    ) {
+      return 'allow';
+    }
+    return 'ask';
+  }
+
   async execute(signal: AbortSignal): Promise<ToolResult> {
     try {
-      // Default to target directory if no path is provided
-      const searchDirAbs = resolveAndValidatePath(
-        this.config,
-        this.params.path,
-      );
-      const searchDirDisplay = this.params.path || '.';
+      // Determine which directories to search
+      const searchDirs: string[] = [];
+      let searchLocationDescription: string;
 
-      // Perform grep search
-      const rawMatches = await this.performGrepSearch({
-        pattern: this.params.pattern,
-        path: searchDirAbs,
-        glob: this.params.glob,
-        signal,
-      });
+      if (this.params.path) {
+        // User specified a path — search only that directory
+        const searchDirAbs = resolveAndValidatePath(
+          this.config,
+          this.params.path,
+          { allowExternalPaths: true },
+        );
+        searchDirs.push(searchDirAbs);
+        searchLocationDescription = `in path "${this.params.path}"`;
+      } else {
+        // No path specified — search all workspace directories
+        const workspaceDirs = this.config
+          .getWorkspaceContext()
+          .getDirectories();
+        searchDirs.push(...workspaceDirs);
+        searchLocationDescription =
+          workspaceDirs.length > 1
+            ? `across ${workspaceDirs.length} workspace directories`
+            : `in the workspace directory`;
+      }
 
-      // Build search description
-      const searchLocationDescription = this.params.path
-        ? `in path "${searchDirDisplay}"`
-        : `in the workspace directory`;
+      // Perform grep search across all directories
+      let rawMatches: GrepMatch[] = [];
+      for (const searchDir of searchDirs) {
+        const matches = await this.performGrepSearch({
+          pattern: this.params.pattern,
+          path: searchDir,
+          glob: this.params.glob,
+          signal,
+        });
+        // When searching multiple directories, convert relative file paths
+        // to absolute paths so results from different directories are
+        // unambiguous.
+        if (searchDirs.length > 1) {
+          for (const match of matches) {
+            if (!path.isAbsolute(match.filePath)) {
+              match.filePath = path.resolve(searchDir, match.filePath);
+            }
+          }
+        }
+        rawMatches.push(...matches);
+      }
+
+      // Deduplicate matches that might appear from overlapping workspace
+      // directories (e.g. parent + child both in workspace dirs).
+      if (searchDirs.length > 1) {
+        const seen = new Set<string>();
+        rawMatches = rawMatches.filter((match) => {
+          const key = `${match.filePath}:${match.lineNumber}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+      }
 
       const filterDescription = this.params.glob
         ? ` (filter: "${this.params.glob}")`
@@ -138,20 +210,38 @@ class GrepToolInvocation extends BaseToolInvocation<
 
       // Build grep output
       let grepOutput = '';
-      for (const filePath in matchesByFile) {
-        grepOutput += `File: ${filePath}\n`;
-        matchesByFile[filePath].forEach((match) => {
-          const trimmedLine = match.line.trim();
-          grepOutput += `L${match.lineNumber}: ${trimmedLine}\n`;
-        });
-        grepOutput += '---\n';
-      }
-
-      // Apply character limit as safety net
+      const visibleMatches: GrepMatch[] = [];
       let truncatedByCharLimit = false;
-      if (Number.isFinite(charLimit) && grepOutput.length > charLimit) {
-        grepOutput = grepOutput.slice(0, charLimit) + '...';
-        truncatedByCharLimit = true;
+      const appendChunk = (chunk: string, match?: GrepMatch): boolean => {
+        if (
+          Number.isFinite(charLimit) &&
+          grepOutput.length + chunk.length > charLimit
+        ) {
+          grepOutput += chunk.slice(
+            0,
+            Math.max(charLimit - grepOutput.length, 0),
+          );
+          grepOutput += '...';
+          if (match) visibleMatches.push(match);
+          truncatedByCharLimit = true;
+          return false;
+        }
+        grepOutput += chunk;
+        if (match) visibleMatches.push(match);
+        return true;
+      };
+
+      for (const filePath in matchesByFile) {
+        if (!appendChunk(`File: ${filePath}\n`)) break;
+        let stopRendering = false;
+        for (const match of matchesByFile[filePath]) {
+          const trimmedLine = match.line.trim();
+          if (!appendChunk(`L${match.lineNumber}: ${trimmedLine}\n`, match)) {
+            stopRendering = true;
+            break;
+          }
+        }
+        if (stopRendering || !appendChunk('---\n')) break;
       }
 
       // Count how many lines we actually included after character truncation
@@ -181,9 +271,16 @@ class GrepToolInvocation extends BaseToolInvocation<
       return {
         llmContent: llmContent.trim(),
         returnDisplay: displayMessage,
+        resultFilePaths: Array.from(
+          new Set(
+            visibleMatches
+              .map((match) => match.absoluteFilePath)
+              .filter((filePath) => filePath !== ''),
+          ),
+        ),
       };
     } catch (error) {
-      console.error(`Error during GrepLogic execution: ${error}`);
+      debugLogger.error(`Error during GrepLogic execution: ${error}`);
       const errorMessage = getErrorMessage(error);
       return {
         llmContent: `Error during grep search operation: ${errorMessage}`,
@@ -237,8 +334,9 @@ class GrepToolInvocation extends BaseToolInvocation<
 
         results.push({
           filePath: relativeFilePath || path.basename(absoluteFilePath),
+          absoluteFilePath,
           lineNumber,
-          line: lineContent,
+          line: lineContent.replace(/\r$/, ''),
         });
       }
     }
@@ -319,7 +417,7 @@ class GrepToolInvocation extends BaseToolInvocation<
           });
           return this.parseGrepOutput(output, absolutePath);
         } catch (gitError: unknown) {
-          console.debug(
+          debugLogger.debug(
             `GrepLogic: git grep failed: ${getErrorMessage(
               gitError,
             )}. Falling back...`,
@@ -421,7 +519,7 @@ class GrepToolInvocation extends BaseToolInvocation<
           });
           return this.parseGrepOutput(output, absolutePath);
         } catch (grepError: unknown) {
-          console.debug(
+          debugLogger.debug(
             `GrepLogic: System grep failed: ${getErrorMessage(
               grepError,
             )}. Falling back...`,
@@ -430,7 +528,7 @@ class GrepToolInvocation extends BaseToolInvocation<
       }
 
       // --- Strategy 3: Pure JavaScript Fallback ---
-      console.debug(
+      debugLogger.debug(
         'GrepLogic: Falling back to JavaScript grep implementation.',
       );
       strategyUsed = 'javascript fallback';
@@ -460,6 +558,7 @@ class GrepToolInvocation extends BaseToolInvocation<
                 filePath:
                   path.relative(absolutePath, fileAbsolutePath) ||
                   path.basename(fileAbsolutePath),
+                absoluteFilePath: fileAbsolutePath,
                 lineNumber: index + 1,
                 line,
               });
@@ -468,7 +567,7 @@ class GrepToolInvocation extends BaseToolInvocation<
         } catch (readError: unknown) {
           // Ignore errors like permission denied or file gone during read
           if (!isNodeError(readError) || readError.code !== 'ENOENT') {
-            console.debug(
+            debugLogger.debug(
               `GrepLogic: Could not read/process ${fileAbsolutePath}: ${getErrorMessage(
                 readError,
               )}`,
@@ -479,7 +578,7 @@ class GrepToolInvocation extends BaseToolInvocation<
 
       return allMatches;
     } catch (error: unknown) {
-      console.error(
+      debugLogger.error(
         `GrepLogic: Error in performGrepSearch (Strategy: ${strategyUsed}): ${getErrorMessage(
           error,
         )}`,
@@ -501,7 +600,7 @@ export class GrepTool extends BaseDeclarativeTool<GrepToolParams, ToolResult> {
     super(
       GrepTool.Name,
       ToolDisplayNames.GREP,
-      'A powerful search tool for finding patterns in files\n\n  Usage:\n  - ALWAYS use Grep for search tasks. NEVER invoke `grep` or `rg` as a Bash command. The Grep tool has been optimized for correct permissions and access.\n  - Supports full regex syntax (e.g., "log.*Error", "function\\s+\\w+")\n  - Filter files with glob parameter (e.g., "*.js", "**/*.tsx")\n  - Case-insensitive by default\n  - Use Task tool for open-ended searches requiring multiple rounds\n',
+      'A powerful search tool for finding patterns in files\n\n  Usage:\n  - ALWAYS use Grep for search tasks. NEVER invoke `grep` or `rg` as a Bash command. The Grep tool has been optimized for correct permissions and access.\n  - Supports full regex syntax (e.g., "log.*Error", "function\\s+\\w+")\n  - Filter files with glob parameter (e.g., "*.js", "**/*.tsx")\n  - Case-insensitive by default\n  - Use Agent tool for open-ended searches requiring multiple rounds\n',
       Kind.Search,
       {
         properties: {
@@ -549,8 +648,11 @@ export class GrepTool extends BaseDeclarativeTool<GrepToolParams, ToolResult> {
 
     // Only validate path if one is provided
     if (params.path) {
+      params.path = unescapePath(params.path.trim());
       try {
-        resolveAndValidatePath(this.config, params.path);
+        resolveAndValidatePath(this.config, params.path, {
+          allowExternalPaths: true,
+        });
       } catch (error) {
         return getErrorMessage(error);
       }

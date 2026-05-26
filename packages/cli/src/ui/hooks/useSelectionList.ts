@@ -5,7 +5,9 @@
  */
 
 import { useReducer, useRef, useEffect } from 'react';
+import { createDebugLogger } from '@qwen-code/qwen-code-core';
 import { useKeypress } from './useKeypress.js';
+import { keyMatchers, Command } from '../keyMatchers.js';
 
 export interface SelectionListItem<T> {
   key: string;
@@ -21,6 +23,8 @@ export interface UseSelectionListOptions<T> {
   isFocused?: boolean;
   showNumbers?: boolean;
 }
+
+const debugLogger = createDebugLogger('SELECTION_LIST');
 
 export interface UseSelectionListResult {
   activeIndex: number;
@@ -130,6 +134,27 @@ const computeInitialIndex = <T>(
   return targetIndex;
 };
 
+const areItemsStructurallyEqual = <T>(
+  a: Array<SelectionListItem<T>>,
+  b: Array<SelectionListItem<T>>,
+): boolean => {
+  if (a === b) {
+    return true;
+  }
+
+  if (a.length !== b.length) {
+    return false;
+  }
+
+  for (let i = 0; i < a.length; i++) {
+    if (a[i]?.key !== b[i]?.key || a[i]?.disabled !== b[i]?.disabled) {
+      return false;
+    }
+  }
+
+  return true;
+};
+
 function selectionListReducer<T>(
   state: SelectionListState<T>,
   action: SelectionListAction<T>,
@@ -173,22 +198,30 @@ function selectionListReducer<T>(
 
     case 'INITIALIZE': {
       const { initialIndex, items } = action.payload;
+      const initialIndexChanged = initialIndex !== state.initialIndex;
       const activeKey =
-        initialIndex === state.initialIndex &&
-        state.activeIndex !== state.initialIndex
+        !initialIndexChanged && state.activeIndex !== state.initialIndex
           ? state.items[state.activeIndex]?.key
           : undefined;
+      const targetIndex = computeInitialIndex(initialIndex, items, activeKey);
+      const itemsStructurallyEqual = areItemsStructurallyEqual(
+        items,
+        state.items,
+      );
 
-      if (items === state.items && initialIndex === state.initialIndex) {
+      if (
+        !initialIndexChanged &&
+        targetIndex === state.activeIndex &&
+        itemsStructurallyEqual
+      ) {
         return state;
       }
 
-      const targetIndex = computeInitialIndex(initialIndex, items, activeKey);
-
       return {
         ...state,
-        items,
+        items: itemsStructurallyEqual ? state.items : items,
         activeIndex: targetIndex,
+        initialIndex,
         pendingHighlight: false,
       };
     }
@@ -203,7 +236,7 @@ function selectionListReducer<T>(
 
     default: {
       const exhaustiveCheck: never = action;
-      console.error(`Unknown selection list action: ${exhaustiveCheck}`);
+      debugLogger.error(`Unknown selection list action: ${exhaustiveCheck}`);
       return state;
     }
   }
@@ -292,12 +325,12 @@ export function useSelectionList<T>({
         numberInputRef.current = '';
       }
 
-      if (name === 'k' || name === 'up') {
+      if (keyMatchers[Command.SELECTION_UP](key)) {
         dispatch({ type: 'MOVE_UP', payload: { items } });
         return;
       }
 
-      if (name === 'j' || name === 'down') {
+      if (keyMatchers[Command.SELECTION_DOWN](key)) {
         dispatch({ type: 'MOVE_DOWN', payload: { items } });
         return;
       }

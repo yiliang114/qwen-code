@@ -11,14 +11,16 @@ import type {
   ToolCallStartParams,
   ToolCallResultParams,
   ResolvedToolMetadata,
+  SubagentMeta,
 } from '../types.js';
-import type * as acp from '../../acp.js';
+import type {
+  ToolCallContent,
+  ToolCallLocation,
+  ToolKind,
+} from '@agentclientprotocol/sdk';
 import type { Part } from '@google/genai';
-import {
-  TodoWriteTool,
-  Kind,
-  ExitPlanModeTool,
-} from '@qwen-code/qwen-code-core';
+import { ToolNames, Kind } from '@qwen-code/qwen-code-core';
+import { buildTruncatedDiffPreviewText } from '../../../utils/truncatedDiffPreview.js';
 
 /**
  * Unified tool call event emitter.
@@ -65,6 +67,13 @@ export class ToolCallEmitter extends BaseEmitter {
       locations,
       kind,
       rawInput: params.args ?? {},
+      _meta: {
+        toolName: params.toolName,
+        ...params.subagentMeta,
+        ...(BaseEmitter.toEpochMs(params.timestamp) != null && {
+          timestamp: BaseEmitter.toEpochMs(params.timestamp),
+        }),
+      },
     });
 
     return true;
@@ -95,7 +104,7 @@ export class ToolCallEmitter extends BaseEmitter {
     }
 
     // Determine content for the update
-    let contentArray: acp.ToolCallContent[] = [];
+    let contentArray: ToolCallContent[] = [];
 
     // Special case: diff result from edit tools (format from resultDisplay)
     const diffContent = this.extractDiffContent(params.resultDisplay);
@@ -120,6 +129,13 @@ export class ToolCallEmitter extends BaseEmitter {
       toolCallId: params.callId,
       status: params.success ? 'completed' : 'failed',
       content: contentArray,
+      _meta: {
+        toolName: params.toolName,
+        ...params.subagentMeta,
+        ...(BaseEmitter.toEpochMs(params.timestamp) != null && {
+          timestamp: BaseEmitter.toEpochMs(params.timestamp),
+        }),
+      },
     };
 
     // Add rawOutput from resultDisplay
@@ -135,9 +151,16 @@ export class ToolCallEmitter extends BaseEmitter {
    * Use this for explicit error handling when not using emitResult.
    *
    * @param callId - The tool call ID
+   * @param toolName - The tool name
    * @param error - The error that occurred
+   * @param subagentMeta - Optional subagent metadata
    */
-  async emitError(callId: string, error: Error): Promise<void> {
+  async emitError(
+    callId: string,
+    toolName: string,
+    error: Error,
+    subagentMeta?: SubagentMeta,
+  ): Promise<void> {
     await this.sendUpdate({
       sessionUpdate: 'tool_call_update',
       toolCallId: callId,
@@ -145,6 +168,10 @@ export class ToolCallEmitter extends BaseEmitter {
       content: [
         { type: 'content', content: { type: 'text', text: error.message } },
       ],
+      _meta: {
+        toolName,
+        ...subagentMeta,
+      },
     });
   }
 
@@ -155,14 +182,14 @@ export class ToolCallEmitter extends BaseEmitter {
    * Exposed for external use in components that need to check this.
    */
   isTodoWriteTool(toolName: string): boolean {
-    return toolName === TodoWriteTool.Name;
+    return toolName === ToolNames.TODO_WRITE;
   }
 
   /**
    * Checks if a tool name is the ExitPlanModeTool.
    */
   isExitPlanModeTool(toolName: string): boolean {
-    return toolName === ExitPlanModeTool.Name;
+    return toolName === ToolNames.EXIT_PLAN_MODE;
   }
 
   /**
@@ -180,8 +207,8 @@ export class ToolCallEmitter extends BaseEmitter {
     const tool = toolRegistry.getTool(toolName);
 
     let title = tool?.displayName ?? toolName;
-    let locations: acp.ToolCallLocation[] = [];
-    let kind: acp.ToolKind = 'other';
+    let locations: ToolCallLocation[] = [];
+    let kind: ToolKind = 'other';
 
     if (tool && args) {
       try {
@@ -195,7 +222,13 @@ export class ToolCallEmitter extends BaseEmitter {
         // Pass tool name to handle special cases like exit_plan_mode -> switch_mode
         kind = this.mapToolKind(tool.kind, toolName);
       } catch {
-        // Use defaults on build failure
+        // Fallback: use the description arg directly if available
+        if (typeof args['description'] === 'string') {
+          title = `${title}: ${args['description']}`;
+        }
+        if (tool.kind) {
+          kind = this.mapToolKind(tool.kind, toolName);
+        }
       }
     }
 
@@ -208,13 +241,13 @@ export class ToolCallEmitter extends BaseEmitter {
    * @param kind - The core Kind enum value
    * @param toolName - Optional tool name to handle special cases like exit_plan_mode
    */
-  mapToolKind(kind: Kind, toolName?: string): acp.ToolKind {
+  mapToolKind(kind: Kind, toolName?: string): ToolKind {
     // Special case: exit_plan_mode uses 'switch_mode' kind per ACP spec
     if (toolName && this.isExitPlanModeTool(toolName)) {
       return 'switch_mode';
     }
 
-    const kindMap: Record<Kind, acp.ToolKind> = {
+    const kindMap: Record<Kind, ToolKind> = {
       [Kind.Read]: 'read',
       [Kind.Edit]: 'edit',
       [Kind.Delete]: 'delete',
@@ -234,15 +267,23 @@ export class ToolCallEmitter extends BaseEmitter {
    * Extracts diff content from resultDisplay if it's a diff type (edit tool result).
    * Returns null if not a diff.
    */
-  private extractDiffContent(
-    resultDisplay: unknown,
-  ): acp.ToolCallContent | null {
+  private extractDiffContent(resultDisplay: unknown): ToolCallContent | null {
     if (!resultDisplay || typeof resultDisplay !== 'object') return null;
 
     const obj = resultDisplay as Record<string, unknown>;
 
     // Check if this is a diff display (edit tool result)
     if ('fileName' in obj && 'newContent' in obj) {
+      if (obj['truncatedForSession'] === true) {
+        return {
+          type: 'content',
+          content: {
+            type: 'text',
+            text: buildTruncatedDiffPreviewText(obj),
+          },
+        };
+      }
+
       return {
         type: 'diff',
         path: obj['fileName'] as string,
@@ -258,10 +299,8 @@ export class ToolCallEmitter extends BaseEmitter {
    * Transforms Part[] to ToolCallContent[].
    * Extracts text from functionResponse parts and text parts.
    */
-  private transformPartsToToolCallContent(
-    parts: Part[],
-  ): acp.ToolCallContent[] {
-    const result: acp.ToolCallContent[] = [];
+  private transformPartsToToolCallContent(parts: Part[]): ToolCallContent[] {
+    const result: ToolCallContent[] = [];
 
     for (const part of parts) {
       // Handle text parts

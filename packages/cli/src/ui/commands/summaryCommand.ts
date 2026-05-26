@@ -11,7 +11,10 @@ import {
   CommandKind,
   type SlashCommandActionReturn,
 } from './types.js';
-import { getProjectSummaryPrompt } from '@qwen-code/qwen-code-core';
+import {
+  getProjectSummaryPrompt,
+  runSideQuery,
+} from '@qwen-code/qwen-code-core';
 import type { HistoryItemSummary } from '../types.js';
 import { t } from '../../i18n/index.js';
 
@@ -23,10 +26,12 @@ export const summaryCommand: SlashCommand = {
     );
   },
   kind: CommandKind.BUILT_IN,
+  supportedModes: ['interactive', 'non_interactive', 'acp'] as const,
   action: async (context): Promise<SlashCommandActionReturn> => {
     const { config } = context.services;
     const { ui } = context;
     const executionMode = context.executionMode ?? 'interactive';
+    const abortSignal = context.abortSignal;
 
     if (!config) {
       return {
@@ -87,9 +92,23 @@ export const summaryCommand: SlashCommand = {
         parts: message.parts,
       }));
 
-      // Use generateContent with chat history as context
-      const response = await geminiClient.generateContent(
-        [
+      // Carry over the main session's system instruction. Without this the
+      // model sees only chat history + the summary prompt, losing the coding-
+      // assistant role, project context, and user memory. The chat sets it
+      // as a string (see GeminiClient.getMainSessionSystemInstruction).
+      const rawSystemInstruction = geminiClient
+        .getChat()
+        .getGenerationConfig().systemInstruction;
+      const chatSystemInstruction =
+        typeof rawSystemInstruction === 'string'
+          ? rawSystemInstruction
+          : undefined;
+
+      const result = await runSideQuery(config, {
+        purpose: 'project-summary',
+        model: config.getModel(),
+        systemInstruction: chatSystemInstruction,
+        contents: [
           ...conversationContext,
           {
             role: 'user',
@@ -100,21 +119,10 @@ export const summaryCommand: SlashCommand = {
             ],
           },
         ],
-        {},
-        new AbortController().signal,
-        config.getModel(),
-      );
+        abortSignal: abortSignal ?? new AbortController().signal,
+      });
 
-      // Extract text from response
-      const parts = response.candidates?.[0]?.content?.parts;
-
-      const markdownSummary =
-        parts
-          ?.map((part) => part.text)
-          .filter((text): text is string => typeof text === 'string')
-          .join('') || '';
-
-      if (!markdownSummary) {
+      if (!result.text) {
         throw new Error(
           t(
             'Failed to generate summary - no text content received from LLM response',
@@ -122,7 +130,7 @@ export const summaryCommand: SlashCommand = {
         );
       }
 
-      return markdownSummary;
+      return result.text;
     };
 
     const saveSummaryToDisk = async (
@@ -197,6 +205,10 @@ export const summaryCommand: SlashCommand = {
       if (executionMode !== 'interactive') {
         return;
       }
+      // If cancelled via ESC, don't show error — cancelSlashCommand already handled UI
+      if (abortSignal?.aborted) {
+        return;
+      }
       ui.setPendingItem(null);
       ui.addItem(
         {
@@ -241,6 +253,9 @@ export const summaryCommand: SlashCommand = {
     }> => {
       emitInteractivePending('generating');
       const markdownSummary = await generateSummaryMarkdown(history);
+      if (abortSignal?.aborted) {
+        throw new DOMException('Summary generation cancelled.', 'AbortError');
+      }
       emitInteractivePending('saving');
       const { filePathForDisplay } = await saveSummaryToDisk(markdownSummary);
       completeInteractive(filePathForDisplay);

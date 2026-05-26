@@ -51,6 +51,51 @@ if (existsSync(coreVendorDir)) {
   console.warn(`Warning: Vendor directory not found at ${coreVendorDir}`);
 }
 
+// Copy bundled skills (e.g. /review) so they are available at runtime.
+// In the esbuild bundle, import.meta.url resolves to dist/cli.js, so
+// SkillManager looks for bundled skills at dist/bundled/.
+const bundledSkillsDir = join(
+  root,
+  'packages',
+  'core',
+  'src',
+  'skills',
+  'bundled',
+);
+if (existsSync(bundledSkillsDir)) {
+  const destBundledDir = join(distDir, 'bundled');
+  copyRecursiveSync(bundledSkillsDir, destBundledDir);
+  console.log('Copied bundled skills to dist/bundled/');
+} else {
+  console.warn(
+    `Warning: Bundled skills directory not found at ${bundledSkillsDir}`,
+  );
+}
+
+// Copy user docs into qc-helper bundled skill so it can reference them at runtime.
+// The qc-helper skill reads docs from a `docs/` subdirectory relative to its own
+// directory. In the esbuild bundle this becomes dist/bundled/qc-helper/docs/.
+const userDocsDir = join(root, 'docs', 'users');
+if (existsSync(userDocsDir)) {
+  const destDocsDir = join(distDir, 'bundled', 'qc-helper', 'docs');
+  copyRecursiveSync(userDocsDir, destDocsDir);
+  console.log('Copied docs/users/ to dist/bundled/qc-helper/docs/');
+} else {
+  console.warn(`Warning: User docs directory not found at ${userDocsDir}`);
+}
+
+// Copy builtin locales so bundled dist/cli.js can load UI translations at runtime.
+// Published packages already include these via prepare-package.js; bundle output
+// should mirror that behavior for local `node dist/cli.js` runs.
+const localesDir = join(root, 'packages', 'cli', 'src', 'i18n', 'locales');
+if (existsSync(localesDir)) {
+  const destLocalesDir = join(distDir, 'locales');
+  copyRecursiveSync(localesDir, destLocalesDir);
+  console.log('Copied builtin locales to dist/locales/');
+} else {
+  console.warn(`Warning: Locales directory not found at ${localesDir}`);
+}
+
 console.log('\n✅ All bundle assets copied to dist/');
 
 /**

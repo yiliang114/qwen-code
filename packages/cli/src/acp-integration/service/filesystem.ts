@@ -1,63 +1,98 @@
 /**
  * @license
- * Copyright 2025 Google LLC
+ * Copyright 2025 Qwen Team
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { FileSystemService } from '@qwen-code/qwen-code-core';
-import type * as acp from '../acp.js';
+import type {
+  AgentSideConnection,
+  FileSystemCapability,
+  ReadTextFileRequest,
+  WriteTextFileRequest,
+  WriteTextFileResponse,
+} from '@agentclientprotocol/sdk';
+import { RequestError } from '@agentclientprotocol/sdk';
+import type {
+  FileSystemService,
+  ReadTextFileResponse,
+} from '@qwen-code/qwen-code-core';
 
-/**
- * ACP client-based implementation of FileSystemService
- */
+const RESOURCE_NOT_FOUND_CODE = -32002;
+
+function getErrorCode(error: unknown): unknown {
+  if (error instanceof RequestError) {
+    return error.code;
+  }
+
+  if (typeof error === 'object' && error !== null && 'code' in error) {
+    return (error as { code?: unknown }).code;
+  }
+
+  return undefined;
+}
+
+function createEnoentError(filePath: string): NodeJS.ErrnoException {
+  const err = new Error(`File not found: ${filePath}`) as NodeJS.ErrnoException;
+  err.code = 'ENOENT';
+  err.errno = -2;
+  err.path = filePath;
+  return err;
+}
+
 export class AcpFileSystemService implements FileSystemService {
   constructor(
-    private readonly client: acp.Client,
+    private readonly connection: AgentSideConnection,
     private readonly sessionId: string,
-    private readonly capabilities: acp.FileSystemCapability,
+    private readonly capabilities: FileSystemCapability,
     private readonly fallback: FileSystemService,
   ) {}
 
-  async readTextFile(filePath: string): Promise<string> {
+  async readTextFile(
+    params: Omit<ReadTextFileRequest, 'sessionId'>,
+  ): Promise<ReadTextFileResponse> {
     if (!this.capabilities.readTextFile) {
-      return this.fallback.readTextFile(filePath);
+      return this.fallback.readTextFile(params);
     }
 
-    const response = await this.client.readTextFile({
-      path: filePath,
-      sessionId: this.sessionId,
-      line: null,
-      limit: null,
-    });
+    let response: ReadTextFileResponse;
+    try {
+      response = await this.connection.readTextFile({
+        ...params,
+        sessionId: this.sessionId,
+      });
+    } catch (error) {
+      const errorCode = getErrorCode(error);
 
-    if (response.content.startsWith('ERROR: ENOENT:')) {
-      // Treat ACP error strings as structured ENOENT errors without
-      // assuming a specific platform format.
-      const match = /^ERROR:\s*ENOENT:\s*(?<path>.*)$/i.exec(response.content);
-      const err = new Error(response.content) as NodeJS.ErrnoException;
-      err.code = 'ENOENT';
-      err.errno = -2;
-      const rawPath = match?.groups?.['path']?.trim();
-      err['path'] = rawPath
-        ? rawPath.replace(/^['"]|['"]$/g, '') || filePath
-        : filePath;
-      throw err;
+      if (errorCode === RESOURCE_NOT_FOUND_CODE) {
+        throw createEnoentError(params.path);
+      }
+
+      throw error;
     }
 
-    return response.content;
+    return response;
   }
 
-  async writeTextFile(filePath: string, content: string): Promise<void> {
+  async writeTextFile(
+    params: Omit<WriteTextFileRequest, 'sessionId'>,
+  ): Promise<WriteTextFileResponse> {
     if (!this.capabilities.writeTextFile) {
-      return this.fallback.writeTextFile(filePath, content);
+      return this.fallback.writeTextFile(params);
     }
 
-    await this.client.writeTextFile({
-      path: filePath,
-      content,
+    const finalContent = params._meta?.['bom']
+      ? '\uFEFF' + params.content
+      : params.content;
+
+    await this.connection.writeTextFile({
+      ...params,
+      content: finalContent,
       sessionId: this.sessionId,
     });
+
+    return { _meta: params._meta };
   }
+
   findFiles(fileName: string, searchPaths: readonly string[]): string[] {
     return this.fallback.findFiles(fileName, searchPaths);
   }

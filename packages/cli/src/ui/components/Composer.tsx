@@ -5,134 +5,132 @@
  */
 
 import { Box, Text, useIsScreenReaderEnabled } from 'ink';
-import { useMemo } from 'react';
+import { useCallback, useState } from 'react';
 import { LoadingIndicator } from './LoadingIndicator.js';
-import { ContextSummaryDisplay } from './ContextSummaryDisplay.js';
-import { AutoAcceptIndicator } from './AutoAcceptIndicator.js';
-import { ShellModeIndicator } from './ShellModeIndicator.js';
-import { DetailedMessagesDisplay } from './DetailedMessagesDisplay.js';
-import { InputPrompt, calculatePromptWidths } from './InputPrompt.js';
+import { InputPrompt } from './InputPrompt.js';
 import { Footer } from './Footer.js';
-import { ShowMoreLines } from './ShowMoreLines.js';
 import { QueuedMessageDisplay } from './QueuedMessageDisplay.js';
-import { OverflowProvider } from '../contexts/OverflowContext.js';
-import { theme } from '../semantic-colors.js';
-import { isNarrowWidth } from '../utils/isNarrowWidth.js';
+import { KeyboardShortcuts } from './KeyboardShortcuts.js';
 import { useUIState } from '../contexts/UIStateContext.js';
 import { useUIActions } from '../contexts/UIActionsContext.js';
 import { useVimMode } from '../contexts/VimModeContext.js';
 import { useConfig } from '../contexts/ConfigContext.js';
-import { useSettings } from '../contexts/SettingsContext.js';
-import { ApprovalMode } from '@qwen-code/qwen-code-core';
-import { StreamingState } from '../types.js';
-import { ConfigInitDisplay } from '../components/ConfigInitDisplay.js';
+import { theme } from '../semantic-colors.js';
+import { StreamingState, type HistoryItemToolGroup } from '../types.js';
+import { FeedbackDialog } from '../FeedbackDialog.js';
 import { t } from '../../i18n/index.js';
 
 export const Composer = () => {
   const config = useConfig();
-  const settings = useSettings();
   const isScreenReaderEnabled = useIsScreenReaderEnabled();
   const uiState = useUIState();
   const uiActions = useUIActions();
   const { vimEnabled } = useVimMode();
-  const terminalWidth = process.stdout.columns;
-  const isNarrow = isNarrowWidth(terminalWidth);
-  const debugConsoleMaxHeight = Math.floor(Math.max(terminalWidth * 0.2, 5));
 
-  const { contextFileNames, showAutoAcceptIndicator } = uiState;
+  const {
+    showAutoAcceptIndicator,
+    streamingResponseLengthRef,
+    isReceivingContent,
+  } = uiState;
 
-  // Use the container width of InputPrompt for width of DetailedMessagesDisplay
-  const { containerWidth } = useMemo(
-    () => calculatePromptWidths(uiState.terminalWidth),
-    [uiState.terminalWidth],
+  // Real-time token animation is performed inside LoadingIndicator itself, so
+  // the 100ms polling only re-renders that one component — keeping InputPrompt
+  // and Footer static avoids terminal flicker during streaming.
+  const isStreaming =
+    uiState.streamingState === StreamingState.Responding ||
+    uiState.streamingState === StreamingState.WaitingForConfirmation;
+  // `isStreaming` covers Responding|WaitingForConfirmation, but we only
+  // suppress during Responding (active token output). A confirmation prompt
+  // must remain visible regardless of width. Drop the redundant `isStreaming`
+  // guard so future expansions of `isStreaming` don't silently widen suppression.
+  const suppressBottomLoadingIndicator =
+    uiState.streamingState === StreamingState.Responding &&
+    uiState.terminalWidth <= 30;
+
+  // Aggregate agent tool tokens from executing tool calls. Only changes when
+  // a subagent reports progress, so it doesn't drive the animation loop.
+  let agentTokens = 0;
+  for (const item of uiState.pendingGeminiHistoryItems ?? []) {
+    if (item.type === 'tool_group') {
+      const toolGroup = item as HistoryItemToolGroup;
+      for (const tool of toolGroup.tools) {
+        const display = tool.resultDisplay;
+        if (
+          typeof display === 'object' &&
+          display !== null &&
+          'type' in display &&
+          display.type === 'task_execution' &&
+          'tokenCount' in display &&
+          typeof display.tokenCount === 'number'
+        ) {
+          agentTokens += display.tokenCount;
+        }
+      }
+    }
+  }
+
+  // State for keyboard shortcuts display toggle
+  const [showShortcuts, setShowShortcuts] = useState(false);
+  const handleToggleShortcuts = useCallback(() => {
+    setShowShortcuts((prev) => !prev);
+  }, []);
+
+  // State for autocomplete-dropdown visibility (narrow signal). Drives the
+  // Footer / KeyboardShortcuts hide-when-dropdown-visible logic below; kept
+  // local to Composer because nothing outside this component needs the
+  // narrow signal.
+  const [showSuggestions, setShowSuggestions] = useState(false);
+
+  // Broad signal — any input-area Tab consumer. Forwarded to AppContainer
+  // via UIActionsContext so useAutoAcceptIndicator's `shouldBlockTab` can
+  // suppress the Windows-only bare-Tab approval-mode fallback. See #4171.
+  const handleTabConsumerChange = useCallback(
+    (active: boolean) => {
+      uiActions.onTabConsumerChange(active);
+    },
+    [uiActions],
   );
 
   return (
-    <Box flexDirection="column">
-      {!uiState.embeddedShellFocused && (
+    <Box flexDirection="column" marginTop={1}>
+      {!uiState.embeddedShellFocused && !suppressBottomLoadingIndicator && (
         <LoadingIndicator
+          // Hide loading phrases when enableLoadingPhrases is explicitly false.
+          // Using === false ensures phrases show by default when undefined.
           thought={
             uiState.streamingState === StreamingState.WaitingForConfirmation ||
-            config.getAccessibility()?.disableLoadingPhrases
+            config.getAccessibility()?.enableLoadingPhrases === false
               ? undefined
               : uiState.thought
           }
           currentLoadingPhrase={
-            config.getAccessibility()?.disableLoadingPhrases
+            config.getAccessibility()?.enableLoadingPhrases === false
               ? undefined
               : uiState.currentLoadingPhrase
           }
           elapsedTime={uiState.elapsedTime}
+          candidatesTokens={agentTokens}
+          streamingCharsRef={streamingResponseLengthRef}
+          isStreaming={isStreaming}
+          isReceivingContent={isReceivingContent}
         />
       )}
-
-      {!uiState.isConfigInitialized && <ConfigInitDisplay />}
+      {/*
+       * Narrow-terminal fallback: when the full LoadingIndicator is suppressed
+       * (≤30 cols, actively Responding) we still surface a minimal `esc to
+       * cancel` hint so users on ultra-narrow terminals retain the cancel
+       * affordance during long-running calls. The full timer/spinner/phrase
+       * UI is still suppressed to avoid layout breakage.
+       */}
+      {!uiState.embeddedShellFocused && suppressBottomLoadingIndicator && (
+        <Box paddingLeft={2}>
+          <Text color={theme.text.secondary}>({t('Esc to cancel')})</Text>
+        </Box>
+      )}
 
       <QueuedMessageDisplay messageQueue={uiState.messageQueue} />
 
-      <Box
-        marginTop={1}
-        justifyContent={
-          settings.merged.ui?.hideContextSummary
-            ? 'flex-start'
-            : 'space-between'
-        }
-        width="100%"
-        flexDirection={isNarrow ? 'column' : 'row'}
-        alignItems={isNarrow ? 'flex-start' : 'center'}
-      >
-        <Box marginRight={1}>
-          {process.env['GEMINI_SYSTEM_MD'] && (
-            <Text color={theme.status.error}>|⌐■_■| </Text>
-          )}
-          {uiState.ctrlCPressedOnce ? (
-            <Text color={theme.status.warning}>
-              {t('Press Ctrl+C again to exit.')}
-            </Text>
-          ) : uiState.ctrlDPressedOnce ? (
-            <Text color={theme.status.warning}>
-              {t('Press Ctrl+D again to exit.')}
-            </Text>
-          ) : uiState.showEscapePrompt ? (
-            <Text color={theme.text.secondary}>
-              {t('Press Esc again to clear.')}
-            </Text>
-          ) : (
-            !settings.merged.ui?.hideContextSummary && (
-              <ContextSummaryDisplay
-                ideContext={uiState.ideContextState}
-                geminiMdFileCount={uiState.geminiMdFileCount}
-                contextFileNames={contextFileNames}
-                mcpServers={config.getMcpServers()}
-                blockedMcpServers={config.getBlockedMcpServers()}
-                showToolDescriptions={uiState.showToolDescriptions}
-              />
-            )
-          )}
-        </Box>
-        <Box paddingTop={isNarrow ? 1 : 0}>
-          {showAutoAcceptIndicator !== ApprovalMode.DEFAULT &&
-            !uiState.shellModeActive && (
-              <AutoAcceptIndicator approvalMode={showAutoAcceptIndicator} />
-            )}
-          {uiState.shellModeActive && <ShellModeIndicator />}
-        </Box>
-      </Box>
-
-      {uiState.showErrorDetails && (
-        <OverflowProvider>
-          <Box flexDirection="column">
-            <DetailedMessagesDisplay
-              messages={uiState.filteredConsoleMessages}
-              maxHeight={
-                uiState.constrainHeight ? debugConsoleMaxHeight : undefined
-              }
-              width={containerWidth}
-            />
-            <ShowMoreLines constrainHeight={uiState.constrainHeight} />
-          </Box>
-        </OverflowProvider>
-      )}
+      {uiState.isFeedbackDialogOpen && <FeedbackDialog />}
 
       {uiState.isInputActive && (
         <InputPrompt
@@ -145,10 +143,15 @@ export const Composer = () => {
           config={config}
           slashCommands={uiState.slashCommands}
           commandContext={uiState.commandContext}
+          recentSlashCommands={uiState.recentSlashCommands}
           shellModeActive={uiState.shellModeActive}
           setShellModeActive={uiActions.setShellModeActive}
           approvalMode={showAutoAcceptIndicator}
           onEscapePromptChange={uiActions.onEscapePromptChange}
+          onToggleShortcuts={handleToggleShortcuts}
+          showShortcuts={showShortcuts}
+          onSuggestionsVisibilityChange={setShowSuggestions}
+          onTabConsumerChange={handleTabConsumerChange}
           focus={true}
           vimHandleInput={uiActions.vimHandleInput}
           isEmbeddedShellFocused={uiState.embeddedShellFocused}
@@ -157,10 +160,20 @@ export const Composer = () => {
               ? '  ' + t("Press 'i' for INSERT mode and 'Esc' for NORMAL mode.")
               : '  ' + t('Type your message or @path/to/file')
           }
+          promptSuggestion={uiState.promptSuggestion}
+          onPromptSuggestionDismiss={uiState.dismissPromptSuggestion}
         />
       )}
 
-      {!settings.merged.ui?.hideFooter && !isScreenReaderEnabled && <Footer />}
+      {/* Exclusive area: only one component visible at a time */}
+      {/* Hide footer when a confirmation dialog (e.g. ask_user_question) is active */}
+      {uiState.isInputActive &&
+        !showSuggestions &&
+        (showShortcuts ? (
+          <KeyboardShortcuts />
+        ) : (
+          !isScreenReaderEnabled && <Footer />
+        ))}
     </Box>
   );
 };

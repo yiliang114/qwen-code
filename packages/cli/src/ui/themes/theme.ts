@@ -21,6 +21,9 @@ export interface ColorsTheme {
   AccentGreen: string;
   AccentYellow: string;
   AccentRed: string;
+  // Dim variants for less intense UI elements
+  AccentYellowDim: string;
+  AccentRedDim: string;
   DiffAdded: string;
   DiffRemoved: string;
   Comment: string;
@@ -37,6 +40,7 @@ export interface CustomTheme {
     secondary?: string;
     link?: string;
     accent?: string;
+    code?: string;
   };
   background?: {
     primary?: string;
@@ -58,6 +62,8 @@ export interface CustomTheme {
     error?: string;
     success?: string;
     warning?: string;
+    errorDim?: string;
+    warningDim?: string;
   };
 
   // Legacy properties (all optional)
@@ -70,6 +76,8 @@ export interface CustomTheme {
   AccentGreen?: string;
   AccentYellow?: string;
   AccentRed?: string;
+  AccentYellowDim?: string;
+  AccentRedDim?: string;
   DiffAdded?: string;
   DiffRemoved?: string;
   Comment?: string;
@@ -88,6 +96,8 @@ export const lightTheme: ColorsTheme = {
   AccentGreen: '#3CA84B',
   AccentYellow: '#D5A40A',
   AccentRed: '#DD4C4C',
+  AccentYellowDim: '#8B7000',
+  AccentRedDim: '#993333',
   DiffAdded: '#C6EAD8',
   DiffRemoved: '#FFCCCC',
   Comment: '#008000',
@@ -106,6 +116,8 @@ export const darkTheme: ColorsTheme = {
   AccentGreen: '#A6E3A1',
   AccentYellow: '#F9E2AF',
   AccentRed: '#F38BA8',
+  AccentYellowDim: '#8B7530',
+  AccentRedDim: '#8B3A4A',
   DiffAdded: '#28350B',
   DiffRemoved: '#430000',
   Comment: '#6C7086',
@@ -124,6 +136,8 @@ export const ansiTheme: ColorsTheme = {
   AccentGreen: 'green',
   AccentYellow: 'yellow',
   AccentRed: 'red',
+  AccentYellowDim: 'yellow',
+  AccentRedDim: 'red',
   DiffAdded: 'green',
   DiffRemoved: 'red',
   Comment: 'gray',
@@ -161,6 +175,7 @@ export class Theme {
         secondary: this.colors.Gray,
         link: this.colors.AccentBlue,
         accent: this.colors.AccentPurple,
+        code: this.colors.LightBlue,
       },
       background: {
         primary: this.colors.Background,
@@ -182,6 +197,8 @@ export class Theme {
         error: this.colors.AccentRed,
         success: this.colors.AccentGreen,
         warning: this.colors.AccentYellow,
+        errorDim: this.colors.AccentRedDim,
+        warningDim: this.colors.AccentYellowDim,
       },
     };
     this._colorMap = Object.freeze(this._buildColorMap(rawMappings)); // Build and freeze the map
@@ -254,13 +271,17 @@ export function createCustomTheme(customTheme: CustomTheme): Theme {
     type: 'custom',
     Background: customTheme.background?.primary ?? customTheme.Background ?? '',
     Foreground: customTheme.text?.primary ?? customTheme.Foreground ?? '',
-    LightBlue: customTheme.text?.link ?? customTheme.LightBlue ?? '',
+    LightBlue: customTheme.text?.code ?? customTheme.LightBlue ?? '',
     AccentBlue: customTheme.text?.link ?? customTheme.AccentBlue ?? '',
     AccentPurple: customTheme.text?.accent ?? customTheme.AccentPurple ?? '',
     AccentCyan: customTheme.text?.link ?? customTheme.AccentCyan ?? '',
     AccentGreen: customTheme.status?.success ?? customTheme.AccentGreen ?? '',
     AccentYellow: customTheme.status?.warning ?? customTheme.AccentYellow ?? '',
     AccentRed: customTheme.status?.error ?? customTheme.AccentRed ?? '',
+    AccentYellowDim:
+      customTheme.status?.warningDim ?? customTheme.AccentYellowDim ?? '',
+    AccentRedDim:
+      customTheme.status?.errorDim ?? customTheme.AccentRedDim ?? '',
     DiffAdded:
       customTheme.background?.diff?.added ?? customTheme.DiffAdded ?? '',
     DiffRemoved:
@@ -414,6 +435,7 @@ export function createCustomTheme(customTheme: CustomTheme): Theme {
       secondary: customTheme.text?.secondary ?? colors.Gray,
       link: customTheme.text?.link ?? colors.AccentBlue,
       accent: customTheme.text?.accent ?? colors.AccentPurple,
+      code: customTheme.text?.code ?? colors.LightBlue,
     },
     background: {
       primary: customTheme.background?.primary ?? colors.Background,
@@ -435,6 +457,8 @@ export function createCustomTheme(customTheme: CustomTheme): Theme {
       error: customTheme.status?.error ?? colors.AccentRed,
       success: customTheme.status?.success ?? colors.AccentGreen,
       warning: customTheme.status?.warning ?? colors.AccentYellow,
+      errorDim: customTheme.status?.errorDim ?? colors.AccentRedDim,
+      warningDim: customTheme.status?.warningDim ?? colors.AccentYellowDim,
     },
   };
 
