@@ -166,8 +166,9 @@ export function useAtCompletion(props: UseAtCompletionProps): void {
           cacheTtl: 30, // 30 seconds
           enableRecursiveFileSearch:
             config?.getEnableRecursiveFileSearch() ?? true,
-          disableFuzzySearch:
-            config?.getFileFilteringDisableFuzzySearch() ?? false,
+          // Use enableFuzzySearch with !== false to default to true when undefined.
+          enableFuzzySearch:
+            config?.getFileFilteringEnableFuzzySearch() !== false,
         });
         await searcher.initialize();
         fileSearch.current = searcher;
@@ -210,9 +211,13 @@ export function useAtCompletion(props: UseAtCompletionProps): void {
           return;
         }
 
+        // isDirectory relies on crawler.ts in @qwen-code/qwen-code-core
+        // always normalizing paths with posix '/' via fdir.withPathSeparator('/').
+        // If the crawler ever switches to path.sep, this check must be updated.
         const suggestions = results.map((p) => ({
           label: p,
           value: escapePath(p),
+          isDirectory: p.endsWith('/'),
         }));
         dispatch({ type: 'SEARCH_SUCCESS', payload: suggestions });
       } catch (error) {

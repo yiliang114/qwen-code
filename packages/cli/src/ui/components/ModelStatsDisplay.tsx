@@ -13,16 +13,28 @@ import {
   calculateCacheHitRate,
   calculateErrorRate,
 } from '../utils/computeStats.js';
-import type { ModelMetrics } from '../contexts/SessionContext.js';
+import type { ModelMetricsCore } from '../contexts/SessionContext.js';
 import { useSessionStats } from '../contexts/SessionContext.js';
+import { flattenModelsBySource } from '../utils/modelsBySource.js';
 import { t } from '../../i18n/index.js';
+import { useSettings } from '../contexts/SettingsContext.js';
+import { calculateCost } from '../../utils/costCalculator.js';
 
 const METRIC_COL_WIDTH = 28;
-const MODEL_COL_WIDTH = 22;
+// 28 + 2*24 = 76, fitting the 76-column panel at 80-column terminal width
+// when the session has a single (model, source) pair split into two columns.
+// Sessions with three or more sources will exceed the panel — acceptable per
+// the design doc, which accepts the crowded layout for many-subagent cases.
+const MODEL_COL_WIDTH = 24;
+// Keep this in sync with the surrounding Box borderStyle and paddingX:
+// Ink's round border consumes 2 border columns plus 2 columns of horizontal
+// padding on each side.
+const PANEL_HORIZONTAL_CHROME_WIDTH = 6;
 
 interface StatRowProps {
   title: string;
   values: Array<string | React.ReactElement>;
+  modelColWidth: number;
   isSubtle?: boolean;
   isSection?: boolean;
 }
@@ -30,6 +42,7 @@ interface StatRowProps {
 const StatRow: React.FC<StatRowProps> = ({
   title,
   values,
+  modelColWidth,
   isSubtle = false,
   isSection = false,
 }) => (
@@ -43,27 +56,34 @@ const StatRow: React.FC<StatRowProps> = ({
       </Text>
     </Box>
     {values.map((value, index) => (
-      <Box width={MODEL_COL_WIDTH} key={index}>
+      <Box width={modelColWidth} key={index}>
         <Text color={theme.text.primary}>{value}</Text>
       </Box>
     ))}
   </Box>
 );
 
-export const ModelStatsDisplay: React.FC = () => {
+interface ModelStatsDisplayProps {
+  width?: number;
+}
+
+export const ModelStatsDisplay: React.FC<ModelStatsDisplayProps> = ({
+  width,
+}) => {
   const { stats } = useSessionStats();
   const { models } = stats.metrics;
-  const activeModels = Object.entries(models).filter(
-    ([, metrics]) => metrics.api.totalRequests > 0,
-  );
+  const entries = flattenModelsBySource(models);
+  const settings = useSettings();
+  const modelPricing = settings.merged.modelPricing;
 
-  if (activeModels.length === 0) {
+  if (entries.length === 0) {
     return (
       <Box
         borderStyle="round"
         borderColor={theme.border.default}
         paddingY={1}
         paddingX={2}
+        width={width}
       >
         <Text color={theme.text.primary}>
           {t('No API calls have been made in this session.')}
@@ -72,18 +92,31 @@ export const ModelStatsDisplay: React.FC = () => {
     );
   }
 
-  const modelNames = activeModels.map(([name]) => name);
-
   const getModelValues = (
-    getter: (metrics: ModelMetrics) => string | React.ReactElement,
-  ) => activeModels.map(([, metrics]) => getter(metrics));
+    getter: (metrics: ModelMetricsCore) => string | React.ReactElement,
+  ) => entries.map(({ metrics }) => getter(metrics));
 
-  const hasThoughts = activeModels.some(
-    ([, metrics]) => metrics.tokens.thoughts > 0,
+  const hasThoughts = entries.some(
+    ({ metrics }) => metrics.tokens.thoughts > 0,
   );
-  const hasTool = activeModels.some(([, metrics]) => metrics.tokens.tool > 0);
-  const hasCached = activeModels.some(
-    ([, metrics]) => metrics.tokens.cached > 0,
+  const hasCached = entries.some(({ metrics }) => metrics.tokens.cached > 0);
+  const modelColWidth =
+    entries.length === 1 && width
+      ? Math.max(
+          MODEL_COL_WIDTH,
+          width - PANEL_HORIZONTAL_CHROME_WIDTH - METRIC_COL_WIDTH,
+        )
+      : MODEL_COL_WIDTH;
+
+  const getModelName = (key: string): string => key.split('::')[0];
+
+  const hasPricing = entries.some(
+    ({ key, metrics }) =>
+      calculateCost({
+        inputTokens: metrics.tokens.prompt,
+        outputTokens: metrics.tokens.candidates + metrics.tokens.thoughts,
+        pricing: modelPricing?.[getModelName(key)],
+      }) != null,
   );
 
   return (
@@ -93,6 +126,7 @@ export const ModelStatsDisplay: React.FC = () => {
       flexDirection="column"
       paddingY={1}
       paddingX={2}
+      width={width}
     >
       <Text bold color={theme.text.accent}>
         {t('Model Stats For Nerds')}
@@ -106,10 +140,10 @@ export const ModelStatsDisplay: React.FC = () => {
             {t('Metric')}
           </Text>
         </Box>
-        {modelNames.map((name) => (
-          <Box width={MODEL_COL_WIDTH} key={name}>
+        {entries.map(({ key, label }) => (
+          <Box width={modelColWidth} key={key}>
             <Text bold color={theme.text.primary}>
-              {name}
+              {label}
             </Text>
           </Box>
         ))}
@@ -126,10 +160,16 @@ export const ModelStatsDisplay: React.FC = () => {
       />
 
       {/* API Section */}
-      <StatRow title={t('API')} values={[]} isSection />
+      <StatRow
+        title={t('API')}
+        values={[]}
+        modelColWidth={modelColWidth}
+        isSection
+      />
       <StatRow
         title={t('Requests')}
         values={getModelValues((m) => m.api.totalRequests.toLocaleString())}
+        modelColWidth={modelColWidth}
       />
       <StatRow
         title={t('Errors')}
@@ -145,6 +185,7 @@ export const ModelStatsDisplay: React.FC = () => {
             </Text>
           );
         })}
+        modelColWidth={modelColWidth}
       />
       <StatRow
         title={t('Avg Latency')}
@@ -152,12 +193,18 @@ export const ModelStatsDisplay: React.FC = () => {
           const avgLatency = calculateAverageLatency(m);
           return formatDuration(avgLatency);
         })}
+        modelColWidth={modelColWidth}
       />
 
       <Box height={1} />
 
       {/* Tokens Section */}
-      <StatRow title={t('Tokens')} values={[]} isSection />
+      <StatRow
+        title={t('Tokens')}
+        values={[]}
+        modelColWidth={modelColWidth}
+        isSection
+      />
       <StatRow
         title={t('Total')}
         values={getModelValues((m) => (
@@ -165,11 +212,13 @@ export const ModelStatsDisplay: React.FC = () => {
             {m.tokens.total.toLocaleString()}
           </Text>
         ))}
+        modelColWidth={modelColWidth}
       />
       <StatRow
         title={t('Prompt')}
         isSubtle
         values={getModelValues((m) => m.tokens.prompt.toLocaleString())}
+        modelColWidth={modelColWidth}
       />
       {hasCached && (
         <StatRow
@@ -183,6 +232,7 @@ export const ModelStatsDisplay: React.FC = () => {
               </Text>
             );
           })}
+          modelColWidth={modelColWidth}
         />
       )}
       {hasThoughts && (
@@ -190,20 +240,39 @@ export const ModelStatsDisplay: React.FC = () => {
           title={t('Thoughts')}
           isSubtle
           values={getModelValues((m) => m.tokens.thoughts.toLocaleString())}
-        />
-      )}
-      {hasTool && (
-        <StatRow
-          title={t('Tool')}
-          isSubtle
-          values={getModelValues((m) => m.tokens.tool.toLocaleString())}
+          modelColWidth={modelColWidth}
         />
       )}
       <StatRow
         title={t('Output')}
         isSubtle
         values={getModelValues((m) => m.tokens.candidates.toLocaleString())}
+        modelColWidth={modelColWidth}
       />
+      {hasPricing && (
+        <>
+          <Box height={1} />
+          <StatRow
+            title={t('Cost')}
+            values={[]}
+            modelColWidth={modelColWidth}
+            isSection
+          />
+          <StatRow
+            title={t('Estimated')}
+            values={entries.map(({ key, metrics }) => {
+              const cost = calculateCost({
+                inputTokens: metrics.tokens.prompt,
+                outputTokens:
+                  metrics.tokens.candidates + metrics.tokens.thoughts,
+                pricing: modelPricing?.[getModelName(key)],
+              });
+              return cost != null ? `$${cost.toFixed(4)}` : 'N/A';
+            })}
+            modelColWidth={modelColWidth}
+          />
+        </>
+      )}
     </Box>
   );
 };

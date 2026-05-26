@@ -8,6 +8,9 @@ import { isNodeError } from '../utils/errors.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as process from 'node:process';
+import { createDebugLogger } from './debugLogger.js';
+
+const debugLogger = createDebugLogger('WORKSPACE');
 
 export type Unsubscribe = () => void;
 
@@ -20,6 +23,16 @@ export class WorkspaceContext {
   private directories = new Set<string>();
   private initialDirectories: Set<string>;
   private onDirectoriesChangedListeners = new Set<() => void>();
+  /**
+   * Memoized realpath results. Every workspace-bounded tool call ultimately
+   * routes through {@link fullyResolvedPath} → `fs.realpathSync`; without
+   * this cache the same path gets re-resolved on every Read/Glob/Grep/Ls
+   * invocation. Bounded so long sessions touching many files don't grow
+   * without limit; FIFO eviction is good enough — the working set tends to
+   * be the small set of paths the model is actively manipulating.
+   */
+  private resolvedPathCache = new Map<string, string>();
+  private static readonly RESOLVED_PATH_CACHE_MAX = 1024;
 
   /**
    * Creates a new WorkspaceContext with the given initial directory and optional additional directories.
@@ -28,10 +41,13 @@ export class WorkspaceContext {
    */
   constructor(directory: string, additionalDirectories: string[] = []) {
     this.addDirectory(directory);
+    // Snapshot only the primary working directory as "initial" (non-removable).
+    // Additional directories (from settings / CLI flags) are added after
+    // the snapshot so they remain removable by the user.
+    this.initialDirectories = new Set(this.directories);
     for (const additionalDirectory of additionalDirectories) {
       this.addDirectory(additionalDirectory);
     }
-    this.initialDirectories = new Set(this.directories);
   }
 
   /**
@@ -53,7 +69,7 @@ export class WorkspaceContext {
         listener();
       } catch (e) {
         // Don't let one listener break others.
-        console.error('Error in WorkspaceContext listener:', e);
+        debugLogger.error('Error in WorkspaceContext listener:', e);
       }
     }
   }
@@ -72,8 +88,8 @@ export class WorkspaceContext {
       this.directories.add(resolved);
       this.notifyDirectoriesChanged();
     } catch (err) {
-      console.warn(
-        `[WARN] Skipping unreadable directory: ${directory} (${err instanceof Error ? err.message : String(err)})`,
+      debugLogger.warn(
+        `Skipping unreadable directory: ${directory} (${err instanceof Error ? err.message : String(err)})`,
       );
     }
   }
@@ -109,6 +125,53 @@ export class WorkspaceContext {
     return Array.from(this.initialDirectories);
   }
 
+  /**
+   * Removes a directory from the workspace.
+   * Cannot remove initial directories (those set at construction time).
+   * @param directory The directory path to remove
+   * @returns True if the directory was removed, false if not found or is an initial directory
+   */
+  removeDirectory(directory: string): boolean {
+    // Resolve to match the stored form
+    let resolved: string;
+    try {
+      resolved = this.resolveAndValidateDir(directory);
+    } catch {
+      // If we can't resolve it, try matching by raw string (e.g. directory was deleted)
+      resolved = path.isAbsolute(directory)
+        ? directory
+        : path.resolve(process.cwd(), directory);
+    }
+
+    if (this.initialDirectories.has(resolved)) {
+      debugLogger.warn(`Cannot remove initial directory: ${resolved}`);
+      return false;
+    }
+
+    if (!this.directories.has(resolved)) {
+      return false;
+    }
+
+    this.directories.delete(resolved);
+    this.notifyDirectoriesChanged();
+    return true;
+  }
+
+  /**
+   * Checks whether a directory is an initial (non-removable) directory.
+   */
+  isInitialDirectory(directory: string): boolean {
+    try {
+      const resolved = this.resolveAndValidateDir(directory);
+      return this.initialDirectories.has(resolved);
+    } catch {
+      const absolutePath = path.isAbsolute(directory)
+        ? directory
+        : path.resolve(process.cwd(), directory);
+      return this.initialDirectories.has(absolutePath);
+    }
+  }
+
   setDirectories(directories: readonly string[]): void {
     const newDirectories = new Set<string>();
     for (const dir of directories) {
@@ -134,7 +197,7 @@ export class WorkspaceContext {
       const fullyResolvedPath = this.fullyResolvedPath(pathToCheck);
 
       for (const dir of this.directories) {
-        if (this.isPathWithinRoot(fullyResolvedPath, dir)) {
+        if (isPathWithinRoot(fullyResolvedPath, dir)) {
           return true;
         }
       }
@@ -148,10 +211,21 @@ export class WorkspaceContext {
    * Fully resolves a path, including symbolic links.
    * If the path does not exist, it returns the fully resolved path as it would be
    * if it did exist.
+   *
+   * Result is memoized in {@link resolvedPathCache}. Filesystem-state cache:
+   * if a file is renamed / a symlink is retargeted mid-session the cache
+   * goes stale, which is the same correctness profile as any single
+   * `realpathSync` call (it captures a moment in time). The win is cutting
+   * 8+ syscalls per tool-heavy prompt down to 1.
    */
   private fullyResolvedPath(pathToCheck: string): string {
+    const cached = this.resolvedPathCache.get(pathToCheck);
+    if (cached !== undefined) {
+      return cached;
+    }
+    let resolved: string;
     try {
-      return fs.realpathSync(pathToCheck);
+      resolved = fs.realpathSync(pathToCheck);
     } catch (e: unknown) {
       if (
         isNodeError(e) &&
@@ -162,28 +236,21 @@ export class WorkspaceContext {
         !this.isFileSymlink(e.path)
       ) {
         // If it doesn't exist, e.path contains the fully resolved path.
-        return e.path;
+        resolved = e.path;
+      } else {
+        // Don't cache exceptions — the path may exist on retry.
+        throw e;
       }
-      throw e;
     }
-  }
-
-  /**
-   * Checks if a path is within a given root directory.
-   * @param pathToCheck The absolute path to check
-   * @param rootDirectory The absolute root directory
-   * @returns True if the path is within the root directory, false otherwise
-   */
-  private isPathWithinRoot(
-    pathToCheck: string,
-    rootDirectory: string,
-  ): boolean {
-    const relative = path.relative(rootDirectory, pathToCheck);
-    return (
-      !relative.startsWith(`..${path.sep}`) &&
-      relative !== '..' &&
-      !path.isAbsolute(relative)
-    );
+    if (
+      this.resolvedPathCache.size >= WorkspaceContext.RESOLVED_PATH_CACHE_MAX
+    ) {
+      // FIFO eviction: drop the oldest insertion (Map preserves insert order).
+      const oldest = this.resolvedPathCache.keys().next().value;
+      if (oldest !== undefined) this.resolvedPathCache.delete(oldest);
+    }
+    this.resolvedPathCache.set(pathToCheck, resolved);
+    return resolved;
   }
 
   /**
@@ -196,4 +263,22 @@ export class WorkspaceContext {
       return false;
     }
   }
+}
+
+/**
+ * Checks if a path is within a given root directory.
+ * @param pathToCheck The absolute path to check
+ * @param rootDirectory The absolute root directory
+ * @returns True if the path is within the root directory, false otherwise
+ */
+export function isPathWithinRoot(
+  pathToCheck: string,
+  rootDirectory: string,
+): boolean {
+  const relative = path.relative(rootDirectory, pathToCheck);
+  return (
+    !relative.startsWith(`..${path.sep}`) &&
+    relative !== '..' &&
+    !path.isAbsolute(relative)
+  );
 }

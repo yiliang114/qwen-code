@@ -4,11 +4,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// no hooks needed beyond keypress handled inside
-import { Box, Text } from 'ink';
+import { Box, Text, useStdin } from 'ink';
 import chalk from 'chalk';
 import stringWidth from 'string-width';
 import { useTextBuffer } from './text-buffer.js';
+import { usePreferredEditor } from '../../hooks/usePreferredEditor.js';
 import { useKeypress } from '../../hooks/useKeypress.js';
 import { keyMatchers, Command } from '../../keyMatchers.js';
 import { cpSlice, cpLen } from '../../utils/textUtils.js';
@@ -21,22 +21,49 @@ export interface TextInputProps {
   value: string;
   onChange: (text: string) => void;
   onSubmit?: () => void;
+  /** Called when Tab is pressed; if provided, prevents the default tab-insertion behaviour. */
+  onTab?: (key: Key) => void;
+  /** Called when ↑ is pressed; if provided, prevents cursor-up in the buffer. */
+  onUp?: () => void;
+  /** Called when ↓ is pressed; if provided, prevents cursor-down in the buffer. */
+  onDown?: () => void;
   placeholder?: string;
   height?: number; // lines in viewport; >1 enables multiline
   isActive?: boolean; // when false, ignore keypresses
   validationErrors?: string[];
   inputWidth?: number;
+  initialCursorOffset?: number;
+  ellipsizeOverflow?: boolean;
+}
+
+function ellipsizeMiddle(text: string, width: number): string {
+  if (width <= 0) return '';
+  if (stringWidth(text) <= width) return text;
+  if (width <= 3) return cpSlice(text, 0, width);
+
+  const available = width - 3;
+  const headLength = Math.ceil(available / 2);
+  const tailLength = Math.floor(available / 2);
+  return `${cpSlice(text, 0, headLength)}...${cpSlice(
+    text,
+    cpLen(text) - tailLength,
+  )}`;
 }
 
 export function TextInput({
   value,
   onChange,
   onSubmit,
+  onTab,
+  onUp,
+  onDown,
   placeholder,
   height = 1,
   isActive = true,
   validationErrors = [],
   inputWidth = 80,
+  initialCursorOffset,
+  ellipsizeOverflow = false,
 }: TextInputProps) {
   const allowMultiline = height > 1;
 
@@ -49,11 +76,18 @@ export function TextInput({
     onChangeRef.current?.(text);
   }, []);
 
+  const preferredEditor = usePreferredEditor();
+  const { stdin, setRawMode } = useStdin();
+
   const buffer = useTextBuffer({
     initialText: value || '',
+    initialCursorOffset,
     viewport: { height, width: inputWidth },
+    stdin,
+    setRawMode,
     isValidPath: () => false,
     onChange: stableOnChange,
+    preferredEditor,
   });
 
   const handleSubmit = () => {
@@ -65,27 +99,37 @@ export function TextInput({
     (key: Key) => {
       if (!buffer || !isActive) return;
 
-      // Submit on Enter
-      if (keyMatchers[Command.SUBMIT](key) || key.name === 'return') {
-        if (allowMultiline) {
-          const [row, col] = buffer.cursor;
-          const line = buffer.lines[row];
-          const charBefore = col > 0 ? cpSlice(line, col - 1, col) : '';
-          if (charBefore === '\\') {
-            buffer.backspace();
-            buffer.newline();
-          } else {
-            handleSubmit();
-          }
-        } else {
-          handleSubmit();
-        }
+      // Tab completion: delegate to caller instead of inserting a tab character
+      // During paste, let tab through as literal content (e.g. Excel tab-separated data)
+      if (key.name === 'tab' && !key.paste) {
+        onTab?.(key);
         return;
       }
 
-      // Multiline newline insertion (Shift+Enter etc.)
+      // Arrow-key completion navigation: delegate to caller
+      if (key.name === 'up' && onUp) {
+        onUp();
+        return;
+      }
+      if (key.name === 'down' && onDown) {
+        onDown();
+        return;
+      }
+
+      // Multiline newline insertion (Shift+Enter etc.) — check before SUBMIT
+      // so that modified-Return keys aren't swallowed by the submit branch.
       if (allowMultiline && keyMatchers[Command.NEWLINE](key)) {
         buffer.newline();
+        return;
+      }
+
+      // Submit on Enter (plain Return). In single-line mode any Return
+      // variant submits since there is no newline concept.
+      if (
+        keyMatchers[Command.SUBMIT](key) ||
+        (!allowMultiline && key.name === 'return')
+      ) {
+        handleSubmit();
         return;
       }
 
@@ -140,6 +184,8 @@ export function TextInput({
               {chalk.inverse(placeholder.slice(0, 1))}
               <Text color={Colors.Gray}>{placeholder.slice(1)}</Text>
             </Text>
+          ) : ellipsizeOverflow && stringWidth(buffer.text) > inputWidth ? (
+            <Text>{ellipsizeMiddle(buffer.text, inputWidth)}</Text>
           ) : (
             linesToRender.map((lineText, visualIdxInRenderedSet) => {
               const cursorVisualRow = cursorVisualRowAbsolute - scrollVisualRow;

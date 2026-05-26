@@ -5,7 +5,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Config } from '@qwen-code/qwen-code-core';
+import { SendMessageType, type Config } from '@qwen-code/qwen-code-core';
 import { runNonInteractiveStreamJson } from './session.js';
 import type {
   CLIUserMessage,
@@ -18,7 +18,6 @@ import { StreamJsonOutputAdapter } from './io/StreamJsonOutputAdapter.js';
 import { ControlDispatcher } from './control/ControlDispatcher.js';
 import { ControlContext } from './control/ControlContext.js';
 import { ControlService } from './control/ControlService.js';
-import { ConsolePatcher } from '../ui/utils/ConsolePatcher.js';
 
 const runNonInteractiveMock = vi.fn();
 
@@ -47,10 +46,6 @@ vi.mock('./control/ControlService.js', () => ({
   ControlService: vi.fn(),
 }));
 
-vi.mock('../ui/utils/ConsolePatcher.js', () => ({
-  ConsolePatcher: vi.fn(),
-}));
-
 interface ConfigOverrides {
   getSessionId?: () => string;
   getModel?: () => string;
@@ -61,6 +56,18 @@ interface ConfigOverrides {
   [key: string]: unknown;
 }
 
+let mockMonitorRegistry: {
+  setNotificationCallback: ReturnType<typeof vi.fn>;
+  setRegisterCallback: ReturnType<typeof vi.fn>;
+  abortAll: ReturnType<typeof vi.fn>;
+};
+let mockBackgroundShellRegistry: {
+  abortAll: ReturnType<typeof vi.fn>;
+};
+let mockBackgroundTaskRegistry: {
+  abortAll: ReturnType<typeof vi.fn>;
+};
+
 function createConfig(overrides: ConfigOverrides = {}): Config {
   const base = {
     getSessionId: () => 'test-session',
@@ -70,6 +77,10 @@ function createConfig(overrides: ConfigOverrides = {}): Config {
     getApprovalMode: () => 'auto',
     getOutputFormat: () => 'stream-json',
     initialize: vi.fn(),
+    waitForMcpReady: vi.fn().mockResolvedValue(undefined),
+    getMonitorRegistry: () => mockMonitorRegistry,
+    getBackgroundShellRegistry: () => mockBackgroundShellRegistry,
+    getBackgroundTaskRegistry: () => mockBackgroundTaskRegistry,
   };
   return { ...base, ...overrides } as unknown as Config;
 }
@@ -147,40 +158,45 @@ describe('runNonInteractiveStreamJson', () => {
   };
   let mockOutputAdapter: {
     emitResult: ReturnType<typeof vi.fn>;
+    emitUserMessage: ReturnType<typeof vi.fn>;
+    emitSystemMessage: ReturnType<typeof vi.fn>;
   };
   let mockDispatcher: {
     dispatch: ReturnType<typeof vi.fn>;
     handleControlResponse: ReturnType<typeof vi.fn>;
     handleCancel: ReturnType<typeof vi.fn>;
     shutdown: ReturnType<typeof vi.fn>;
+    markInputClosed: ReturnType<typeof vi.fn>;
     getPendingIncomingRequestCount: ReturnType<typeof vi.fn>;
     waitForPendingIncomingRequests: ReturnType<typeof vi.fn>;
     sdkMcpController: {
       createSendSdkMcpMessage: ReturnType<typeof vi.fn>;
     };
   };
-  let mockConsolePatcher: {
-    patch: ReturnType<typeof vi.fn>;
-    cleanup: ReturnType<typeof vi.fn>;
-  };
-
   beforeEach(() => {
+    mockMonitorRegistry = {
+      setNotificationCallback: vi.fn(),
+      setRegisterCallback: vi.fn(),
+      abortAll: vi.fn(),
+    };
+    mockBackgroundShellRegistry = {
+      abortAll: vi.fn(),
+    };
+    mockBackgroundTaskRegistry = {
+      abortAll: vi.fn(),
+    };
     config = createConfig();
     runNonInteractiveMock.mockReset();
 
     // Setup mocks
-    mockConsolePatcher = {
-      patch: vi.fn(),
-      cleanup: vi.fn(),
-    };
-    (ConsolePatcher as unknown as ReturnType<typeof vi.fn>).mockImplementation(
-      () => mockConsolePatcher,
-    );
-
     mockOutputAdapter = {
       emitResult: vi.fn(),
+      emitUserMessage: vi.fn(),
+      emitSystemMessage: vi.fn(),
     } as {
       emitResult: ReturnType<typeof vi.fn>;
+      emitUserMessage: ReturnType<typeof vi.fn>;
+      emitSystemMessage: ReturnType<typeof vi.fn>;
       [key: string]: unknown;
     };
     (
@@ -192,6 +208,7 @@ describe('runNonInteractiveStreamJson', () => {
       handleControlResponse: vi.fn(),
       handleCancel: vi.fn(),
       shutdown: vi.fn(),
+      markInputClosed: vi.fn(),
       getPendingIncomingRequestCount: vi.fn().mockReturnValue(0),
       waitForPendingIncomingRequests: vi.fn().mockResolvedValue(undefined),
       sdkMcpController: {
@@ -234,9 +251,7 @@ describe('runNonInteractiveStreamJson', () => {
 
     await runNonInteractiveStreamJson(config, '');
 
-    expect(mockConsolePatcher.patch).toHaveBeenCalledTimes(1);
     expect(mockDispatcher.dispatch).toHaveBeenCalledWith(initRequest);
-    expect(mockConsolePatcher.cleanup).toHaveBeenCalledTimes(1);
   });
 
   it('processes user message when received as first message', async () => {
@@ -275,6 +290,240 @@ describe('runNonInteractiveStreamJson', () => {
     await runNonInteractiveStreamJson(config, '');
 
     expect(runNonInteractiveMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('routes monitor notifications through the session queue', async () => {
+    const initRequest = createControlRequest('initialize');
+    const userMessage = createUserMessage('Start a monitor');
+    let closeInput: (() => void) | undefined;
+
+    let registerCallback:
+      | ((entry: {
+          monitorId: string;
+          toolUseId?: string;
+          description: string;
+        }) => void)
+      | undefined;
+    let monitorCallback:
+      | ((
+          displayText: string,
+          modelText: string,
+          meta: {
+            monitorId: string;
+            toolUseId?: string;
+            status: string;
+          },
+        ) => void)
+      | undefined;
+    mockMonitorRegistry.setRegisterCallback.mockImplementation((cb) => {
+      registerCallback = cb;
+    });
+    mockMonitorRegistry.setNotificationCallback.mockImplementation((cb) => {
+      monitorCallback = cb;
+    });
+
+    const notificationXml =
+      '<task-notification>\n' +
+      '<task-id>mon_1</task-id>\n' +
+      '<kind>monitor</kind>\n' +
+      '<status>running</status>\n' +
+      '<summary>Monitor emitted event #1.</summary>\n' +
+      '<result>ready</result>\n' +
+      '</task-notification>';
+
+    runNonInteractiveMock
+      .mockImplementationOnce(async () => {
+        registerCallback?.({
+          monitorId: 'mon_1',
+          toolUseId: 'tool_mon_1',
+          description: 'logs',
+        });
+        monitorCallback?.('Monitor "logs" event #1: ready', notificationXml, {
+          monitorId: 'mon_1',
+          toolUseId: 'tool_mon_1',
+          status: 'running',
+        });
+      })
+      .mockResolvedValueOnce(undefined);
+
+    mockInputReader.read = async function* () {
+      yield initRequest;
+      yield userMessage;
+      await new Promise<void>((resolve) => {
+        closeInput = resolve;
+      });
+    };
+
+    const sessionPromise = runNonInteractiveStreamJson(config, '');
+    await vi.waitFor(() => {
+      expect(runNonInteractiveMock).toHaveBeenCalledTimes(2);
+    });
+    closeInput?.();
+    await sessionPromise;
+
+    expect(runNonInteractiveMock).toHaveBeenCalledTimes(2);
+    expect(mockOutputAdapter.emitSystemMessage).toHaveBeenCalledWith(
+      'task_started',
+      {
+        task_id: 'mon_1',
+        tool_use_id: 'tool_mon_1',
+        description: 'logs',
+      },
+    );
+    expect(mockOutputAdapter.emitUserMessage).toHaveBeenCalledWith([
+      { text: 'Monitor "logs" event #1: ready' },
+    ]);
+    expect(mockOutputAdapter.emitSystemMessage).toHaveBeenCalledWith(
+      'task_notification',
+      {
+        task_id: 'mon_1',
+        tool_use_id: 'tool_mon_1',
+        status: 'running',
+      },
+    );
+    expect(runNonInteractiveMock).toHaveBeenNthCalledWith(
+      2,
+      config,
+      expect.objectContaining({ merged: expect.any(Object) }),
+      notificationXml,
+      expect.stringContaining('test-session'),
+      expect.objectContaining({
+        adapter: mockOutputAdapter,
+        sendMessageType: SendMessageType.Notification,
+        notificationDisplayText: 'Monitor "logs" event #1: ready',
+        captureMonitorNotifications: false,
+        captureMonitorRegistrations: false,
+      }),
+    );
+  });
+
+  it('stops accepting new monitor events before EOF drain', async () => {
+    const initRequest = createControlRequest('initialize');
+    const userMessage = createUserMessage('Start a monitor');
+    let closeInput: (() => void) | undefined;
+
+    let registerCallback:
+      | ((entry: {
+          monitorId: string;
+          toolUseId?: string;
+          description: string;
+        }) => void)
+      | undefined;
+    let notificationCallback:
+      | ((
+          displayText: string,
+          modelText: string,
+          meta: {
+            monitorId: string;
+            toolUseId?: string;
+            status: string;
+          },
+        ) => void)
+      | undefined;
+
+    mockMonitorRegistry.setRegisterCallback.mockImplementation((cb) => {
+      registerCallback = cb;
+    });
+    mockMonitorRegistry.setNotificationCallback.mockImplementation((cb) => {
+      notificationCallback = cb;
+    });
+
+    let releaseFirstTurn: (() => void) | undefined;
+    runNonInteractiveMock.mockImplementationOnce(async () => {
+      registerCallback?.({
+        monitorId: 'mon_before_eof',
+        toolUseId: 'tool_mon_before_eof',
+        description: 'before eof',
+      });
+      notificationCallback?.(
+        'Monitor "before eof" event #1: ready',
+        '<task-notification>before-eof</task-notification>',
+        {
+          monitorId: 'mon_before_eof',
+          toolUseId: 'tool_mon_before_eof',
+          status: 'running',
+        },
+      );
+      await new Promise<void>((resolve) => {
+        releaseFirstTurn = () => {
+          registerCallback?.({
+            monitorId: 'mon_late',
+            toolUseId: 'tool_mon_late',
+            description: 'late monitor',
+          });
+          notificationCallback?.(
+            'Monitor "late monitor" event #1: ignored',
+            '<task-notification>late</task-notification>',
+            {
+              monitorId: 'mon_late',
+              toolUseId: 'tool_mon_late',
+              status: 'running',
+            },
+          );
+          resolve();
+        };
+      });
+    });
+
+    mockInputReader.read = async function* () {
+      yield initRequest;
+      yield userMessage;
+      await new Promise<void>((resolve) => {
+        closeInput = resolve;
+      });
+    };
+
+    const sessionPromise = runNonInteractiveStreamJson(config, '');
+    await vi.waitFor(() => {
+      expect(runNonInteractiveMock).toHaveBeenCalledTimes(1);
+    });
+
+    closeInput?.();
+    await vi.waitFor(() => {
+      expect(
+        mockMonitorRegistry.setNotificationCallback,
+      ).toHaveBeenLastCalledWith(undefined);
+      expect(mockMonitorRegistry.setRegisterCallback).toHaveBeenLastCalledWith(
+        undefined,
+      );
+    });
+
+    releaseFirstTurn?.();
+    await sessionPromise;
+
+    expect(mockOutputAdapter.emitSystemMessage).toHaveBeenCalledWith(
+      'task_started',
+      {
+        task_id: 'mon_before_eof',
+        tool_use_id: 'tool_mon_before_eof',
+        description: 'before eof',
+      },
+    );
+    expect(mockOutputAdapter.emitSystemMessage).not.toHaveBeenCalledWith(
+      'task_started',
+      expect.objectContaining({ task_id: 'mon_late' }),
+    );
+    expect(mockOutputAdapter.emitSystemMessage).toHaveBeenCalledWith(
+      'task_notification',
+      {
+        task_id: 'mon_before_eof',
+        tool_use_id: 'tool_mon_before_eof',
+        status: 'running',
+      },
+    );
+    expect(mockOutputAdapter.emitSystemMessage).not.toHaveBeenCalledWith(
+      'task_notification',
+      expect.objectContaining({ task_id: 'mon_late' }),
+    );
+    expect(runNonInteractiveMock).toHaveBeenCalledTimes(2);
+
+    const clearCalls = mockMonitorRegistry.setNotificationCallback.mock.calls
+      .map(([cb]) => cb)
+      .filter((cb) => cb === undefined);
+    expect(clearCalls).toHaveLength(1);
+    expect(mockMonitorRegistry.setRegisterCallback).toHaveBeenLastCalledWith(
+      undefined,
+    );
   });
 
   it('enqueues user messages received during processing', async () => {
@@ -487,8 +736,6 @@ describe('runNonInteractiveStreamJson', () => {
     await expect(runNonInteractiveStreamJson(config, '')).rejects.toThrow(
       'Stream error',
     );
-
-    expect(mockConsolePatcher.cleanup).toHaveBeenCalled();
   });
 
   it('stops processing when abort signal is triggered', async () => {
@@ -565,9 +812,6 @@ describe('runNonInteractiveStreamJson', () => {
     };
 
     await runNonInteractiveStreamJson(config, '');
-
-    expect(mockConsolePatcher.patch).toHaveBeenCalledTimes(1);
-    expect(mockConsolePatcher.cleanup).toHaveBeenCalledTimes(1);
   });
 
   it('cleans up output adapter on completion', async () => {
@@ -590,13 +834,158 @@ describe('runNonInteractiveStreamJson', () => {
     expect(mockDispatcher.shutdown).toHaveBeenCalledTimes(1);
   });
 
+  it('aborts background registries on stream completion shutdown', async () => {
+    const initRequest = createControlRequest('initialize');
+
+    mockInputReader.read = async function* () {
+      yield initRequest;
+    };
+
+    await runNonInteractiveStreamJson(config, '');
+
+    expect(mockMonitorRegistry.abortAll).toHaveBeenCalledTimes(2);
+    expect(mockBackgroundShellRegistry.abortAll).toHaveBeenCalledTimes(2);
+    expect(mockBackgroundTaskRegistry.abortAll).toHaveBeenCalledTimes(2);
+  });
+
+  it('aborts background registries on error shutdown', async () => {
+    const streamError = new Error('Stream error');
+    // eslint-disable-next-line require-yield
+    mockInputReader.read = async function* () {
+      throw streamError;
+    } as typeof mockInputReader.read;
+
+    await expect(runNonInteractiveStreamJson(config, '')).rejects.toThrow(
+      'Stream error',
+    );
+
+    expect(mockMonitorRegistry.abortAll).toHaveBeenCalledTimes(2);
+    expect(mockBackgroundShellRegistry.abortAll).toHaveBeenCalledTimes(2);
+    expect(mockBackgroundTaskRegistry.abortAll).toHaveBeenCalledTimes(2);
+  });
+
+  it('runs final background cleanup after in-flight processing drains', async () => {
+    const initRequest = createControlRequest('initialize');
+    const userMessage = createUserMessage('Start background work');
+    let releaseProcessing: (() => void) | undefined;
+    const callOrder: string[] = [];
+
+    mockMonitorRegistry.abortAll.mockImplementation(() => {
+      callOrder.push('monitor:abortAll');
+    });
+    mockBackgroundShellRegistry.abortAll.mockImplementation(() => {
+      callOrder.push('background:abortAll');
+    });
+    mockBackgroundTaskRegistry.abortAll.mockImplementation(() => {
+      callOrder.push('agent:abortAll');
+    });
+
+    runNonInteractiveMock.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          callOrder.push('run:start');
+          releaseProcessing = () => {
+            callOrder.push('run:end');
+            resolve();
+          };
+        }),
+    );
+
+    mockInputReader.read = async function* () {
+      yield initRequest;
+      yield userMessage;
+    };
+
+    const sessionPromise = runNonInteractiveStreamJson(config, '');
+    await vi.waitFor(() => {
+      expect(releaseProcessing).toBeDefined();
+    });
+
+    expect(mockMonitorRegistry.abortAll).toHaveBeenCalledTimes(1);
+    expect(mockBackgroundShellRegistry.abortAll).toHaveBeenCalledTimes(1);
+    expect(mockBackgroundTaskRegistry.abortAll).toHaveBeenCalledTimes(1);
+    expect(callOrder).toContain('run:start');
+    expect(callOrder).toContain('monitor:abortAll');
+    expect(callOrder).toContain('background:abortAll');
+    expect(callOrder).toContain('agent:abortAll');
+
+    releaseProcessing?.();
+    await sessionPromise;
+
+    expect(mockMonitorRegistry.abortAll).toHaveBeenCalledTimes(2);
+    expect(mockBackgroundShellRegistry.abortAll).toHaveBeenCalledTimes(2);
+    expect(mockBackgroundTaskRegistry.abortAll).toHaveBeenCalledTimes(2);
+    expect(callOrder.slice(-4)).toEqual([
+      'run:end',
+      'monitor:abortAll',
+      'background:abortAll',
+      'agent:abortAll',
+    ]);
+  });
+
+  it('runs final background cleanup after in-flight processing drains on error shutdown', async () => {
+    const initRequest = createControlRequest('initialize');
+    const userMessage = createUserMessage('Start background work');
+    let releaseProcessing: (() => void) | undefined;
+    const callOrder: string[] = [];
+    const streamError = new Error('Stream error');
+
+    mockMonitorRegistry.abortAll.mockImplementation(() => {
+      callOrder.push('monitor:abortAll');
+    });
+    mockBackgroundShellRegistry.abortAll.mockImplementation(() => {
+      callOrder.push('background:abortAll');
+    });
+    mockBackgroundTaskRegistry.abortAll.mockImplementation(() => {
+      callOrder.push('agent:abortAll');
+    });
+
+    runNonInteractiveMock.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          callOrder.push('run:start');
+          releaseProcessing = () => {
+            callOrder.push('run:end');
+            resolve();
+          };
+        }),
+    );
+
+    mockInputReader.read = async function* () {
+      yield initRequest;
+      yield userMessage;
+      throw streamError;
+    } as typeof mockInputReader.read;
+
+    const sessionPromise = runNonInteractiveStreamJson(config, '');
+    await vi.waitFor(() => {
+      expect(releaseProcessing).toBeDefined();
+    });
+
+    expect(mockMonitorRegistry.abortAll).toHaveBeenCalledTimes(1);
+    expect(mockBackgroundShellRegistry.abortAll).toHaveBeenCalledTimes(1);
+    expect(mockBackgroundTaskRegistry.abortAll).toHaveBeenCalledTimes(1);
+    expect(callOrder).toContain('run:start');
+
+    releaseProcessing?.();
+    await expect(sessionPromise).rejects.toThrow('Stream error');
+
+    expect(mockMonitorRegistry.abortAll).toHaveBeenCalledTimes(2);
+    expect(mockBackgroundShellRegistry.abortAll).toHaveBeenCalledTimes(2);
+    expect(mockBackgroundTaskRegistry.abortAll).toHaveBeenCalledTimes(2);
+    expect(callOrder.slice(-4)).toEqual([
+      'run:end',
+      'monitor:abortAll',
+      'background:abortAll',
+      'agent:abortAll',
+    ]);
+  });
+
   it('handles empty stream gracefully', async () => {
     mockInputReader.read = async function* () {
       // Empty stream
     };
 
     await runNonInteractiveStreamJson(config, '');
-
-    expect(mockConsolePatcher.cleanup).toHaveBeenCalled();
   });
 });

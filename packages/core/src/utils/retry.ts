@@ -6,13 +6,25 @@
 
 import type { GenerateContentResponse } from '@google/genai';
 import { AuthType } from '../core/contentGenerator.js';
-import {
-  isQwenQuotaExceededError,
-  isQwenThrottlingError,
-} from './quotaErrorDetection.js';
+import { isQwenQuotaExceededError } from './quotaErrorDetection.js';
+import { createDebugLogger } from './debugLogger.js';
+import { getErrorStatus } from './errors.js';
+
+const debugLogger = createDebugLogger('RETRY');
+
+// Persistent retry mode constants
+const PERSISTENT_MAX_BACKOFF_MS = 5 * 60 * 1000; // 5 minutes — single retry backoff cap
+const PERSISTENT_CAP_MS = 6 * 60 * 60 * 1000; // 6 hours — absolute single wait cap
+const HEARTBEAT_INTERVAL_MS = 30_000; // 30 seconds
 
 export interface HttpError extends Error {
   status?: number;
+}
+
+export interface HeartbeatInfo {
+  attempt: number;
+  remainingMs: number;
+  error: unknown;
 }
 
 export interface RetryOptions {
@@ -21,16 +33,19 @@ export interface RetryOptions {
   maxDelayMs: number;
   shouldRetryOnError: (error: Error) => boolean;
   shouldRetryOnContent?: (content: GenerateContentResponse) => boolean;
-  onPersistent429?: (
-    authType?: string,
-    error?: unknown,
-  ) => Promise<string | boolean | null>;
   authType?: string;
+  // Persistent retry mode options
+  persistentMode?: boolean;
+  persistentMaxBackoffMs?: number;
+  persistentCapMs?: number;
+  heartbeatIntervalMs?: number;
+  heartbeatFn?: (info: HeartbeatInfo) => void;
+  signal?: AbortSignal;
 }
 
 const DEFAULT_RETRY_OPTIONS: RetryOptions = {
-  maxAttempts: 5,
-  initialDelayMs: 5000,
+  maxAttempts: 7,
+  initialDelayMs: 1500,
   maxDelayMs: 30000, // 30 seconds
   shouldRetryOnError: defaultShouldRetry,
 };
@@ -42,18 +57,31 @@ const DEFAULT_RETRY_OPTIONS: RetryOptions = {
  * @returns True if the error is a transient error, false otherwise.
  */
 function defaultShouldRetry(error: Error | unknown): boolean {
-  // Check for common transient error status codes either in message or a status property
-  if (error && typeof (error as { status?: number }).status === 'number') {
-    const status = (error as { status: number }).status;
-    if (status === 429 || (status >= 500 && status < 600)) {
-      return true;
-    }
-  }
-  if (error instanceof Error && error.message) {
-    if (error.message.includes('429')) return true;
-    if (error.message.match(/5\d{2}/)) return true;
-  }
-  return false;
+  const status = getErrorStatus(error);
+  return (
+    status === 429 || (status !== undefined && status >= 500 && status < 600)
+  );
+}
+
+/**
+ * Determines if an error is a transient capacity error eligible for persistent retry.
+ * Only 429 (Rate Limit) and 529 (Overloaded) qualify — HTTP 500 is excluded
+ * because it may indicate a permanent server bug.
+ */
+export function isTransientCapacityError(error: unknown): boolean {
+  const status = getErrorStatus(error);
+  return status === 429 || status === 529;
+}
+
+/**
+ * Detects whether persistent retry mode is explicitly enabled.
+ * Requires the user to opt in via QWEN_CODE_UNATTENDED_RETRY — we intentionally
+ * do NOT auto-activate on CI=true, because silently turning a fast-fail CI job
+ * into an infinite-wait job would be surprising and dangerous.
+ */
+export function isUnattendedMode(): boolean {
+  const val = process.env['QWEN_CODE_UNATTENDED_RETRY'];
+  return val === 'true' || val === '1';
 }
 
 /**
@@ -66,7 +94,44 @@ function delay(ms: number): Promise<void> {
 }
 
 /**
+ * Sleeps in chunks, emitting heartbeat callbacks at regular intervals.
+ * Supports AbortSignal for graceful cancellation.
+ */
+async function sleepWithHeartbeat(
+  totalMs: number,
+  ctx: {
+    attempt: number;
+    error: unknown;
+    heartbeatInterval: number;
+    heartbeatFn?: (info: HeartbeatInfo) => void;
+    signal?: AbortSignal;
+  },
+): Promise<void> {
+  let remaining = totalMs;
+
+  while (remaining > 0) {
+    if (ctx.signal?.aborted) {
+      throw new Error('Retry aborted by signal');
+    }
+
+    const chunk = Math.max(1, Math.min(remaining, ctx.heartbeatInterval));
+    await delay(chunk);
+    remaining -= chunk;
+
+    if (remaining > 0 && ctx.heartbeatFn) {
+      ctx.heartbeatFn({
+        attempt: ctx.attempt,
+        remainingMs: remaining,
+        error: ctx.error,
+      });
+    }
+  }
+}
+
+/**
  * Retries a function with exponential backoff and jitter.
+ * Supports persistent retry mode for unattended/CI environments where transient
+ * capacity errors (429/529) should be retried indefinitely rather than failing.
  * @param fn The asynchronous function to retry.
  * @param options Optional retry configuration.
  * @returns A promise that resolves with the result of the function if successful.
@@ -91,14 +156,25 @@ export async function retryWithBackoff<T>(
     authType,
     shouldRetryOnError,
     shouldRetryOnContent,
+    persistentMode,
+    persistentMaxBackoffMs,
+    persistentCapMs,
+    heartbeatIntervalMs,
+    heartbeatFn,
+    signal,
   } = {
     ...DEFAULT_RETRY_OPTIONS,
     ...cleanOptions,
   };
 
+  const persistent = persistentMode ?? false;
+  const maxBackoff = persistentMaxBackoffMs ?? PERSISTENT_MAX_BACKOFF_MS;
+  const capMs = persistentCapMs ?? PERSISTENT_CAP_MS;
+  const heartbeatInterval = heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS;
+
   let attempt = 0;
+  let persistentAttempt = 0;
   let currentDelay = initialDelayMs;
-  let consecutive429Count = 0;
 
   while (attempt < maxAttempts) {
     attempt++;
@@ -123,84 +199,101 @@ export async function retryWithBackoff<T>(
       // Check for Qwen OAuth quota exceeded error - throw immediately without retry
       if (authType === AuthType.QWEN_OAUTH && isQwenQuotaExceededError(error)) {
         throw new Error(
-          `Qwen API quota exceeded: Your Qwen API quota has been exhausted. Please wait for your quota to reset.`,
+          `Qwen OAuth free tier has been discontinued as of 2026-04-15.\n\n` +
+            `To continue using Qwen Code, try one of these alternatives:\n` +
+            `  - OpenRouter:    https://openrouter.ai/docs/quickstart\n` +
+            `  - Fireworks AI:  https://docs.fireworks.ai/api-reference/introduction\n` +
+            `  - ModelStudio:   https://help.aliyun.com/zh/model-studio/coding-plan\n\n` +
+            `After setting up your API key, run /auth to configure your provider.`,
         );
       }
 
-      // Track consecutive 429 errors, but handle Qwen throttling differently
-      if (errorStatus === 429) {
-        // For Qwen throttling errors, we still want to track them for exponential backoff
-        // but not for quota fallback logic (since Qwen doesn't have model fallback)
-        if (authType === AuthType.QWEN_OAUTH && isQwenThrottlingError(error)) {
-          // Keep track of 429s but reset the consecutive count to avoid fallback logic
-          consecutive429Count = 0;
-        } else {
-          consecutive429Count++;
-        }
-      } else {
-        consecutive429Count = 0;
-      }
-
-      console.debug('consecutive429Count', consecutive429Count);
+      // Determine if this error qualifies for persistent retry.
+      // Persistent mode still respects shouldRetryOnError — callers can force
+      // fast-fail even for transient errors if they explicitly return false.
+      const isTransient = isTransientCapacityError(error);
+      const callerAllowsRetry = shouldRetryOnError(error as Error);
+      const shouldPersist = persistent && isTransient && callerAllowsRetry;
 
       // Check if we've exhausted retries or shouldn't retry
-      if (attempt >= maxAttempts || !shouldRetryOnError(error as Error)) {
-        throw error;
+      if (!shouldPersist) {
+        if (attempt >= maxAttempts || !callerAllowsRetry) {
+          throw error;
+        }
       }
 
-      const { delayDurationMs, errorStatus: delayErrorStatus } =
-        getDelayDurationAndStatus(error);
+      // === Calculate delay ===
+      let delayMs: number;
 
-      if (delayDurationMs > 0) {
-        // Respect Retry-After header if present and parsed
-        console.warn(
-          `Attempt ${attempt} failed with status ${delayErrorStatus ?? 'unknown'}. Retrying after explicit delay of ${delayDurationMs}ms...`,
+      if (shouldPersist) {
+        persistentAttempt++;
+
+        // Prefer Retry-After header for 429 errors
+        const retryAfterMs =
+          errorStatus === 429 ? getRetryAfterDelayMs(error) : 0;
+
+        if (retryAfterMs > 0) {
+          // Retry-After is a server-specified wait — respect it, only cap at
+          // the absolute limit (capMs/6h), NOT at maxBackoff (5min).
+          delayMs = Math.min(retryAfterMs, capMs);
+        } else {
+          // Exponential backoff — cap at maxBackoff (5min) then absolute cap
+          delayMs = Math.min(
+            initialDelayMs * Math.pow(2, persistentAttempt - 1),
+            maxBackoff,
+          );
+          delayMs = Math.min(delayMs, capMs);
+
+          // Add jitter (±25%), then re-apply caps so delay never exceeds limits
+          delayMs += delayMs * 0.25 * (Math.random() * 2 - 1);
+          delayMs = Math.min(Math.max(0, delayMs), maxBackoff, capMs);
+        }
+
+        const reportedAttempt = persistentAttempt;
+        debugLogger.warn(
+          `[Persistent] Attempt ${reportedAttempt} failed with status ${errorStatus ?? 'unknown'}. ` +
+            `Retrying in ${Math.ceil(delayMs / 1000)}s...`,
           error,
         );
-        await delay(delayDurationMs);
-        // Reset currentDelay for next potential non-429 error, or if Retry-After is not present next time
-        currentDelay = initialDelayMs;
+
+        // Heartbeat sleep — chunked to keep CI alive
+        await sleepWithHeartbeat(delayMs, {
+          attempt: reportedAttempt,
+          error,
+          heartbeatInterval,
+          heartbeatFn,
+          signal,
+        });
+
+        // Clamp attempt so the while-loop never exits
+        if (attempt >= maxAttempts) {
+          attempt = maxAttempts - 1;
+        }
       } else {
-        // Fallback to exponential backoff with jitter
-        logRetryAttempt(attempt, error, errorStatus);
-        // Add jitter: +/- 30% of currentDelay
-        const jitter = currentDelay * 0.3 * (Math.random() * 2 - 1);
-        const delayWithJitter = Math.max(0, currentDelay + jitter);
-        await delay(delayWithJitter);
-        currentDelay = Math.min(maxDelayMs, currentDelay * 2);
+        // Normal retry path (unchanged behavior)
+        const retryAfterMs =
+          errorStatus === 429 ? getRetryAfterDelayMs(error) : 0;
+
+        if (retryAfterMs > 0) {
+          debugLogger.warn(
+            `Attempt ${attempt} failed with status ${errorStatus ?? 'unknown'}. Retrying after explicit delay of ${retryAfterMs}ms...`,
+            error,
+          );
+          await delay(retryAfterMs);
+          currentDelay = initialDelayMs;
+        } else {
+          logRetryAttempt(attempt, error, errorStatus);
+          const jitter = currentDelay * 0.3 * (Math.random() * 2 - 1);
+          const delayWithJitter = Math.max(0, currentDelay + jitter);
+          await delay(delayWithJitter);
+          currentDelay = Math.min(maxDelayMs, currentDelay * 2);
+        }
       }
     }
   }
   // This line should theoretically be unreachable due to the throw in the catch block.
   // Added for type safety and to satisfy the compiler that a promise is always returned.
   throw new Error('Retry attempts exhausted');
-}
-
-/**
- * Extracts the HTTP status code from an error object.
- * @param error The error object.
- * @returns The HTTP status code, or undefined if not found.
- */
-export function getErrorStatus(error: unknown): number | undefined {
-  if (typeof error === 'object' && error !== null) {
-    if ('status' in error && typeof error.status === 'number') {
-      return error.status;
-    }
-    // Check for error.response.status (common in axios errors)
-    if (
-      'response' in error &&
-      typeof (error as { response?: unknown }).response === 'object' &&
-      (error as { response?: unknown }).response !== null
-    ) {
-      const response = (
-        error as { response: { status?: unknown; headers?: unknown } }
-      ).response;
-      if ('status' in response && typeof response.status === 'number') {
-        return response.status;
-      }
-    }
-  }
-  return undefined;
 }
 
 /**
@@ -242,24 +335,6 @@ function getRetryAfterDelayMs(error: unknown): number {
 }
 
 /**
- * Determines the delay duration based on the error, prioritizing Retry-After header.
- * @param error The error object.
- * @returns An object containing the delay duration in milliseconds and the error status.
- */
-function getDelayDurationAndStatus(error: unknown): {
-  delayDurationMs: number;
-  errorStatus: number | undefined;
-} {
-  const errorStatus = getErrorStatus(error);
-  let delayDurationMs = 0;
-
-  if (errorStatus === 429) {
-    delayDurationMs = getRetryAfterDelayMs(error);
-  }
-  return { delayDurationMs, errorStatus };
-}
-
-/**
  * Logs a message for a retry attempt when using exponential backoff.
  * @param attempt The current attempt number.
  * @param error The error that caused the retry.
@@ -270,31 +345,15 @@ function logRetryAttempt(
   error: unknown,
   errorStatus?: number,
 ): void {
-  let message = `Attempt ${attempt} failed. Retrying with backoff...`;
-  if (errorStatus) {
-    message = `Attempt ${attempt} failed with status ${errorStatus}. Retrying with backoff...`;
-  }
+  const message = errorStatus
+    ? `Attempt ${attempt} failed with status ${errorStatus}. Retrying with backoff...`
+    : `Attempt ${attempt} failed. Retrying with backoff...`;
 
   if (errorStatus === 429) {
-    console.warn(message, error);
+    debugLogger.warn(message, error);
   } else if (errorStatus && errorStatus >= 500 && errorStatus < 600) {
-    console.error(message, error);
-  } else if (error instanceof Error) {
-    // Fallback for errors that might not have a status but have a message
-    if (error.message.includes('429')) {
-      console.warn(
-        `Attempt ${attempt} failed with 429 error (no Retry-After header). Retrying with backoff...`,
-        error,
-      );
-    } else if (error.message.match(/5\d{2}/)) {
-      console.error(
-        `Attempt ${attempt} failed with 5xx error. Retrying with backoff...`,
-        error,
-      );
-    } else {
-      console.warn(message, error); // Default to warn for other errors
-    }
+    debugLogger.error(message, error);
   } else {
-    console.warn(message, error); // Default to warn if error type is unknown
+    debugLogger.warn(message, error);
   }
 }

@@ -4,7 +4,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { AuthType, DEFAULT_QWEN_MODEL } from '@qwen-code/qwen-code-core';
+import {
+  AuthType,
+  type Config,
+  type AvailableModel as CoreAvailableModel,
+  QWEN_OAUTH_MODELS,
+} from '@qwen-code/qwen-code-core';
 import { t } from '../../i18n/index.js';
 
 export type AvailableModel = {
@@ -14,41 +19,25 @@ export type AvailableModel = {
   isVision?: boolean;
 };
 
-export const MAINLINE_VLM = 'vision-model';
-export const MAINLINE_CODER = DEFAULT_QWEN_MODEL;
+const CACHED_QWEN_OAUTH_MODELS: AvailableModel[] = QWEN_OAUTH_MODELS.map(
+  (model) => ({
+    id: model.id,
+    label: model.name ?? model.id,
+    description: model.description,
+    isVision: model.capabilities?.vision ?? false,
+  }),
+);
 
-export const AVAILABLE_MODELS_QWEN: AvailableModel[] = [
-  {
-    id: MAINLINE_CODER,
-    label: MAINLINE_CODER,
-    get description() {
-      return t(
-        'The latest Qwen Coder model from Alibaba Cloud ModelStudio (version: qwen3-coder-plus-2025-09-23)',
-      );
-    },
-  },
-  {
-    id: MAINLINE_VLM,
-    label: MAINLINE_VLM,
-    get description() {
-      return t(
-        'The latest Qwen Vision model from Alibaba Cloud ModelStudio (version: qwen3-vl-plus-2025-09-23)',
-      );
-    },
-    isVision: true,
-  },
-];
+function getQwenOAuthModels(): readonly AvailableModel[] {
+  return CACHED_QWEN_OAUTH_MODELS;
+}
 
 /**
- * Get available Qwen models filtered by vision model preview setting
+ * Get available Qwen models
+ * coder-model now has vision capabilities by default.
  */
-export function getFilteredQwenModels(
-  visionModelPreviewEnabled: boolean,
-): AvailableModel[] {
-  if (visionModelPreviewEnabled) {
-    return AVAILABLE_MODELS_QWEN;
-  }
-  return AVAILABLE_MODELS_QWEN.filter((model) => !model.isVision);
+export function getFilteredQwenModels(): AvailableModel[] {
+  return [...getQwenOAuthModels()];
 }
 
 /**
@@ -57,20 +46,75 @@ export function getFilteredQwenModels(
  */
 export function getOpenAIAvailableModelFromEnv(): AvailableModel | null {
   const id = process.env['OPENAI_MODEL']?.trim();
-  return id ? { id, label: id } : null;
+  return id
+    ? {
+        id,
+        label: id,
+        get description() {
+          return t('Configured via OPENAI_MODEL environment variable');
+        },
+      }
+    : null;
 }
 
 export function getAnthropicAvailableModelFromEnv(): AvailableModel | null {
   const id = process.env['ANTHROPIC_MODEL']?.trim();
-  return id ? { id, label: id } : null;
+  return id
+    ? {
+        id,
+        label: id,
+        get description() {
+          return t('Configured via ANTHROPIC_MODEL environment variable');
+        },
+      }
+    : null;
 }
 
+/**
+ * Convert core AvailableModel to CLI AvailableModel format
+ */
+function convertCoreModelToCliModel(
+  coreModel: CoreAvailableModel,
+): AvailableModel {
+  return {
+    id: coreModel.id,
+    label: coreModel.label,
+    description: coreModel.description,
+    isVision: coreModel.isVision ?? coreModel.capabilities?.vision ?? false,
+  };
+}
+
+/**
+ * Get available models for the given authType.
+ *
+ * If a Config object is provided, uses config.getAvailableModelsForAuthType().
+ * Falls back to environment variables only when no config is provided.
+ */
 export function getAvailableModelsForAuthType(
   authType: AuthType,
+  config?: Config,
 ): AvailableModel[] {
+  // Use config's model registry when available
+  if (config) {
+    try {
+      const models = config.getAvailableModelsForAuthType(authType);
+      if (models.length > 0) {
+        return models.map(convertCoreModelToCliModel);
+      }
+    } catch {
+      // If config throws (e.g., not initialized), return empty array
+    }
+    // When a Config object is provided, we intentionally do NOT fall back to env-based
+    // "raw" models. These may reflect the currently effective config but should not be
+    // presented as selectable options in /model.
+    return [];
+  }
+
+  // Fall back to environment variables for specific auth types (no config provided)
   switch (authType) {
-    case AuthType.QWEN_OAUTH:
-      return AVAILABLE_MODELS_QWEN;
+    case AuthType.QWEN_OAUTH: {
+      return [...getQwenOAuthModels()];
+    }
     case AuthType.USE_OPENAI: {
       const openAIModel = getOpenAIAvailableModelFromEnv();
       return openAIModel ? [openAIModel] : [];
@@ -80,23 +124,6 @@ export function getAvailableModelsForAuthType(
       return anthropicModel ? [anthropicModel] : [];
     }
     default:
-      // For other auth types, return empty array for now
-      // This can be expanded later according to the design doc
       return [];
   }
-}
-
-/**
-/**
- * Hard code the default vision model as a string literal,
- * until our coding model supports multimodal.
- */
-export function getDefaultVisionModel(): string {
-  return MAINLINE_VLM;
-}
-
-export function isVisionModel(modelId: string): boolean {
-  return AVAILABLE_MODELS_QWEN.some(
-    (model) => model.id === modelId && model.isVision,
-  );
 }

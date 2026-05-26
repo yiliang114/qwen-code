@@ -19,6 +19,18 @@ import type { ContentGeneratorConfig } from '../../contentGenerator.js';
 import { AuthType } from '../../contentGenerator.js';
 import type { ChatCompletionToolWithCache } from './types.js';
 import { DEFAULT_TIMEOUT, DEFAULT_MAX_RETRIES } from '../constants.js';
+import { buildRuntimeFetchOptions } from '../../../utils/runtimeFetchOptions.js';
+import type { OpenAIRuntimeFetchOptions } from '../../../utils/runtimeFetchOptions.js';
+
+const mockDebugLogger = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
+vi.mock('../../../utils/debugLogger.js', () => ({
+  createDebugLogger: vi.fn(() => mockDebugLogger),
+}));
 
 // Mock OpenAI
 vi.mock('openai', () => ({
@@ -32,6 +44,24 @@ vi.mock('openai', () => ({
   })),
 }));
 
+vi.mock('../../../utils/runtimeFetchOptions.js', () => ({
+  buildRuntimeFetchOptions: vi.fn(),
+}));
+
+// Mock DASHSCOPE_PROXY_BASE_URL so tests can control its value
+vi.mock('../constants.js', () => ({
+  DEFAULT_TIMEOUT: 120000,
+  DEFAULT_MAX_RETRIES: 3,
+  DEFAULT_OPENAI_BASE_URL: 'https://api.openai.com/v1',
+  DEFAULT_DASHSCOPE_BASE_URL:
+    'https://dashscope.aliyuncs.com/compatible-mode/v1',
+  DEFAULT_DEEPSEEK_BASE_URL: 'https://api.deepseek.com/v1',
+  DEFAULT_OPEN_ROUTER_BASE_URL: 'https://openrouter.ai/api/v1',
+  get DASHSCOPE_PROXY_BASE_URL() {
+    return process.env['DASHSCOPE_PROXY_BASE_URL'];
+  },
+}));
+
 describe('DashScopeOpenAICompatibleProvider', () => {
   let provider: DashScopeOpenAICompatibleProvider;
   let mockContentGeneratorConfig: ContentGeneratorConfig;
@@ -39,6 +69,12 @@ describe('DashScopeOpenAICompatibleProvider', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
+    const mockedBuildRuntimeFetchOptions =
+      buildRuntimeFetchOptions as unknown as MockedFunction<
+        (sdkType: 'openai', proxyUrl?: string) => OpenAIRuntimeFetchOptions
+      >;
+    mockedBuildRuntimeFetchOptions.mockReturnValue(undefined);
 
     // Mock ContentGeneratorConfig
     mockContentGeneratorConfig = {
@@ -55,8 +91,9 @@ describe('DashScopeOpenAICompatibleProvider', () => {
       getCliVersion: vi.fn().mockReturnValue('1.0.0'),
       getSessionId: vi.fn().mockReturnValue('test-session-id'),
       getContentGeneratorConfig: vi.fn().mockReturnValue({
-        disableCacheControl: false,
+        enableCacheControl: true,
       }),
+      getProxy: vi.fn().mockReturnValue(undefined),
     } as unknown as Config;
 
     provider = new DashScopeOpenAICompatibleProvider(
@@ -105,6 +142,114 @@ describe('DashScopeOpenAICompatibleProvider', () => {
       expect(result).toBe(true);
     });
 
+    it('should return true for DashScope coding plan URL', () => {
+      const config = {
+        authType: AuthType.USE_OPENAI,
+        baseUrl: 'https://coding.dashscope.aliyuncs.com/v1',
+      } as ContentGeneratorConfig;
+
+      const result =
+        DashScopeOpenAICompatibleProvider.isDashScopeProvider(config);
+      expect(result).toBe(true);
+    });
+
+    it('should return true for DashScope international coding plan URL', () => {
+      const config = {
+        authType: AuthType.USE_OPENAI,
+        baseUrl: 'https://coding-intl.dashscope-intl.aliyuncs.com/v1',
+      } as ContentGeneratorConfig;
+
+      const result =
+        DashScopeOpenAICompatibleProvider.isDashScopeProvider(config);
+      expect(result).toBe(true);
+    });
+
+    it('should return true for internal alibaba-inc.com subdomain', () => {
+      const config = {
+        authType: AuthType.USE_OPENAI,
+        baseUrl: 'https://gateway.alibaba-inc.com/dashscope/v1',
+      } as ContentGeneratorConfig;
+
+      const result =
+        DashScopeOpenAICompatibleProvider.isDashScopeProvider(config);
+      expect(result).toBe(true);
+      expect(mockDebugLogger.debug).toHaveBeenCalledWith(
+        'DashScope provider activated via internal origin: gateway.alibaba-inc.com',
+      );
+    });
+
+    it('should return true for internal aliyun-inc.com subdomain', () => {
+      const config = {
+        authType: AuthType.USE_OPENAI,
+        baseUrl: 'https://model-gateway.aliyun-inc.com/dashscope/v1',
+      } as ContentGeneratorConfig;
+
+      const result =
+        DashScopeOpenAICompatibleProvider.isDashScopeProvider(config);
+      expect(result).toBe(true);
+    });
+
+    it('should return true for multi-level internal subdomain', () => {
+      const config = {
+        authType: AuthType.USE_OPENAI,
+        baseUrl: 'https://a.b.alibaba-inc.com/dashscope/v1',
+      } as ContentGeneratorConfig;
+
+      const result =
+        DashScopeOpenAICompatibleProvider.isDashScopeProvider(config);
+      expect(result).toBe(true);
+    });
+
+    it('should return true for port-bearing internal URL', () => {
+      const config = {
+        authType: AuthType.USE_OPENAI,
+        baseUrl: 'https://gateway.alibaba-inc.com:8443/dashscope/v1',
+      } as ContentGeneratorConfig;
+
+      const result =
+        DashScopeOpenAICompatibleProvider.isDashScopeProvider(config);
+      expect(result).toBe(true);
+    });
+
+    it('should return false for bare alibaba-inc.com domain', () => {
+      const config = {
+        authType: AuthType.USE_OPENAI,
+        baseUrl: 'https://alibaba-inc.com/v1',
+      } as ContentGeneratorConfig;
+
+      const result =
+        DashScopeOpenAICompatibleProvider.isDashScopeProvider(config);
+      expect(result).toBe(false);
+    });
+
+    it('should return false for bare aliyun-inc.com domain', () => {
+      const config = {
+        authType: AuthType.USE_OPENAI,
+        baseUrl: 'https://aliyun-inc.com/v1',
+      } as ContentGeneratorConfig;
+
+      const result =
+        DashScopeOpenAICompatibleProvider.isDashScopeProvider(config);
+      expect(result).toBe(false);
+    });
+
+    it('should return false for lookalike internal domains without dot boundary', () => {
+      const configs = [
+        'https://notalibaba-inc.com/v1',
+        'https://notaliyun-inc.com/v1',
+        'https://alibaba-inc.com.evil.com/v1',
+        'https://aliyun-inc.com.evil.com/v1',
+      ];
+
+      configs.forEach((baseUrl) => {
+        const result = DashScopeOpenAICompatibleProvider.isDashScopeProvider({
+          authType: AuthType.USE_OPENAI,
+          baseUrl,
+        } as ContentGeneratorConfig);
+        expect(result).toBe(false);
+      });
+    });
+
     it('should return false for non-DashScope configurations', () => {
       const configs = [
         {
@@ -128,6 +273,134 @@ describe('DashScopeOpenAICompatibleProvider', () => {
         expect(result).toBe(false);
       });
     });
+
+    it('should return false when the dashscope domain only appears in the URL path', () => {
+      const config = {
+        authType: AuthType.USE_OPENAI,
+        baseUrl: 'https://evil.example.com/dashscope.aliyuncs.com/v1',
+      } as ContentGeneratorConfig;
+
+      const result =
+        DashScopeOpenAICompatibleProvider.isDashScopeProvider(config);
+      expect(result).toBe(false);
+    });
+
+    it('should return false for a domain that only ends with dashscope.aliyuncs.com as a suffix without a dot', () => {
+      const config = {
+        authType: AuthType.USE_OPENAI,
+        baseUrl: 'https://notdashscope.aliyuncs.com/v1',
+      } as ContentGeneratorConfig;
+
+      const result =
+        DashScopeOpenAICompatibleProvider.isDashScopeProvider(config);
+      expect(result).toBe(false);
+    });
+
+    it('should return false for an unparseable baseUrl', () => {
+      const config = {
+        authType: AuthType.USE_OPENAI,
+        baseUrl: 'not a url',
+      } as ContentGeneratorConfig;
+
+      const result =
+        DashScopeOpenAICompatibleProvider.isDashScopeProvider(config);
+      expect(result).toBe(false);
+    });
+
+    it('should return true when baseUrl matches DASHSCOPE_PROXY_BASE_URL', () => {
+      vi.stubEnv(
+        'DASHSCOPE_PROXY_BASE_URL',
+        'https://your-proxy.com/dashscope',
+      );
+
+      const config = {
+        authType: AuthType.USE_OPENAI,
+        baseUrl: 'https://your-proxy.com/dashscope',
+      } as ContentGeneratorConfig;
+
+      const result =
+        DashScopeOpenAICompatibleProvider.isDashScopeProvider(config);
+      expect(result).toBe(true);
+    });
+
+    it('should return false when baseUrl does not match DASHSCOPE_PROXY_BASE_URL', () => {
+      vi.stubEnv(
+        'DASHSCOPE_PROXY_BASE_URL',
+        'https://your-proxy.com/dashscope',
+      );
+
+      const config = {
+        authType: AuthType.USE_OPENAI,
+        baseUrl: 'https://other-proxy.com/dashscope',
+      } as ContentGeneratorConfig;
+
+      const result =
+        DashScopeOpenAICompatibleProvider.isDashScopeProvider(config);
+      expect(result).toBe(false);
+    });
+
+    it('should debug log when baseUrl does not match DASHSCOPE_PROXY_BASE_URL', () => {
+      vi.stubEnv(
+        'DASHSCOPE_PROXY_BASE_URL',
+        'https://your-proxy.com/dashscope',
+      );
+
+      const config = {
+        authType: AuthType.USE_OPENAI,
+        baseUrl: 'https://other-proxy.com/dashscope',
+      } as ContentGeneratorConfig;
+
+      const result =
+        DashScopeOpenAICompatibleProvider.isDashScopeProvider(config);
+
+      expect(result).toBe(false);
+      expect(mockDebugLogger.debug).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'DASHSCOPE_PROXY_BASE_URL is configured but the request baseUrl does not match',
+        ),
+      );
+    });
+
+    it('should log internal-origin activation instead of proxy mismatch for internal domains', () => {
+      vi.stubEnv(
+        'DASHSCOPE_PROXY_BASE_URL',
+        'https://your-proxy.com/dashscope',
+      );
+
+      const config = {
+        authType: AuthType.USE_OPENAI,
+        baseUrl: 'https://gateway.alibaba-inc.com/dashscope/v1',
+      } as ContentGeneratorConfig;
+
+      const result =
+        DashScopeOpenAICompatibleProvider.isDashScopeProvider(config);
+
+      expect(result).toBe(true);
+      expect(mockDebugLogger.debug).toHaveBeenCalledWith(
+        'DashScope provider activated via internal origin: gateway.alibaba-inc.com',
+      );
+      expect(mockDebugLogger.debug).not.toHaveBeenCalledWith(
+        expect.stringContaining(
+          'DASHSCOPE_PROXY_BASE_URL is configured but the request baseUrl does not match',
+        ),
+      );
+    });
+
+    it('should return true when baseUrl matches DASHSCOPE_PROXY_BASE_URL with trailing slash', () => {
+      vi.stubEnv(
+        'DASHSCOPE_PROXY_BASE_URL',
+        'https://your-proxy.com/dashscope',
+      );
+
+      const config = {
+        authType: AuthType.USE_OPENAI,
+        baseUrl: 'https://your-proxy.com/dashscope/',
+      } as ContentGeneratorConfig;
+
+      const result =
+        DashScopeOpenAICompatibleProvider.isDashScopeProvider(config);
+      expect(result).toBe(true);
+    });
   });
 
   describe('buildHeaders', () => {
@@ -140,6 +413,27 @@ describe('DashScopeOpenAICompatibleProvider', () => {
         'X-DashScope-UserAgent': `QwenCode/1.0.0 (${process.platform}; ${process.arch})`,
         'X-DashScope-AuthType': AuthType.QWEN_OAUTH,
       });
+    });
+
+    it('should merge custom headers with DashScope defaults', () => {
+      const providerWithCustomHeaders = new DashScopeOpenAICompatibleProvider(
+        {
+          ...mockContentGeneratorConfig,
+          customHeaders: {
+            'X-Custom': '1',
+            'X-DashScope-CacheControl': 'disable',
+          },
+        } as ContentGeneratorConfig,
+        mockCliConfig,
+      );
+
+      const headers = providerWithCustomHeaders.buildHeaders();
+
+      expect(headers['User-Agent']).toContain('QwenCode/1.0.0');
+      expect(headers['X-DashScope-UserAgent']).toContain('QwenCode/1.0.0');
+      expect(headers['X-DashScope-AuthType']).toBe(AuthType.QWEN_OAUTH);
+      expect(headers['X-Custom']).toBe('1');
+      expect(headers['X-DashScope-CacheControl']).toBe('disable');
     });
 
     it('should handle unknown CLI version', () => {
@@ -164,18 +458,20 @@ describe('DashScopeOpenAICompatibleProvider', () => {
     it('should create OpenAI client with DashScope configuration', () => {
       const client = provider.buildClient();
 
-      expect(OpenAI).toHaveBeenCalledWith({
-        apiKey: 'test-api-key',
-        baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-        timeout: 60000,
-        maxRetries: 2,
-        defaultHeaders: {
-          'User-Agent': `QwenCode/1.0.0 (${process.platform}; ${process.arch})`,
-          'X-DashScope-CacheControl': 'enable',
-          'X-DashScope-UserAgent': `QwenCode/1.0.0 (${process.platform}; ${process.arch})`,
-          'X-DashScope-AuthType': AuthType.QWEN_OAUTH,
-        },
-      });
+      expect(OpenAI).toHaveBeenCalledWith(
+        expect.objectContaining({
+          apiKey: 'test-api-key',
+          baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+          timeout: 60000,
+          maxRetries: 2,
+          defaultHeaders: {
+            'User-Agent': `QwenCode/1.0.0 (${process.platform}; ${process.arch})`,
+            'X-DashScope-CacheControl': 'enable',
+            'X-DashScope-UserAgent': `QwenCode/1.0.0 (${process.platform}; ${process.arch})`,
+            'X-DashScope-AuthType': AuthType.QWEN_OAUTH,
+          },
+        }),
+      );
 
       expect(client).toBeDefined();
     });
@@ -186,13 +482,15 @@ describe('DashScopeOpenAICompatibleProvider', () => {
 
       provider.buildClient();
 
-      expect(OpenAI).toHaveBeenCalledWith({
-        apiKey: 'test-api-key',
-        baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-        timeout: DEFAULT_TIMEOUT,
-        maxRetries: DEFAULT_MAX_RETRIES,
-        defaultHeaders: expect.any(Object),
-      });
+      expect(OpenAI).toHaveBeenCalledWith(
+        expect.objectContaining({
+          apiKey: 'test-api-key',
+          baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+          timeout: DEFAULT_TIMEOUT,
+          maxRetries: DEFAULT_MAX_RETRIES,
+          defaultHeaders: expect.any(Object),
+        }),
+      );
     });
   });
 
@@ -463,7 +761,7 @@ describe('DashScopeOpenAICompatibleProvider', () => {
         >
       ).mockReturnValue({
         model: 'qwen-max',
-        disableCacheControl: true,
+        enableCacheControl: false,
       });
 
       const result = provider.buildRequest(baseRequest, 'test-prompt-id');
@@ -587,7 +885,7 @@ describe('DashScopeOpenAICompatibleProvider', () => {
       });
     });
 
-    it('should add empty text item with cache control if last item is not text for streaming requests', () => {
+    it('should add cache control to last item even if not text for streaming requests', () => {
       const requestWithNonTextLast: OpenAI.Chat.ChatCompletionCreateParams = {
         model: 'qwen-max',
         stream: true, // This will trigger cache control on last message
@@ -612,12 +910,12 @@ describe('DashScopeOpenAICompatibleProvider', () => {
 
       const content = result.messages[0]
         .content as OpenAI.Chat.ChatCompletionContentPart[];
-      expect(content).toHaveLength(3);
+      expect(content).toHaveLength(2);
 
-      // Should add empty text item with cache control
-      expect(content[2]).toEqual({
-        type: 'text',
-        text: '',
+      // Cache control should be added to the last item (image)
+      expect(content[1]).toEqual({
+        type: 'image_url',
+        image_url: { url: 'https://example.com/image.jpg' },
         cache_control: { type: 'ephemeral' },
       });
     });
@@ -688,46 +986,29 @@ describe('DashScopeOpenAICompatibleProvider', () => {
 
       const content = result.messages[0]
         .content as OpenAI.Chat.ChatCompletionContentPart[];
-      expect(content).toEqual([
-        {
-          type: 'text',
-          text: '',
-          cache_control: { type: 'ephemeral' },
-        },
-      ]);
+      // Empty content array should remain empty
+      expect(content).toEqual([]);
     });
   });
 
   describe('output token limits', () => {
-    it('should limit max_tokens when it exceeds model limit for qwen3-coder-plus', () => {
+    it('should limit max_tokens when it exceeds model limit', () => {
       const request: OpenAI.Chat.ChatCompletionCreateParams = {
-        model: 'qwen3-coder-plus',
+        model: 'qwen3-max',
         messages: [{ role: 'user', content: 'Hello' }],
-        max_tokens: 100000, // Exceeds the 65536 limit
+        max_tokens: 100000, // Exceeds the model's output limit
       };
 
       const result = provider.buildRequest(request, 'test-prompt-id');
 
-      expect(result.max_tokens).toBe(65536); // Should be limited to model's output limit
-    });
-
-    it('should limit max_tokens when it exceeds model limit for qwen-vl-max-latest', () => {
-      const request: OpenAI.Chat.ChatCompletionCreateParams = {
-        model: 'qwen-vl-max-latest',
-        messages: [{ role: 'user', content: 'Hello' }],
-        max_tokens: 20000, // Exceeds the 8192 limit
-      };
-
-      const result = provider.buildRequest(request, 'test-prompt-id');
-
-      expect(result.max_tokens).toBe(8192); // Should be limited to model's output limit
+      expect(result.max_tokens).toBe(32768); // Should be limited to model's output limit (32K)
     });
 
     it('should not modify max_tokens when it is within model limit', () => {
       const request: OpenAI.Chat.ChatCompletionCreateParams = {
-        model: 'qwen3-coder-plus',
+        model: 'qwen3-max',
         messages: [{ role: 'user', content: 'Hello' }],
-        max_tokens: 1000, // Within the 65536 limit
+        max_tokens: 1000, // Within the model's output limit
       };
 
       const result = provider.buildRequest(request, 'test-prompt-id');
@@ -735,45 +1016,49 @@ describe('DashScopeOpenAICompatibleProvider', () => {
       expect(result.max_tokens).toBe(1000); // Should remain unchanged
     });
 
-    it('should not add max_tokens when not present in request', () => {
+    it('should set conservative max_tokens default when not present in request', () => {
       const request: OpenAI.Chat.ChatCompletionCreateParams = {
-        model: 'qwen3-coder-plus',
+        model: 'qwen3-max',
         messages: [{ role: 'user', content: 'Hello' }],
         // No max_tokens parameter
       };
 
       const result = provider.buildRequest(request, 'test-prompt-id');
 
-      expect(result.max_tokens).toBeUndefined(); // Should remain undefined
+      // Should set capped default (min of model limit and CAPPED_DEFAULT_MAX_TOKENS)
+      // qwen3-max has 32K output limit, so min(32K, 8K) = 8K
+      expect(result.max_tokens).toBe(8000);
     });
 
-    it('should handle null max_tokens parameter', () => {
+    it('should set conservative max_tokens when null is provided', () => {
       const request: OpenAI.Chat.ChatCompletionCreateParams = {
-        model: 'qwen3-coder-plus',
+        model: 'qwen3-max',
         messages: [{ role: 'user', content: 'Hello' }],
-        max_tokens: null,
+        max_tokens: null as unknown as undefined,
       };
 
       const result = provider.buildRequest(request, 'test-prompt-id');
 
-      expect(result.max_tokens).toBeNull(); // Should remain null
+      // null is treated as not configured, so set capped default: min(32K, 8K) = 8K
+      expect(result.max_tokens).toBe(8000);
     });
 
-    it('should use default output limit for unknown models', () => {
+    it('should respect user max_tokens for unknown models', () => {
       const request: OpenAI.Chat.ChatCompletionCreateParams = {
         model: 'unknown-model',
         messages: [{ role: 'user', content: 'Hello' }],
-        max_tokens: 10000, // Exceeds the default 4096 limit
+        max_tokens: 40000, // User explicitly sets 40K
       };
 
       const result = provider.buildRequest(request, 'test-prompt-id');
 
-      expect(result.max_tokens).toBe(4096); // Should be limited to default output limit
+      // Unknown models: respect user's configuration (backend may support it)
+      expect(result.max_tokens).toBe(40000);
     });
 
     it('should preserve other request parameters when limiting max_tokens', () => {
       const request: OpenAI.Chat.ChatCompletionCreateParams = {
-        model: 'qwen3-coder-plus',
+        model: 'qwen3-max',
         messages: [{ role: 'user', content: 'Hello' }],
         max_tokens: 100000, // Will be limited
         temperature: 0.8,
@@ -787,7 +1072,7 @@ describe('DashScopeOpenAICompatibleProvider', () => {
       const result = provider.buildRequest(request, 'test-prompt-id');
 
       // max_tokens should be limited
-      expect(result.max_tokens).toBe(65536);
+      expect(result.max_tokens).toBe(32768); // Limited to model's output limit (32K)
 
       // Other parameters should be preserved
       expect(result.temperature).toBe(0.8);
@@ -798,63 +1083,9 @@ describe('DashScopeOpenAICompatibleProvider', () => {
       expect(result.user).toBe('test-user');
     });
 
-    it('should work with vision models and output token limits', () => {
+    it('should set high resolution flag for the coder-model model', () => {
       const request: OpenAI.Chat.ChatCompletionCreateParams = {
-        model: 'qwen-vl-max-latest',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: 'Look at this image:' },
-              {
-                type: 'image_url',
-                image_url: { url: 'https://example.com/image.jpg' },
-              },
-            ],
-          },
-        ],
-        max_tokens: 20000, // Exceeds the 8192 limit
-      };
-
-      const result = provider.buildRequest(request, 'test-prompt-id');
-
-      expect(result.max_tokens).toBe(8192); // Should be limited
-      expect(
-        (result as { vl_high_resolution_images?: boolean })
-          .vl_high_resolution_images,
-      ).toBe(true); // Vision-specific parameter should be preserved
-    });
-
-    it('should set high resolution flag for qwen3-vl-plus', () => {
-      const request: OpenAI.Chat.ChatCompletionCreateParams = {
-        model: 'qwen3-vl-plus',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: 'Please inspect the image.' },
-              {
-                type: 'image_url',
-                image_url: { url: 'https://example.com/vl.jpg' },
-              },
-            ],
-          },
-        ],
-        max_tokens: 50000,
-      };
-
-      const result = provider.buildRequest(request, 'test-prompt-id');
-
-      expect(result.max_tokens).toBe(32768);
-      expect(
-        (result as { vl_high_resolution_images?: boolean })
-          .vl_high_resolution_images,
-      ).toBe(true);
-    });
-
-    it('should set high resolution flag for the vision-model alias', () => {
-      const request: OpenAI.Chat.ChatCompletionCreateParams = {
-        model: 'vision-model',
+        model: 'coder-model',
         messages: [
           {
             role: 'user',
@@ -867,12 +1098,12 @@ describe('DashScopeOpenAICompatibleProvider', () => {
             ],
           },
         ],
-        max_tokens: 9000,
+        max_tokens: 100000, // Exceeds the 64K limit
       };
 
       const result = provider.buildRequest(request, 'test-prompt-id');
 
-      expect(result.max_tokens).toBe(8192);
+      expect(result.max_tokens).toBe(65536); // Limited to model's output limit (64K)
       expect(
         (result as { vl_high_resolution_images?: boolean })
           .vl_high_resolution_images,
@@ -881,16 +1112,82 @@ describe('DashScopeOpenAICompatibleProvider', () => {
 
     it('should handle streaming requests with output token limits', () => {
       const request: OpenAI.Chat.ChatCompletionCreateParams = {
-        model: 'qwen3-coder-plus',
+        model: 'qwen3-max',
         messages: [{ role: 'user', content: 'Hello' }],
-        max_tokens: 100000, // Exceeds the 65536 limit
+        max_tokens: 100000, // Exceeds the model's output limit
         stream: true,
       };
 
       const result = provider.buildRequest(request, 'test-prompt-id');
 
-      expect(result.max_tokens).toBe(65536); // Should be limited
+      expect(result.max_tokens).toBe(32768); // Should be limited to model's output limit (32K)
       expect(result.stream).toBe(true); // Streaming should be preserved
+    });
+
+    it('should merge extra_body into the request', () => {
+      const providerWithExtraBody = new DashScopeOpenAICompatibleProvider(
+        {
+          ...mockContentGeneratorConfig,
+          extra_body: {
+            custom_param: 'custom_value',
+            nested: { key: 'value' },
+          },
+        },
+        mockCliConfig,
+      );
+
+      const request: OpenAI.Chat.ChatCompletionCreateParams = {
+        model: 'qwen3-coder-plus',
+        messages: [{ role: 'user', content: 'Hello' }],
+      };
+
+      const result = providerWithExtraBody.buildRequest(
+        request,
+        'test-prompt-id',
+      );
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((result as any).custom_param).toBe('custom_value');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((result as any).nested).toEqual({ key: 'value' });
+    });
+
+    it('should merge extra_body into vision model requests', () => {
+      const providerWithExtraBody = new DashScopeOpenAICompatibleProvider(
+        {
+          ...mockContentGeneratorConfig,
+          extra_body: {
+            custom_param: 'custom_value',
+          },
+        },
+        mockCliConfig,
+      );
+
+      const request: OpenAI.Chat.ChatCompletionCreateParams = {
+        model: 'qwen-vl-max',
+        messages: [{ role: 'user', content: 'Hello' }],
+      };
+
+      const result = providerWithExtraBody.buildRequest(
+        request,
+        'test-prompt-id',
+      );
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((result as any).custom_param).toBe('custom_value');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((result as any).vl_high_resolution_images).toBe(true);
+    });
+
+    it('should not include extra_body when not configured', () => {
+      const request: OpenAI.Chat.ChatCompletionCreateParams = {
+        model: 'qwen3-coder-plus',
+        messages: [{ role: 'user', content: 'Hello' }],
+      };
+
+      const result = provider.buildRequest(request, 'test-prompt-id');
+
+      expect(result).not.toHaveProperty('custom_param');
     });
   });
 });

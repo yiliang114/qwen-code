@@ -29,7 +29,7 @@ The benefits of sandboxing include:
 
 > [!note]
 >
-> **Naming note:** Some sandbox-related environment variables still use the `GEMINI_*` prefix for backwards compatibility.
+> **Naming note:** Some sandbox-related environment variables may have used the `GEMINI_*` prefix historically. All new environment variables use the `QWEN_*` prefix.
 
 ## Sandboxing methods
 
@@ -49,6 +49,8 @@ Cross-platform sandboxing with complete process isolation.
 
 By default, Qwen Code uses a published sandbox image (configured in the CLI package) and will pull it as needed.
 
+The container sandbox mounts your workspace and your `~/.qwen` directory into the container so auth and settings persist between runs.
+
 **Best for**: Strong isolation on any OS, consistent tooling inside a known image.
 
 ### Choosing a method
@@ -66,7 +68,7 @@ By default, Qwen Code uses a published sandbox image (configured in the CLI pack
 qwen -s -p "analyze the code structure"
 
 # Or enable sandboxing for your shell session (recommended for CI / scripts)
-export GEMINI_SANDBOX=true   # true auto-picks a provider (see notes below)
+export QWEN_SANDBOX=true   # true auto-picks a provider (see notes below)
 qwen -p "run the test suite"
 
 # Configure in settings.json
@@ -81,28 +83,36 @@ qwen -p "run the test suite"
 >
 > **Provider selection notes:**
 >
-> - On **macOS**, `GEMINI_SANDBOX=true` typically selects `sandbox-exec` (Seatbelt) if available.
-> - On **Linux/Windows**, `GEMINI_SANDBOX=true` requires `docker` or `podman` to be installed.
-> - To force a provider, set `GEMINI_SANDBOX=docker|podman|sandbox-exec`.
+> - On **macOS**, `QWEN_SANDBOX=true` typically selects `sandbox-exec` (Seatbelt) if available.
+> - On **Linux/Windows**, `QWEN_SANDBOX=true` requires `docker` or `podman` to be installed.
+> - To force a provider, set `QWEN_SANDBOX=docker|podman|sandbox-exec`.
 
 ## Configuration
 
 ### Enable sandboxing (in order of precedence)
 
-1. **Environment variable**: `GEMINI_SANDBOX=true|false|docker|podman|sandbox-exec`
+1. **Environment variable**: `QWEN_SANDBOX=true|false|docker|podman|sandbox-exec`
 2. **Command flag / argument**: `-s`, `--sandbox`, or `--sandbox=<provider>`
 3. **Settings file**: `tools.sandbox` in your `settings.json` (e.g., `{"tools": {"sandbox": true}}`).
 
 > [!important]
 >
-> If `GEMINI_SANDBOX` is set, it **overrides** the CLI flag and `settings.json`.
+> If `QWEN_SANDBOX` is set, it **overrides** the CLI flag and `settings.json`.
 
 ### Configure the sandbox image (Docker/Podman)
 
 - **CLI flag**: `--sandbox-image <image>`
-- **Environment variable**: `GEMINI_SANDBOX_IMAGE=<image>`
+- **Environment variable**: `QWEN_SANDBOX_IMAGE=<image>`
+- **Settings file**: `tools.sandboxImage` in your `settings.json` (e.g., `{"tools": {"sandboxImage": "ghcr.io/qwenlm/qwen-code:0.14.1"}}`)
 
-If you don’t set either, Qwen Code uses the default image configured in the CLI package (for example `ghcr.io/qwenlm/qwen-code:<version>`).
+Priority order (highest to lowest):
+
+1. `--sandbox-image`
+2. `QWEN_SANDBOX_IMAGE`
+3. `tools.sandboxImage`
+4. Built-in default image from the CLI package (for example `ghcr.io/qwenlm/qwen-code:<version>`)
+
+`settings.env.QWEN_SANDBOX_IMAGE` also works as a generic env injection mechanism, but `tools.sandboxImage` is the preferred persistent setting.
 
 ### macOS Seatbelt profiles
 
@@ -148,7 +158,7 @@ export SANDBOX_FLAGS="--flag1 --flag2=value"
 
 If you want to restrict outbound network access to an allowlist, you can run a local proxy alongside the sandbox:
 
-- Set `GEMINI_SANDBOX_PROXY_COMMAND=<command>`
+- Set `QWEN_SANDBOX_PROXY_COMMAND=<command>`
 - The command must start a proxy server that listens on `:::8877`
 
 This is especially useful with `*-proxied` Seatbelt profiles.
@@ -157,21 +167,12 @@ For a working allowlist-style proxy example, see: [Example Proxy Script](/develo
 
 ## Linux UID/GID handling
 
-The sandbox automatically handles user permissions on Linux. Override these permissions with:
+On Linux, Qwen Code defaults to enabling UID/GID mapping so the sandbox runs as your user (and reuses the mounted `~/.qwen`). Override with:
 
 ```bash
 export SANDBOX_SET_UID_GID=true   # Force host UID/GID
 export SANDBOX_SET_UID_GID=false  # Disable UID/GID mapping
 ```
-
-## Customizing the sandbox environment (Docker/Podman)
-
-If you need extra tools inside the container (e.g., `git`, `python`, `rg`), create a custom Dockerfile:
-
-- Path: `.qwen/sandbox.Dockerfile`
-- Then run with: `BUILD_SANDBOX=1 qwen -s ...`
-
-This builds a project-specific image based on the default sandbox image.
 
 ## Troubleshooting
 
@@ -187,6 +188,29 @@ This builds a project-specific image based on the default sandbox image.
 
 - Container sandbox: add them via `.qwen/sandbox.Dockerfile` or `.qwen/sandbox.bashrc`.
 - Seatbelt: your host binaries are used, but the sandbox may restrict access to some paths.
+
+**Java not available in Docker sandbox**
+
+The official Qwen Code Docker image is intentionally minimal to keep the image small, secure, and fast to pull. Different users require different language runtimes (Java, Python, Node.js, etc.), and bundling all environments into a single image is not practical. Therefore, Java is **not included by default** in the Docker sandbox.
+
+If your workflow requires Java, you can extend the base image by creating a `.qwen/sandbox.Dockerfile` in your project:
+
+```dockerfile
+FROM ghcr.io/qwenlm/qwen-code:latest
+
+RUN apt-get update && \
+    apt-get install -y openjdk-17-jre && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+```
+
+Then rebuild the sandbox image:
+
+```bash
+QWEN_SANDBOX=docker BUILD_SANDBOX=1 qwen -s
+```
+
+For more details on customizing the sandbox, see [Customizing the sandbox environment](/developers/tools/sandbox).
 
 **Network issues**
 

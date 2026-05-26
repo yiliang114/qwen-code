@@ -143,6 +143,7 @@ export const ideCommand = async (): Promise<SlashCommand> => {
         return t('manage IDE integration');
       },
       kind: CommandKind.BUILT_IN,
+      supportedModes: ['interactive'] as const,
       action: (): SlashCommandActionReturn =>
         ({
           type: 'message',
@@ -160,6 +161,7 @@ export const ideCommand = async (): Promise<SlashCommand> => {
       return t('manage IDE integration');
     },
     kind: CommandKind.BUILT_IN,
+    supportedModes: ['interactive'] as const,
     subCommands: [],
   };
 
@@ -169,6 +171,7 @@ export const ideCommand = async (): Promise<SlashCommand> => {
       return t('check status of IDE integration');
     },
     kind: CommandKind.BUILT_IN,
+    supportedModes: ['interactive'] as const,
     action: async (): Promise<SlashCommandActionReturn> => {
       const { messageType, content } =
         await getIdeStatusMessageWithFiles(ideClient);
@@ -189,13 +192,26 @@ export const ideCommand = async (): Promise<SlashCommand> => {
       });
     },
     kind: CommandKind.BUILT_IN,
+    supportedModes: ['interactive'] as const,
     action: async (context) => {
       const installer = getIdeInstaller(currentIDE);
+      const isSandBox = !!process.env['SANDBOX'];
+      if (isSandBox) {
+        context.ui.addItem(
+          {
+            type: 'info',
+            text: `IDE integration needs to be installed on the host. If you have already installed it, you can directly connect the ide`,
+          },
+          Date.now(),
+        );
+        return;
+      }
       if (!installer) {
+        const ideName = ideClient.getDetectedIdeDisplayName();
         context.ui.addItem(
           {
             type: 'error',
-            text: `No installer is available for ${ideClient.getDetectedIdeDisplayName()}. Please install the '${QWEN_CODE_COMPANION_EXTENSION_NAME}' extension manually from the marketplace.`,
+            text: `Automatic installation is not supported for ${ideName}. Please install the '${QWEN_CODE_COMPANION_EXTENSION_NAME}' extension manually from the marketplace.`,
           },
           Date.now(),
         );
@@ -264,6 +280,7 @@ export const ideCommand = async (): Promise<SlashCommand> => {
       return t('enable IDE integration');
     },
     kind: CommandKind.BUILT_IN,
+    supportedModes: ['interactive'] as const,
     action: async (context: CommandContext) => {
       context.services.settings.setValue(
         SettingScope.User,
@@ -288,6 +305,7 @@ export const ideCommand = async (): Promise<SlashCommand> => {
       return t('disable IDE integration');
     },
     kind: CommandKind.BUILT_IN,
+    supportedModes: ['interactive'] as const,
     action: async (context: CommandContext) => {
       context.services.settings.setValue(
         SettingScope.User,

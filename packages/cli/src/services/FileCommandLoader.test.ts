@@ -119,6 +119,8 @@ describe('FileCommandLoader', () => {
     const command = commands[0];
     expect(command).toBeDefined();
     expect(command.name).toBe('test');
+    expect(command.sourceLabel).toBe('Custom');
+    expect(command.sourceDetail).toBe('custom');
 
     const result = await command.action?.(
       createMockCommandContext({
@@ -306,6 +308,33 @@ describe('FileCommandLoader', () => {
     } else {
       assert.fail('Incorrect action type for project command');
     }
+  });
+
+  it('skips auto-discovered commands in bare mode', async () => {
+    const userCommandsDir = Storage.getUserCommandsDir();
+    const projectCommandsDir = new Storage(
+      process.cwd(),
+    ).getProjectCommandsDir();
+    mock({
+      [userCommandsDir]: {
+        'user.toml': 'prompt = "User prompt"',
+      },
+      [projectCommandsDir]: {
+        'project.toml': 'prompt = "Project prompt"',
+      },
+    });
+
+    const mockConfig = {
+      getProjectRoot: vi.fn(() => process.cwd()),
+      getExtensions: vi.fn(() => []),
+      getFolderTrustFeature: vi.fn(() => false),
+      getFolderTrust: vi.fn(() => false),
+      getBareMode: vi.fn(() => true),
+    } as unknown as Config;
+    const loader = new FileCommandLoader(mockConfig);
+    const commands = await loader.loadCommands(signal);
+
+    expect(commands).toEqual([]);
   });
 
   it('ignores files with TOML syntax errors', async () => {
@@ -662,8 +691,8 @@ describe('FileCommandLoader', () => {
       const result2 = await commands[2].action?.(
         createMockCommandContext({
           invocation: {
-            raw: '/deploy',
-            name: 'deploy',
+            raw: '/test-ext.deploy',
+            name: 'test-ext.deploy',
             args: '',
           },
         }),
@@ -812,8 +841,8 @@ describe('FileCommandLoader', () => {
       const result = await nestedCmd!.action?.(
         createMockCommandContext({
           invocation: {
-            raw: '/b:c',
-            name: 'b:c',
+            raw: '/a.b:c',
+            name: 'a.b:c',
             args: '',
           },
         }),

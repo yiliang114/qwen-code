@@ -7,24 +7,20 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { GenerateContentParameters } from '@google/genai';
 import { EnhancedErrorHandler } from './errorHandler.js';
-import type { RequestContext } from './errorHandler.js';
+import type { RequestContext } from './types.js';
 
 describe('EnhancedErrorHandler', () => {
+  const fixedNow = 10_000;
   let errorHandler: EnhancedErrorHandler;
-  let mockConsoleError: ReturnType<typeof vi.spyOn>;
   let mockContext: RequestContext;
   let mockRequest: GenerateContentParameters;
 
   beforeEach(() => {
-    mockConsoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
-
+    vi.spyOn(Date, 'now').mockReturnValue(fixedNow);
     mockContext = {
-      userPromptId: 'test-prompt-id',
       model: 'test-model',
-      authType: 'test-auth',
-      startTime: Date.now() - 5000,
-      duration: 5000,
-      isStreaming: false,
+      modalities: {},
+      startTime: fixedNow - 5000,
     };
 
     mockRequest = {
@@ -63,33 +59,6 @@ describe('EnhancedErrorHandler', () => {
       }).toThrow(originalError);
     });
 
-    it('should log error message for non-timeout errors', () => {
-      const originalError = new Error('Test error');
-
-      expect(() => {
-        errorHandler.handle(originalError, mockContext, mockRequest);
-      }).toThrow();
-
-      expect(mockConsoleError).toHaveBeenCalledWith(
-        'OpenAI API Error:',
-        'Test error',
-      );
-    });
-
-    it('should log streaming error message for streaming requests', () => {
-      const streamingContext = { ...mockContext, isStreaming: true };
-      const originalError = new Error('Test streaming error');
-
-      expect(() => {
-        errorHandler.handle(originalError, streamingContext, mockRequest);
-      }).toThrow();
-
-      expect(mockConsoleError).toHaveBeenCalledWith(
-        'OpenAI API Streaming Error:',
-        'Test streaming error',
-      );
-    });
-
     it('should throw enhanced error message for timeout errors', () => {
       const timeoutError = new Error('Request timeout');
 
@@ -98,7 +67,7 @@ describe('EnhancedErrorHandler', () => {
       }).toThrow(/Request timeout after 5s.*Troubleshooting tips:/s);
     });
 
-    it('should not log error when suppression is enabled', () => {
+    it('should use custom suppression function', () => {
       const suppressLogging = vi.fn(() => true);
       errorHandler = new EnhancedErrorHandler(suppressLogging);
       const originalError = new Error('Test error');
@@ -107,7 +76,6 @@ describe('EnhancedErrorHandler', () => {
         errorHandler.handle(originalError, mockContext, mockRequest);
       }).toThrow();
 
-      expect(mockConsoleError).not.toHaveBeenCalled();
       expect(suppressLogging).toHaveBeenCalledWith(originalError, mockRequest);
     });
 
@@ -117,11 +85,27 @@ describe('EnhancedErrorHandler', () => {
       expect(() => {
         errorHandler.handle(stringError, mockContext, mockRequest);
       }).toThrow(stringError);
+    });
 
-      expect(mockConsoleError).toHaveBeenCalledWith(
-        'OpenAI API Error:',
-        'String error message',
+    it('should redact proxy credentials before throwing request-time errors', () => {
+      const proxyError = new Error(
+        'connect ECONNREFUSED token@proxy.local:8080',
       );
+
+      expect(() => {
+        errorHandler.handle(proxyError, mockContext, mockRequest);
+      }).toThrow('connect ECONNREFUSED <redacted>@proxy.local:8080');
+      expect(proxyError.message).not.toContain('token@');
+    });
+
+    it('should redact proxy credentials from string errors', () => {
+      expect(() => {
+        errorHandler.handle(
+          '407 via http://user:pass@proxy.local',
+          mockContext,
+          mockRequest,
+        );
+      }).toThrow('407 via http://<redacted>@proxy.local');
     });
 
     it('should handle null/undefined errors', () => {
@@ -230,24 +214,13 @@ describe('EnhancedErrorHandler', () => {
       errorHandler = new EnhancedErrorHandler();
     });
 
-    it('should build timeout error message for non-streaming requests', () => {
+    it('should build timeout error message', () => {
       const timeoutError = new Error('timeout');
 
       expect(() => {
         errorHandler.handle(timeoutError, mockContext, mockRequest);
       }).toThrow(
         /Request timeout after 5s\. Try reducing input length or increasing timeout in config\./,
-      );
-    });
-
-    it('should build timeout error message for streaming requests', () => {
-      const streamingContext = { ...mockContext, isStreaming: true };
-      const timeoutError = new Error('timeout');
-
-      expect(() => {
-        errorHandler.handle(timeoutError, streamingContext, mockRequest);
-      }).toThrow(
-        /Streaming request timeout after 5s\. Try reducing input length or increasing timeout in config\./,
       );
     });
 
@@ -281,7 +254,10 @@ describe('EnhancedErrorHandler', () => {
     });
 
     it('should handle different duration values correctly', () => {
-      const contextWithDifferentDuration = { ...mockContext, duration: 12345 };
+      const contextWithDifferentDuration = {
+        ...mockContext,
+        startTime: fixedNow - 12345,
+      };
       const timeoutError = new Error('timeout');
 
       expect(() => {
@@ -299,24 +275,13 @@ describe('EnhancedErrorHandler', () => {
       errorHandler = new EnhancedErrorHandler();
     });
 
-    it('should provide general troubleshooting tips for non-streaming requests', () => {
+    it('should provide generic troubleshooting tips', () => {
       const timeoutError = new Error('timeout');
 
       expect(() => {
         errorHandler.handle(timeoutError, mockContext, mockRequest);
       }).toThrow(
-        /Troubleshooting tips:\n- Reduce input length or complexity\n- Increase timeout in config: contentGenerator\.timeout\n- Check network connectivity\n- Consider using streaming mode for long responses/,
-      );
-    });
-
-    it('should provide streaming-specific troubleshooting tips for streaming requests', () => {
-      const streamingContext = { ...mockContext, isStreaming: true };
-      const timeoutError = new Error('timeout');
-
-      expect(() => {
-        errorHandler.handle(timeoutError, streamingContext, mockRequest);
-      }).toThrow(
-        /Streaming timeout troubleshooting:\n- Reduce input length or complexity\n- Increase timeout in config: contentGenerator\.timeout\n- Check network connectivity\n- Check network stability for streaming connections\n- Consider using non-streaming mode for very long inputs/,
+        /Troubleshooting tips:\n- Reduce input length or complexity\n- Increase timeout in config: contentGenerator\.timeout\n- Check network connectivity/,
       );
     });
   });
@@ -346,7 +311,7 @@ describe('EnhancedErrorHandler', () => {
     });
 
     it('should handle zero duration', () => {
-      const zeroContext = { ...mockContext, duration: 0 };
+      const zeroContext = { ...mockContext, startTime: fixedNow };
       const timeoutError = new Error('timeout');
 
       expect(() => {
@@ -355,7 +320,7 @@ describe('EnhancedErrorHandler', () => {
     });
 
     it('should handle negative duration', () => {
-      const negativeContext = { ...mockContext, duration: -1000 };
+      const negativeContext = { ...mockContext, startTime: fixedNow + 1000 };
       const timeoutError = new Error('timeout');
 
       expect(() => {
@@ -364,7 +329,7 @@ describe('EnhancedErrorHandler', () => {
     });
 
     it('should handle very large duration', () => {
-      const largeContext = { ...mockContext, duration: 999999 };
+      const largeContext = { ...mockContext, startTime: fixedNow - 999999 };
       const timeoutError = new Error('timeout');
 
       expect(() => {
@@ -378,8 +343,6 @@ describe('EnhancedErrorHandler', () => {
       expect(() => {
         errorHandler.handle(emptyError, mockContext, mockRequest);
       }).toThrow(emptyError);
-
-      expect(mockConsoleError).toHaveBeenCalledWith('OpenAI API Error:', '');
     });
 
     it('should handle error with only whitespace message', () => {

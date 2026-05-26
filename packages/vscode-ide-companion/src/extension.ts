@@ -13,28 +13,21 @@ import {
   detectIdeFromEnv,
   IDE_DEFINITIONS,
   type IdeInfo,
-} from '@qwen-code/qwen-code-core/src/ide/detect-ide.js';
-import { WebViewProvider } from './webview/WebViewProvider.js';
+} from '@qwen-code/qwen-code-core';
+import { WebViewProvider } from './webview/providers/WebViewProvider.js';
+import { ChatProviderRegistry } from './webview/providers/ChatProviderRegistry.js';
+import { registerChatViewProviders } from './webview/providers/chatViewRegistration.js';
 import { registerNewCommands } from './commands/index.js';
 import { ReadonlyFileSystemProvider } from './services/readonlyFileSystemProvider.js';
 import { isWindows } from './utils/platform.js';
-import { execSync } from 'child_process';
+
+// Keep the dormant daemon IDE adapter on the VSIX bundle path without wiring it
+// into the active extension flow yet.
+export { createSdkDaemonSessionFactory as __daemonIdeSessionFactoryForBundle } from './services/daemonIdeConnection.js';
 
 const CLI_IDE_COMPANION_IDENTIFIER = 'qwenlm.qwen-code-vscode-ide-companion';
 const INFO_MESSAGE_SHOWN_KEY = 'qwenCodeInfoMessageShown';
 export const DIFF_SCHEME = 'qwen-diff';
-
-/**
- * Check if Node.js is available in the system PATH
- */
-function isNodeAvailable(): boolean {
-  try {
-    execSync(isWindows ? 'where node' : 'which node', { stdio: 'ignore' });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 /**
  * IDE environments where the installation greeting is hidden.  In these
@@ -48,7 +41,7 @@ const HIDE_INSTALLATION_GREETING_IDES: ReadonlySet<IdeInfo['name']> = new Set([
 
 let ideServer: IDEServer;
 let logger: vscode.OutputChannel;
-let webViewProviders: WebViewProvider[] = []; // Track multiple chat tabs
+let chatProviderRegistry: ChatProviderRegistry<WebViewProvider> | null = null;
 
 let log: (message: string) => void = () => {};
 
@@ -138,17 +131,25 @@ export async function activate(context: vscode.ExtensionContext) {
   );
   log('Readonly file system provider registered');
 
+  chatProviderRegistry = new ChatProviderRegistry(
+    () => new WebViewProvider(context, context.extensionUri),
+  );
+
   const diffContentProvider = new DiffContentProvider();
   const diffManager = new DiffManager(
     log,
     diffContentProvider,
-    // Delay when any chat tab has a pending permission drawer
-    () => webViewProviders.some((p) => p.hasPendingPermission()),
-    // Suppress diffs when active mode is auto or yolo in any chat tab
+    // Delay when any chat surface has a pending permission drawer
+    () =>
+      chatProviderRegistry
+        ?.getPermissionAwareProviders()
+        .some((p) => p.hasPendingPermission()) ?? false,
+    // Suppress diffs when active mode is auto or yolo in any chat surface
     () => {
-      const providers = webViewProviders.filter(
-        (p) => typeof p.shouldSuppressDiff === 'function',
-      );
+      const providers =
+        chatProviderRegistry
+          ?.getPermissionAwareProviders()
+          .filter((p) => typeof p.shouldSuppressDiff === 'function') ?? [];
       if (providers.length === 0) {
         return false;
       }
@@ -157,11 +158,16 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
   // Helper function to create a new WebView provider instance
-  const createWebViewProvider = (): WebViewProvider => {
-    const provider = new WebViewProvider(context, context.extensionUri);
-    webViewProviders.push(provider);
-    return provider;
-  };
+  const createWebViewProvider = (): WebViewProvider =>
+    chatProviderRegistry!.createEditorProvider();
+
+  const createViewProvider = (): WebViewProvider =>
+    chatProviderRegistry!.createViewProvider();
+
+  const supportsSecondarySidebar = registerChatViewProviders({
+    context,
+    createViewProvider,
+  });
 
   // Register WebView panel serializer for persistence across reloads
   context.subscriptions.push(
@@ -205,8 +211,32 @@ export async function activate(context: vscode.ExtensionContext) {
     context,
     log,
     diffManager,
-    () => webViewProviders,
+    () => chatProviderRegistry?.getEditorProviders() ?? [],
     createWebViewProvider,
+    logger,
+    supportsSecondarySidebar,
+  );
+
+  // Register copy commands for webview context menu
+  // Only send to the first provider with an active webview (the one the user right-clicked)
+  const sendCopyToActive = (action: string) => {
+    for (const provider of chatProviderRegistry?.getPermissionAwareProviders() ??
+      []) {
+      if (provider.sendCopyCommand(action)) {
+        break;
+      }
+    }
+  };
+  context.subscriptions.push(
+    vscode.commands.registerCommand('qwen-code.copyMessage', () =>
+      sendCopyToActive('copyMessage'),
+    ),
+    vscode.commands.registerCommand('qwen-code.copyAllMessages', () =>
+      sendCopyToActive('copyAllMessages'),
+    ),
+    vscode.commands.registerCommand('qwen-code.copyLastReply', () =>
+      sendCopyToActive('copyLastReply'),
+    ),
   );
 
   context.subscriptions.push(
@@ -224,9 +254,10 @@ export async function activate(context: vscode.ExtensionContext) {
       if (docUri && docUri.scheme === DIFF_SCHEME) {
         diffManager.acceptDiff(docUri);
       }
-      // If WebView is requesting permission, actively select an allow option (prefer once)
+      // If any chat surface is requesting permission, actively select allow (prefer once)
       try {
-        for (const provider of webViewProviders) {
+        for (const provider of chatProviderRegistry?.getPermissionAwareProviders() ??
+          []) {
           if (provider?.hasPendingPermission()) {
             provider.respondToPendingPermission('allow');
           }
@@ -241,9 +272,10 @@ export async function activate(context: vscode.ExtensionContext) {
       if (docUri && docUri.scheme === DIFF_SCHEME) {
         diffManager.cancelDiff(docUri);
       }
-      // If WebView is requesting permission, actively select reject/cancel
+      // If any chat surface is requesting permission, actively select reject/cancel
       try {
-        for (const provider of webViewProviders) {
+        for (const provider of chatProviderRegistry?.getPermissionAwareProviders() ??
+          []) {
           if (provider?.hasPendingPermission()) {
             provider.respondToPendingPermission('cancel');
           }
@@ -326,32 +358,36 @@ export async function activate(context: vscode.ExtensionContext) {
             'qwen-cli',
             'cli.js',
           ).fsPath;
-          const quote = (s: string) => `"${s.replace(/"/g, '\\"')}"`;
+          const execPath = process.execPath;
 
-          let qwenCmd: string;
-          if (isNodeAvailable()) {
-            // Prefer system Node.js
-            qwenCmd = `node ${quote(cliEntry)}`;
-          } else {
-            // Fallback to VS Code's bundled Node.js runtime
-            const execPath = process.execPath;
-            const baseCmd = `${quote(execPath)} ${quote(cliEntry)}`;
-            if (isWindows) {
-              // PowerShell requires & call operator for quoted paths
-              qwenCmd = `& ${baseCmd}`;
-            } else if (execPath.toLowerCase().includes('code helper')) {
-              // macOS Electron helper needs ELECTRON_RUN_AS_NODE=1
-              qwenCmd = `ELECTRON_RUN_AS_NODE=1 ${baseCmd}`;
-            } else {
-              qwenCmd = baseCmd;
-            }
-          }
-
-          const terminal = vscode.window.createTerminal({
+          const terminalOptions: vscode.TerminalOptions = {
             name: `Qwen Code (${selectedFolder.name})`,
             cwd: selectedFolder.uri.fsPath,
             location,
-          });
+          };
+
+          let qwenCmd: string;
+
+          if (isWindows) {
+            // On Windows, try multiple strategies to find a Node.js runtime:
+            // 1. Check if VSCode ships a standalone node.exe alongside Code.exe
+            // 2. Check VSCode's internal Node.js in resources directory
+            // 3. Fall back to using Code.exe with ELECTRON_RUN_AS_NODE=1
+            const quoteCmd = (s: string) => `"${s.replace(/"/g, '""')}"`;
+            const cliQuoted = quoteCmd(cliEntry);
+            // TODO: @yiliang114, temporarily run through node, and later hope to decouple from the local node
+            qwenCmd = `node ${cliQuoted}`;
+            terminalOptions.shellPath = process.env.ComSpec;
+          } else {
+            // macOS/Linux: All VSCode-like IDEs (VSCode, Cursor, Windsurf, etc.)
+            // are Electron-based, so we always need ELECTRON_RUN_AS_NODE=1
+            // to run Node.js scripts using the IDE's bundled runtime.
+            const quotePosix = (s: string) => `"${s.replace(/"/g, '\\"')}"`;
+            const baseCmd = `${quotePosix(execPath)} ${quotePosix(cliEntry)}`;
+            qwenCmd = `ELECTRON_RUN_AS_NODE=1 ${baseCmd}`;
+          }
+
+          const terminal = vscode.window.createTerminal(terminalOptions);
           terminal.show();
           terminal.sendText(qwenCmd);
         }
@@ -373,11 +409,8 @@ export async function deactivate(): Promise<void> {
     if (ideServer) {
       await ideServer.stop();
     }
-    // Dispose all WebView providers
-    webViewProviders.forEach((provider) => {
-      provider.dispose();
-    });
-    webViewProviders = [];
+    chatProviderRegistry?.disposeAll();
+    chatProviderRegistry = null;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log(`Failed to stop IDE server during deactivation: ${message}`);

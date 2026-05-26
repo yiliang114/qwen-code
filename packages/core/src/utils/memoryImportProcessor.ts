@@ -8,18 +8,10 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { isSubpath } from './paths.js';
 import { marked, type Token } from 'marked';
+import { createDebugLogger } from './debugLogger.js';
+import { findProjectRoot } from './projectRoot.js';
 
-// Simple console logger for import processing
-const logger = {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  debug: (...args: any[]) =>
-    console.debug('[DEBUG] [ImportProcessor]', ...args),
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  warn: (...args: any[]) => console.warn('[WARN] [ImportProcessor]', ...args),
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  error: (...args: any[]) =>
-    console.error('[ERROR] [ImportProcessor]', ...args),
-};
+const logger = createDebugLogger('IMPORT_PROCESSOR');
 
 /**
  * Interface for tracking import processing state to prevent circular imports
@@ -47,29 +39,11 @@ export interface ProcessImportsResult {
   importTree: MemoryFile;
 }
 
-// Helper to find the project root (looks for .git directory)
-async function findProjectRoot(startDir: string): Promise<string> {
-  let currentDir = path.resolve(startDir);
-  while (true) {
-    const gitPath = path.join(currentDir, '.git');
-    try {
-      const stats = await fs.lstat(gitPath);
-      if (stats.isDirectory()) {
-        return currentDir;
-      }
-    } catch {
-      // .git not found, continue to parent
-    }
-    const parentDir = path.dirname(currentDir);
-    if (parentDir === currentDir) {
-      // Reached filesystem root
-      break;
-    }
-    currentDir = parentDir;
-  }
-  // Fallback to startDir if .git not found
-  return path.resolve(startDir);
-}
+// `findProjectRoot` now lives in `./projectRoot.ts` and is shared with
+// memoryDiscovery. It returns `string | null`; `processImports` below
+// preserves the previous "fall back to startDir" contract at the call
+// site, so behavior for code paths that don't care about the difference
+// (a non-git scratch dir for example) is unchanged.
 
 // Add a type guard for error objects
 function hasMessage(err: unknown): err is { message: string } {
@@ -150,6 +124,18 @@ function isLetter(char: string): boolean {
   ); // a-z
 }
 
+/**
+ * Checks if an error is a "file not found" error (ENOENT)
+ */
+function isFileNotFoundError(err: unknown): boolean {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    'code' in err &&
+    (err as { code: unknown }).code === 'ENOENT'
+  );
+}
+
 function findCodeRegions(content: string): Array<[number, number]> {
   const regions: Array<[number, number]> = [];
   const tokens = marked.lexer(content);
@@ -189,7 +175,6 @@ function findCodeRegions(content: string): Array<[number, number]> {
  * Supports @path/to/file syntax for importing content from other files
  * @param content - The content to process for imports
  * @param basePath - The directory path where the current file is located
- * @param debugMode - Whether to enable debug logging
  * @param importState - State tracking for circular import prevention
  * @param projectRoot - The project root directory for allowed directories
  * @param importFormat - The format of the import tree
@@ -198,7 +183,6 @@ function findCodeRegions(content: string): Array<[number, number]> {
 export async function processImports(
   content: string,
   basePath: string,
-  debugMode: boolean = false,
   importState: ImportState = {
     processedFiles: new Set(),
     maxDepth: 5,
@@ -208,15 +192,16 @@ export async function processImports(
   importFormat: 'flat' | 'tree' = 'tree',
 ): Promise<ProcessImportsResult> {
   if (!projectRoot) {
-    projectRoot = await findProjectRoot(basePath);
+    // Preserve the previous local helper's contract: if no `.git`
+    // ancestor exists, fall back to the absolute basePath so
+    // `@`-imports can still resolve relatively.
+    projectRoot = (await findProjectRoot(basePath)) ?? path.resolve(basePath);
   }
 
   if (importState.currentDepth >= importState.maxDepth) {
-    if (debugMode) {
-      logger.warn(
-        `Maximum import depth (${importState.maxDepth}) reached. Stopping import processing.`,
-      );
-    }
+    logger.warn(
+      `Maximum import depth (${importState.maxDepth}) reached. Stopping import processing.`,
+    );
     return {
       content,
       importTree: { path: importState.currentFile || 'unknown' },
@@ -292,7 +277,9 @@ export async function processImports(
             depth + 1,
           );
         } catch (error) {
-          if (debugMode) {
+          // If file doesn't exist, silently skip this import (it's not a real import)
+          // Only log warnings for other types of errors
+          if (!isFileNotFoundError(error)) {
             logger.warn(
               `Failed to import ${fullPath}: ${hasMessage(error) ? error.message : 'Unknown error'}`,
             );
@@ -363,7 +350,6 @@ export async function processImports(
       const imported = await processImports(
         fileContent,
         path.dirname(fullPath),
-        debugMode,
         newImportState,
         projectRoot,
         importFormat,
@@ -371,6 +357,12 @@ export async function processImports(
       result += `<!-- Imported from: ${importPath} -->\n${imported.content}\n<!-- End of import from: ${importPath} -->`;
       imports.push(imported.importTree);
     } catch (err: unknown) {
+      // If file doesn't exist, preserve the original @path text (it's not a real import)
+      if (isFileNotFoundError(err)) {
+        result += `@${importPath}`;
+        continue;
+      }
+      // For other errors, log and add error comment
       let message = 'Unknown error';
       if (hasMessage(err)) {
         message = err.message;

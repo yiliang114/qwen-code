@@ -27,6 +27,13 @@ import { ANSI } from './ansi.js';
 import { ANSILight } from './ansi-light.js';
 import { NoColorTheme } from './no-color.js';
 import process from 'node:process';
+import { createDebugLogger } from '@qwen-code/qwen-code-core';
+import {
+  detectTerminalTheme,
+  detectTerminalThemeAsync,
+} from './detect-terminal-theme.js';
+
+const debugLogger = createDebugLogger('THEME_MANAGER');
 
 export interface ThemeDisplay {
   name: string;
@@ -35,6 +42,7 @@ export interface ThemeDisplay {
 }
 
 export const DEFAULT_THEME: Theme = QwenDark;
+export const AUTO_THEME_NAME = 'auto';
 
 class ThemeManager {
   private readonly availableThemes: Theme[];
@@ -79,7 +87,7 @@ class ThemeManager {
       const validation = validateCustomTheme(customThemeConfig);
       if (validation.isValid) {
         if (validation.warning) {
-          console.warn(`Theme "${name}": ${validation.warning}`);
+          debugLogger.warn(`Theme "${name}": ${validation.warning}`);
         }
         const themeWithDefaults: CustomTheme = {
           ...DEFAULT_THEME.colors,
@@ -92,10 +100,10 @@ class ThemeManager {
           const theme = createCustomTheme(themeWithDefaults);
           this.customThemes.set(name, theme);
         } catch (error) {
-          console.warn(`Failed to load custom theme "${name}":`, error);
+          debugLogger.warn(`Failed to load custom theme "${name}":`, error);
         }
       } else {
-        console.warn(`Invalid custom theme "${name}": ${validation.error}`);
+        debugLogger.warn(`Invalid custom theme "${name}": ${validation.error}`);
       }
     }
     // If the current active theme is a custom theme, keep it if still valid
@@ -111,15 +119,55 @@ class ThemeManager {
   /**
    * Sets the active theme.
    * @param themeName The name of the theme to set as active.
+   *   If themeName is 'auto', detects the terminal theme and selects
+   *   Qwen Dark or Qwen Light accordingly.
    * @returns True if the theme was successfully set, false otherwise.
    */
   setActiveTheme(themeName: string | undefined): boolean {
+    if (themeName === AUTO_THEME_NAME) {
+      this.activeTheme = this.resolveAutoTheme();
+      debugLogger.info(`Auto-detected theme: ${this.activeTheme.name}`);
+      return true;
+    }
     const theme = this.findThemeByName(themeName);
     if (!theme) {
       return false;
     }
     this.activeTheme = theme;
     return true;
+  }
+
+  /**
+   * Cached auto-detection result. Populated by the async probe at startup
+   * (which includes OSC 11) and reused by subsequent sync resolutions so
+   * reselecting Auto in the /theme dialog never contradicts what was shown
+   * when the app first rendered.
+   */
+  private cachedAutoDetection: 'dark' | 'light' | undefined;
+
+  /**
+   * Detects the terminal's dark/light preference (synchronous) and returns
+   * the corresponding Qwen theme.
+   * Used by the theme dialog for instant preview. Prefers the cached
+   * async-detected value when available so we stay consistent with the
+   * OSC 11 probe performed at startup.
+   */
+  private resolveAutoTheme(): Theme {
+    const detected = this.cachedAutoDetection ?? detectTerminalTheme();
+    return detected === 'light' ? QwenLight : QwenDark;
+  }
+
+  /**
+   * Asynchronous auto-detection that includes an OSC 11 probe.
+   * Intended for startup where a short async delay (~200 ms) is acceptable.
+   * The resolved value is cached so later sync resolutions (e.g. the /theme
+   * dialog reselecting Auto) stay in sync with what the probe detected.
+   */
+  async resolveAutoThemeAsync(): Promise<void> {
+    const detected = await detectTerminalThemeAsync();
+    this.cachedAutoDetection = detected;
+    this.activeTheme = detected === 'light' ? QwenLight : QwenDark;
+    debugLogger.info(`Auto-detected theme (async): ${this.activeTheme.name}`);
   }
 
   /**
@@ -260,7 +308,7 @@ class ThemeManager {
       // 2. Perform security check.
       const homeDir = path.resolve(os.homedir());
       if (!canonicalPath.startsWith(homeDir)) {
-        console.warn(
+        debugLogger.warn(
           `Theme file at "${themePath}" is outside your home directory. ` +
             `Only load themes from trusted sources.`,
         );
@@ -273,14 +321,14 @@ class ThemeManager {
 
       const validation = validateCustomTheme(customThemeConfig);
       if (!validation.isValid) {
-        console.warn(
+        debugLogger.warn(
           `Invalid custom theme from file "${themePath}": ${validation.error}`,
         );
         return undefined;
       }
 
       if (validation.warning) {
-        console.warn(`Theme from "${themePath}": ${validation.warning}`);
+        debugLogger.warn(`Theme from "${themePath}": ${validation.warning}`);
       }
 
       // 4. Create and cache the theme.
@@ -300,7 +348,10 @@ class ThemeManager {
       if (
         !(error instanceof Error && 'code' in error && error.code === 'ENOENT')
       ) {
-        console.warn(`Could not load theme from file "${themePath}":`, error);
+        debugLogger.warn(
+          `Could not load theme from file "${themePath}":`,
+          error,
+        );
       }
       return undefined;
     }

@@ -5,44 +5,54 @@
  */
 
 import { render } from 'ink-testing-library';
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Footer } from './Footer.js';
 import * as useTerminalSize from '../hooks/useTerminalSize.js';
-import { tildeifyPath } from '@qwen-code/qwen-code-core';
+import * as useStatusLineModule from '../hooks/useStatusLine.js';
 import { type UIState, UIStateContext } from '../contexts/UIStateContext.js';
 import { ConfigContext } from '../contexts/ConfigContext.js';
-import { SettingsContext } from '../contexts/SettingsContext.js';
-import type { LoadedSettings } from '../../config/settings.js';
 import { VimModeProvider } from '../contexts/VimModeContext.js';
+import { SettingsContext } from '../contexts/SettingsContext.js';
+import { KeypressProvider } from '../contexts/KeypressContext.js';
+import type { LoadedSettings } from '../../config/settings.js';
 
 vi.mock('../hooks/useTerminalSize.js');
 const useTerminalSizeMock = vi.mocked(useTerminalSize.useTerminalSize);
 
+vi.mock('../hooks/useStatusLine.js');
+const useStatusLineMock = vi.mocked(useStatusLineModule.useStatusLine);
+
 vi.mock('@qwen-code/qwen-code-core', async (importOriginal) => {
-  const original =
+  const actual =
     await importOriginal<typeof import('@qwen-code/qwen-code-core')>();
+  const registry = {
+    list: vi.fn(() => []),
+    subscribe: vi.fn(() => () => {}),
+  };
   return {
-    ...original,
-    shortenPath: (p: string, len: number) => {
-      if (p.length > len) {
-        return '...' + p.slice(p.length - len + 3);
-      }
-      return p;
-    },
+    ...actual,
+    getManagedAutoMemoryDreamTaskRegistry: vi.fn(() => registry),
   };
 });
 
 const defaultProps = {
   model: 'gemini-pro',
-  targetDir:
-    '/Users/test/project/foo/bar/and/some/more/directories/to/make/it/long',
-  branchName: 'main',
 };
+
+const createMockMemoryManager = () => ({
+  subscribe: vi.fn(() => () => {}),
+  listTasksByType: vi.fn(() => []),
+});
 
 const createMockConfig = (overrides = {}) => ({
   getModel: vi.fn(() => defaultProps.model),
-  getTargetDir: vi.fn(() => defaultProps.targetDir),
   getDebugMode: vi.fn(() => false),
+  getContentGeneratorConfig: vi.fn(() => ({ contextWindowSize: 131072 })),
+  getMcpServers: vi.fn(() => ({})),
+  getBlockedMcpServers: vi.fn(() => []),
+  getProjectRoot: vi.fn(() => '/test/project'),
+  getSessionId: vi.fn(() => 'test-session'),
+  getMemoryManager: vi.fn(createMockMemoryManager),
   ...overrides,
 });
 
@@ -50,212 +60,144 @@ const createMockUIState = (overrides: Partial<UIState> = {}): UIState =>
   ({
     sessionStats: {
       lastPromptTokenCount: 100,
+      sessionId: 'test-session',
+      metrics: {
+        models: {},
+        tools: {
+          totalCalls: 0,
+          totalSuccess: 0,
+          totalFail: 0,
+          totalDurationMs: 0,
+          totalDecisions: { accept: 0, reject: 0, modify: 0, auto_accept: 0 },
+          byName: {},
+        },
+        files: { totalLinesAdded: 0, totalLinesRemoved: 0 },
+      },
     },
-    branchName: defaultProps.branchName,
+    currentModel: 'gemini-pro',
+    branchName: undefined,
+    geminiMdFileCount: 0,
+    contextFileNames: [],
+    showToolDescriptions: false,
+    ideContextState: undefined,
+    isConfigInitialized: true,
     ...overrides,
   }) as UIState;
 
-const createDefaultSettings = (
-  options: {
-    showMemoryUsage?: boolean;
-    hideCWD?: boolean;
-    hideSandboxStatus?: boolean;
-    hideModelInfo?: boolean;
-  } = {},
-): LoadedSettings =>
+const createMockSettings = (): LoadedSettings =>
   ({
     merged: {
-      ui: {
-        showMemoryUsage: options.showMemoryUsage,
-        footer: {
-          hideCWD: options.hideCWD,
-          hideSandboxStatus: options.hideSandboxStatus,
-          hideModelInfo: options.hideModelInfo,
-        },
+      general: {
+        vimMode: false,
       },
     },
-  }) as never;
+  }) as LoadedSettings;
 
-const renderWithWidth = (
-  width: number,
-  uiState: UIState,
-  settings: LoadedSettings = createDefaultSettings(),
-) => {
+const renderWithWidth = (width: number, uiState: UIState) => {
   useTerminalSizeMock.mockReturnValue({ columns: width, rows: 24 });
+  const mockSettings = createMockSettings();
   return render(
-    <ConfigContext.Provider value={createMockConfig() as never}>
-      <SettingsContext.Provider value={settings}>
-        <VimModeProvider settings={settings}>
-          <UIStateContext.Provider value={uiState}>
-            <Footer />
-          </UIStateContext.Provider>
-        </VimModeProvider>
-      </SettingsContext.Provider>
-    </ConfigContext.Provider>,
+    <SettingsContext.Provider value={mockSettings}>
+      <ConfigContext.Provider value={createMockConfig() as never}>
+        <KeypressProvider kittyProtocolEnabled={false}>
+          <VimModeProvider settings={mockSettings}>
+            <UIStateContext.Provider value={uiState}>
+              <Footer />
+            </UIStateContext.Provider>
+          </VimModeProvider>
+        </KeypressProvider>
+      </ConfigContext.Provider>
+    </SettingsContext.Provider>,
   );
 };
 
 describe('<Footer />', () => {
+  beforeEach(() => {
+    useStatusLineMock.mockReturnValue({ lines: [] });
+  });
+
   it('renders the component', () => {
     const { lastFrame } = renderWithWidth(120, createMockUIState());
     expect(lastFrame()).toBeDefined();
   });
 
-  describe('path display', () => {
-    it('should display a shortened path on a narrow terminal', () => {
-      const { lastFrame } = renderWithWidth(79, createMockUIState());
-      const tildePath = tildeifyPath(defaultProps.targetDir);
-      const pathLength = Math.max(20, Math.floor(79 * 0.25));
-      const expectedPath =
-        '...' + tildePath.slice(tildePath.length - pathLength + 3);
-      expect(lastFrame()).toContain(expectedPath);
-    });
-
-    it('should use wide layout at 80 columns', () => {
-      const { lastFrame } = renderWithWidth(80, createMockUIState());
-      const tildePath = tildeifyPath(defaultProps.targetDir);
-      const expectedPath =
-        '...' + tildePath.slice(tildePath.length - 80 * 0.25 + 3);
-      expect(lastFrame()).toContain(expectedPath);
-    });
-  });
-
-  it('displays the branch name when provided', () => {
+  it('does not display the working directory or branch name', () => {
     const { lastFrame } = renderWithWidth(120, createMockUIState());
-    expect(lastFrame()).toContain(`(${defaultProps.branchName}*)`);
+    expect(lastFrame()).not.toMatch(/\(.*\*\)/);
   });
 
-  it('does not display the branch name when not provided', () => {
-    const { lastFrame } = renderWithWidth(
-      120,
-      createMockUIState({
-        branchName: undefined,
-      }),
-    );
-    expect(lastFrame()).not.toContain(`(${defaultProps.branchName}*)`);
-  });
-
-  it('displays the model name and context percentage', () => {
+  it('displays the context percentage', () => {
     const { lastFrame } = renderWithWidth(120, createMockUIState());
-    expect(lastFrame()).toContain(defaultProps.model);
-    expect(lastFrame()).toMatch(/\(\d+% context left\)/);
+    expect(lastFrame()).toMatch(/\d+(\.\d+)?% context used/);
   });
 
-  it('displays the model name and abbreviated context percentage', () => {
+  it('displays the abbreviated context percentage on narrow terminal', () => {
     const { lastFrame } = renderWithWidth(99, createMockUIState());
-    expect(lastFrame()).toContain(defaultProps.model);
-    expect(lastFrame()).toMatch(/\(\d+%\)/);
+    expect(lastFrame()).toMatch(/\d+%/);
   });
 
-  describe('sandbox and trust info', () => {
-    it('should display untrusted when isTrustedFolder is false', () => {
-      const { lastFrame } = renderWithWidth(
-        120,
-        createMockUIState({
-          isTrustedFolder: false,
-        }),
-      );
-      expect(lastFrame()).toContain('untrusted');
+  describe('status line rendering', () => {
+    it('renders multi-line status line output', () => {
+      useStatusLineMock.mockReturnValue({
+        lines: ['model-name (main) ctx:34%', '████░░░░ 34% context'],
+      });
+      const { lastFrame } = renderWithWidth(120, createMockUIState());
+      const frame = lastFrame()!;
+      expect(frame).toContain('model-name (main) ctx:34%');
+      expect(frame).toContain('████░░░░ 34% context');
     });
 
-    it('should display custom sandbox info when SANDBOX env is set', () => {
-      vi.stubEnv('SANDBOX', 'gemini-cli-test-sandbox');
-      const { lastFrame } = renderWithWidth(
-        120,
-        createMockUIState({
-          isTrustedFolder: undefined,
-        }),
-      );
-      expect(lastFrame()).toContain('test');
-      vi.unstubAllEnvs();
-    });
-
-    it('should display macOS Seatbelt info when SANDBOX is sandbox-exec', () => {
-      vi.stubEnv('SANDBOX', 'sandbox-exec');
-      vi.stubEnv('SEATBELT_PROFILE', 'test-profile');
-      const { lastFrame } = renderWithWidth(
-        120,
-        createMockUIState({
-          isTrustedFolder: true,
-        }),
-      );
-      expect(lastFrame()).toMatch(/macOS Seatbelt.*\(test-profile\)/s);
-      vi.unstubAllEnvs();
-    });
-
-    it('should display "no sandbox" when SANDBOX is not set and folder is trusted', () => {
-      // Clear any SANDBOX env var that might be set.
-      vi.stubEnv('SANDBOX', '');
-      const { lastFrame } = renderWithWidth(
-        120,
-        createMockUIState({
-          isTrustedFolder: true,
-        }),
-      );
-      expect(lastFrame()).toContain('no sandbox');
-      vi.unstubAllEnvs();
-    });
-
-    it('should prioritize untrusted message over sandbox info', () => {
-      vi.stubEnv('SANDBOX', 'gemini-cli-test-sandbox');
-      const { lastFrame } = renderWithWidth(
-        120,
-        createMockUIState({
-          isTrustedFolder: false,
-        }),
-      );
-      expect(lastFrame()).toContain('untrusted');
-      expect(lastFrame()).not.toMatch(/test-sandbox/s);
-      vi.unstubAllEnvs();
+    it('suppresses hint when status line is active', () => {
+      useStatusLineMock.mockReturnValue({ lines: ['status info'] });
+      const { lastFrame } = renderWithWidth(120, createMockUIState());
+      expect(lastFrame()).not.toContain('? for shortcuts');
     });
   });
 
-  describe('footer configuration filtering (golden snapshots)', () => {
-    it('renders complete footer with all sections visible (baseline)', () => {
+  describe('config init message', () => {
+    it('shows init status in place of the hint while config is initializing', () => {
+      const { lastFrame } = renderWithWidth(
+        120,
+        createMockUIState({ isConfigInitialized: false }),
+      );
+      const frame = lastFrame()!;
+      expect(frame).toContain('Initializing...');
+      expect(frame).not.toContain('? for shortcuts');
+    });
+
+    it('falls back to the hint once config is initialized', () => {
+      const { lastFrame } = renderWithWidth(
+        120,
+        createMockUIState({ isConfigInitialized: true }),
+      );
+      const frame = lastFrame()!;
+      expect(frame).not.toContain('Initializing...');
+      expect(frame).toContain('? for shortcuts');
+    });
+
+    // Init progress is more useful than zero layout shift: we show it even
+    // when a custom status line is active, accepting that the row shrinks
+    // by one line once init completes. Still strictly better than the
+    // original bug (a 2-row residual above the input in the default case).
+    it('shows init status even when a custom status line is active', () => {
+      useStatusLineMock.mockReturnValue({ lines: ['model-name ctx:34%'] });
+      const { lastFrame } = renderWithWidth(
+        120,
+        createMockUIState({ isConfigInitialized: false }),
+      );
+      const frame = lastFrame()!;
+      expect(frame).toContain('model-name ctx:34%');
+      expect(frame).toContain('Initializing...');
+    });
+  });
+
+  describe('footer rendering (golden snapshots)', () => {
+    it('renders complete footer on wide terminal', () => {
       const { lastFrame } = renderWithWidth(120, createMockUIState());
       expect(lastFrame()).toMatchSnapshot('complete-footer-wide');
     });
 
-    it('renders footer with all optional sections hidden (minimal footer)', () => {
-      const { lastFrame } = renderWithWidth(
-        120,
-        createMockUIState(),
-        createDefaultSettings({
-          hideCWD: true,
-          hideSandboxStatus: true,
-          hideModelInfo: true,
-        }),
-      );
-      expect(lastFrame()).toMatchSnapshot('footer-minimal');
-    });
-
-    it('renders footer with only model info hidden (partial filtering)', () => {
-      const { lastFrame } = renderWithWidth(
-        120,
-        createMockUIState(),
-        createDefaultSettings({
-          hideCWD: false,
-          hideSandboxStatus: false,
-          hideModelInfo: true,
-        }),
-      );
-      expect(lastFrame()).toMatchSnapshot('footer-no-model');
-    });
-
-    it('renders footer with CWD and model info hidden to test alignment (only sandbox visible)', () => {
-      const { lastFrame } = renderWithWidth(
-        120,
-        createMockUIState(),
-        createDefaultSettings({
-          hideCWD: true,
-          hideSandboxStatus: false,
-          hideModelInfo: true,
-        }),
-      );
-      expect(lastFrame()).toMatchSnapshot('footer-only-sandbox');
-    });
-
-    it('renders complete footer in narrow terminal (baseline narrow)', () => {
+    it('renders complete footer on narrow terminal', () => {
       const { lastFrame } = renderWithWidth(79, createMockUIState());
       expect(lastFrame()).toMatchSnapshot('complete-footer-narrow');
     });

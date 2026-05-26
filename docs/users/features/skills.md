@@ -1,22 +1,12 @@
-# Agent Skills (Experimental)
+# Agent Skills
 
-> Create, manage, and share Skills to extend Qwen Code’s capabilities.
+> Create, manage, and share Skills to extend Qwen Code's capabilities.
 
-This guide shows you how to create, use, and manage Agent Skills in **Qwen Code**. Skills are modular capabilities that extend the model’s effectiveness through organized folders containing instructions (and optionally scripts/resources).
-
-> [!note]
->
-> Skills are currently **experimental** and must be enabled with `--experimental-skills`.
+This guide shows you how to create, use, and manage Agent Skills in **Qwen Code**. Skills are modular capabilities that extend the model's effectiveness through organized folders containing instructions (and optionally scripts/resources).
 
 ## Prerequisites
 
 - Qwen Code (recent version)
-- Run with the experimental flag enabled:
-
-```bash
-qwen --experimental-skills
-```
-
 - Basic familiarity with Qwen Code ([Quickstart](../quickstart.md))
 
 ## What are Agent Skills?
@@ -25,7 +15,15 @@ Agent Skills package expertise into discoverable capabilities. Each Skill consis
 
 ### How Skills are invoked
 
-Skills are **model-invoked** — the model autonomously decides when to use them based on your request and the Skill’s description. This is different from slash commands, which are **user-invoked** (you explicitly type `/command`).
+Skills are **model-invoked** — the model autonomously decides when to use them based on your request and the Skill's description. This is different from slash commands, which are **user-invoked** (you explicitly type `/command`).
+
+If you want to invoke a Skill explicitly, use the `/skills` slash command:
+
+```bash
+/skills <skill-name>
+```
+
+Use autocomplete to browse available Skills and descriptions.
 
 ### Benefits
 
@@ -49,7 +47,7 @@ mkdir -p ~/.qwen/skills/my-skill-name
 Use personal Skills for:
 
 - Your individual workflows and preferences
-- Experimental Skills you’re developing
+- Skills you're developing
 - Personal productivity helpers
 
 ### Project Skills
@@ -76,6 +74,7 @@ Create a `SKILL.md` file with YAML frontmatter and Markdown content:
 ---
 name: your-skill-name
 description: Brief description of what this Skill does and when to use it
+priority: 10
 ---
 
 # Your Skill Name
@@ -91,13 +90,36 @@ Show concrete examples of using this Skill.
 
 Qwen Code currently validates that:
 
-- `name` is a non-empty string
+- `name` is a non-empty string matching `/^[\p{L}\p{N}_:.-]+$/u` — Unicode letters and digits (CJK / Cyrillic / accented Latin all OK), plus `_`, `:`, `.`, `-`. Whitespace, slashes, brackets and other structurally unsafe characters are rejected at parse time.
 - `description` is a non-empty string
+- `priority` is optional. When present, it must be a finite number. Higher values sort earlier in the `/skills` listing only — slash-command completion (typing `/`) and the `/help` custom commands view stay alphabetical, so a high-priority Skill never reorders built-in commands. Omitted or invalid values are treated as unset, which behaves like `0`.
 
-Recommended conventions (not strictly enforced yet):
+Recommended conventions:
 
-- Use lowercase letters, numbers, and hyphens in `name`
+- Prefer lowercase ASCII with hyphens for shareable names (e.g. `tsx-helper`)
 - Make `description` specific: include both **what** the Skill does and **when** to use it (key words users will naturally mention)
+- Use `priority` sparingly for Skills that should reliably appear before the default alphabetical order in `/skills`. Negative priorities are allowed and sort below unset Skills.
+
+### Optional: gate a Skill on file paths (`paths:`)
+
+For Skills that only matter to specific parts of a codebase, add a `paths:` list of glob patterns. The Skill stays out of the model's available-skills listing until a tool call touches a matching file:
+
+```yaml
+---
+name: tsx-helper
+description: React TSX component helper
+paths:
+  - 'src/**/*.tsx'
+  - 'packages/*/src/**/*.tsx'
+---
+```
+
+Notes:
+
+- Globs are matched relative to the project root with [picomatch](https://github.com/micromatch/picomatch); files outside the project root never trigger activation.
+- A path-gated Skill **stays activated for the rest of the session** once a matching file is touched. A new session, or a `refreshCache` triggered by editing any Skill file, resets activations.
+- `paths:` only gates **model** discovery, and only at the SkillTool listing level. You can always invoke a path-gated Skill yourself via `/<skill-name>` or the `/skills` picker — that user path runs the Skill body regardless of activation state. The model side, however, stays gated until a matching file is touched: a slash invocation does **not** unlock model-side activation, so if you want the model to chain off your invocation (call `Skill { skill: ... }` itself), also access a file matching the skill's `paths:` first.
+- Combining `paths:` with `disable-model-invocation: true` is allowed but the gate has no effect — the Skill is hidden from the model regardless, so path activation never advertises it.
 
 ## Add supporting files
 
@@ -128,15 +150,32 @@ python scripts/helper.py input.txt
 
 ## View available Skills
 
-When `--experimental-skills` is enabled, Qwen Code discovers Skills from:
+Qwen Code discovers Skills from:
 
 - Personal Skills: `~/.qwen/skills/`
 - Project Skills: `.qwen/skills/`
+- Extension Skills: Skills provided by installed extensions
+
+### Extension Skills
+
+Extensions can provide custom skills that become available when the extension is enabled. These skills are stored in the extension's `skills/` directory and follow the same format as personal and project skills.
+
+Extension skills are automatically discovered and loaded when the extension is installed and enabled.
+
+To see which extensions provide skills, check the extension's `qwen-extension.json` file for a `skills` field.
 
 To view available Skills, ask Qwen Code directly:
 
 ```text
 What Skills are available?
+```
+
+> **Heads up — model vs. user view.** Asking the model only surfaces Skills the model can currently see. If a Skill uses `paths:` (see "Optional: gate a Skill on file paths" above), it stays out of that listing until a matching file has been touched. The full set is always visible to you via the `/skills` slash command and on disk.
+
+Or browse the full list with the slash command (always shows every Skill, including path-gated ones that have not activated yet):
+
+```text
+/skills
 ```
 
 Or inspect the filesystem:
@@ -148,7 +187,7 @@ ls ~/.qwen/skills/
 # List project Skills (if in a project directory)
 ls .qwen/skills/
 
-# View a specific Skill’s content
+# View a specific Skill's content
 cat ~/.qwen/skills/my-skill/SKILL.md
 ```
 
@@ -156,17 +195,17 @@ cat ~/.qwen/skills/my-skill/SKILL.md
 
 After creating a Skill, test it by asking questions that match your description.
 
-Example: if your description mentions “PDF files”:
+Example: if your description mentions "PDF files":
 
 ```text
 Can you help me extract text from this PDF?
 ```
 
-The model autonomously decides to use your Skill if it matches the request — you don’t need to explicitly invoke it.
+The model autonomously decides to use your Skill if it matches the request — you don't need to explicitly invoke it.
 
 ## Debug a Skill
 
-If Qwen Code doesn’t use your Skill, check these common issues:
+If Qwen Code doesn't use your Skill, check these common issues:
 
 ### Make the description specific
 
@@ -214,7 +253,7 @@ Ensure:
 Run Qwen Code with debug mode to see Skill loading errors:
 
 ```bash
-qwen --experimental-skills --debug
+qwen --debug
 ```
 
 ## Share Skills with your team
@@ -223,7 +262,7 @@ You can share Skills through project repositories:
 
 1. Add the Skill under `.qwen/skills/`
 2. Commit and push
-3. Teammates pull the changes and run with `--experimental-skills`
+3. Teammates pull the changes
 
 ```bash
 git add .qwen/skills/
@@ -264,8 +303,8 @@ git commit -m "Remove unused Skill"
 
 One Skill should address one capability:
 
-- Focused: “PDF form filling”, “Excel analysis”, “Git commit messages”
-- Too broad: “Document processing” (split into smaller Skills)
+- Focused: "PDF form filling", "Excel analysis", "Git commit messages"
+- Too broad: "Document processing" (split into smaller Skills)
 
 ### Write clear descriptions
 

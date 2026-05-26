@@ -7,17 +7,21 @@
 import crypto from 'crypto';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import * as os from 'os';
-
+import type { ChildProcess } from 'node:child_process';
 import open from 'open';
 import { EventEmitter } from 'events';
 import type { Config } from '../config/config.js';
 import { randomUUID } from 'node:crypto';
+import { formatFetchErrorForUser } from '../utils/fetch.js';
+import { createDebugLogger } from '../utils/debugLogger.js';
 import {
   SharedTokenManager,
   TokenManagerError,
   TokenError,
 } from './sharedTokenManager.js';
+import { Storage } from '../config/storage.js';
+
+const debugLogger = createDebugLogger('QWEN_OAUTH');
 
 // OAuth Endpoints
 const QWEN_OAUTH_BASE_URL = 'https://chat.qwen.ai';
@@ -32,7 +36,6 @@ const QWEN_OAUTH_SCOPE = 'openid profile email model.completion';
 const QWEN_OAUTH_GRANT_TYPE = 'urn:ietf:params:oauth:grant-type:device_code';
 
 // File System Configuration
-const QWEN_DIR = '.qwen';
 const QWEN_CREDENTIAL_FILENAME = 'oauth_creds.json';
 
 /**
@@ -103,6 +106,44 @@ export class CredentialsClearRequiredError extends Error {
   ) {
     super(message);
     this.name = 'CredentialsClearRequiredError';
+  }
+}
+
+/**
+ * Typed error thrown by `QwenOAuth2Client.pollDeviceToken` for upstream
+ * RFC 8628 errors that aren't `authorization_pending` / `slow_down`.
+ *
+ * Earlier the class threw a plain `Error` with the OAuth code embedded
+ * in the message text; downstream callers (notably PR #4255's
+ * device-flow registry provider) had to substring-match the message
+ * to extract the error code, an implicit cross-file contract that
+ * silently degrades to `upstream_error` if the message format ever
+ * changes. The structured `oauthError` / `description` / `status`
+ * fields make the contract explicit + type-checked.
+ *
+ * The thrown `message` keeps the same `"Device token poll failed:
+ * ${error} - ${description}"` shape so existing log-parsing /
+ * substring-matching code continues to work; new code should branch
+ * on `instanceof QwenOAuthPollError` + read fields directly.
+ */
+export class QwenOAuthPollError extends Error {
+  readonly status?: number;
+  readonly oauthError?: string;
+  readonly description?: string;
+  constructor(opts: {
+    oauthError?: string;
+    description?: string;
+    status?: number;
+  }) {
+    super(
+      `Device token poll failed: ${opts.oauthError ?? 'Unknown error'} - ${
+        opts.description ?? '(no description)'
+      }`,
+    );
+    this.name = 'QwenOAuthPollError';
+    this.oauthError = opts.oauthError;
+    this.description = opts.description;
+    this.status = opts.status;
   }
 }
 
@@ -234,15 +275,21 @@ export interface IQwenOAuth2Client {
   setCredentials(credentials: QwenCredentials): void;
   getCredentials(): QwenCredentials;
   getAccessToken(): Promise<{ token?: string }>;
-  requestDeviceAuthorization(options: {
-    scope: string;
-    code_challenge: string;
-    code_challenge_method: string;
-  }): Promise<DeviceAuthorizationResponse>;
-  pollDeviceToken(options: {
-    device_code: string;
-    code_verifier: string;
-  }): Promise<DeviceTokenResponse>;
+  requestDeviceAuthorization(
+    options: {
+      scope: string;
+      code_challenge: string;
+      code_challenge_method: string;
+    },
+    fetchOpts?: { signal?: AbortSignal },
+  ): Promise<DeviceAuthorizationResponse>;
+  pollDeviceToken(
+    options: {
+      device_code: string;
+      code_verifier: string;
+    },
+    fetchOpts?: { signal?: AbortSignal },
+  ): Promise<DeviceTokenResponse>;
   refreshAccessToken(): Promise<TokenRefreshResponse>;
 }
 
@@ -272,7 +319,10 @@ export class QwenOAuth2Client implements IQwenOAuth2Client {
       const credentials = await this.sharedManager.getValidCredentials(this);
       return { token: credentials.access_token };
     } catch (error) {
-      console.warn('Failed to get access token from shared manager:', error);
+      debugLogger.warn(
+        'Failed to get access token from shared manager:',
+        error,
+      );
 
       // Don't use fallback to local credentials to prevent race conditions
       // All token management should go through SharedTokenManager for consistency
@@ -281,11 +331,14 @@ export class QwenOAuth2Client implements IQwenOAuth2Client {
     }
   }
 
-  async requestDeviceAuthorization(options: {
-    scope: string;
-    code_challenge: string;
-    code_challenge_method: string;
-  }): Promise<DeviceAuthorizationResponse> {
+  async requestDeviceAuthorization(
+    options: {
+      scope: string;
+      code_challenge: string;
+      code_challenge_method: string;
+    },
+    fetchOpts?: { signal?: AbortSignal },
+  ): Promise<DeviceAuthorizationResponse> {
     const bodyData = {
       client_id: QWEN_OAUTH_CLIENT_ID,
       scope: options.scope,
@@ -301,6 +354,12 @@ export class QwenOAuth2Client implements IQwenOAuth2Client {
         'x-request-id': randomUUID(),
       },
       body: objectToUrlEncoded(bodyData),
+      // PR #4255 — daemon device-flow registry passes its
+      // `cancelController.signal` so dispose / cancel during a slow
+      // device-authorization request actually aborts the in-flight
+      // socket immediately. Pre-existing CLI callers omit it; the
+      // optional shape preserves backward compatibility.
+      ...(fetchOpts?.signal ? { signal: fetchOpts.signal } : {}),
     });
 
     if (!response.ok) {
@@ -311,7 +370,28 @@ export class QwenOAuth2Client implements IQwenOAuth2Client {
     }
 
     const result = (await response.json()) as DeviceAuthorizationResponse;
-    console.debug('Device authorization result:', result);
+    // PR #4255 fold-in 9 review thread #12: do NOT log the full
+    // result. `device_code` is an RFC 8628 bearer-equivalent
+    // credential — anyone holding it within the grant's lifetime
+    // can complete the token exchange. The daemon device-flow
+    // registry's `BrandedSecret` keeps `device_code` out of HTTP
+    // bodies / events / logs, but a debug-mode `console.log(result)`
+    // here would write the raw `device_code` to stderr / journald,
+    // bypassing the entire redaction layer. Log only the
+    // operationally-useful timing fields (size + presence of error
+    // envelope + lifetimes); secrets stay in memory.
+    if (isDeviceAuthorizationSuccess(result)) {
+      debugLogger.debug('Device authorization result (sanitized):', {
+        ok: true,
+        expires_in: result.expires_in,
+      });
+    } else {
+      const errorData = result as ErrorData;
+      debugLogger.debug('Device authorization result (sanitized):', {
+        ok: false,
+        error: errorData?.error,
+      });
+    }
 
     // Check if the response indicates success
     if (!isDeviceAuthorizationSuccess(result)) {
@@ -324,10 +404,13 @@ export class QwenOAuth2Client implements IQwenOAuth2Client {
     return result;
   }
 
-  async pollDeviceToken(options: {
-    device_code: string;
-    code_verifier: string;
-  }): Promise<DeviceTokenResponse> {
+  async pollDeviceToken(
+    options: {
+      device_code: string;
+      code_verifier: string;
+    },
+    fetchOpts?: { signal?: AbortSignal },
+  ): Promise<DeviceTokenResponse> {
     const bodyData = {
       grant_type: QWEN_OAUTH_GRANT_TYPE,
       client_id: QWEN_OAUTH_CLIENT_ID,
@@ -342,6 +425,11 @@ export class QwenOAuth2Client implements IQwenOAuth2Client {
         Accept: 'application/json',
       },
       body: objectToUrlEncoded(bodyData),
+      // PR #4255 — daemon device-flow registry passes its per-entry
+      // `cancelController.signal` so cancel() / dispose() during a
+      // slow IdP response actually aborts the in-flight socket
+      // instead of waiting for the upstream timeout.
+      ...(fetchOpts?.signal ? { signal: fetchOpts.signal } : {}),
     });
 
     if (!response.ok) {
@@ -380,12 +468,16 @@ export class QwenOAuth2Client implements IQwenOAuth2Client {
 
       // Handle other 400 errors (access_denied, expired_token, etc.) as real errors
 
-      // For other errors, throw with proper error information
-      const error = new Error(
-        `Device token poll failed: ${errorData.error || 'Unknown error'} - ${errorData.error_description}`,
-      );
-      (error as Error & { status?: number }).status = response.status;
-      throw error;
+      // For other errors, throw a typed `QwenOAuthPollError` so
+      // downstream callers (PR #4255 device-flow registry) can branch
+      // on `instanceof` + structured fields instead of substring-
+      // matching the message text. The message format is preserved
+      // for log-readers + any pre-existing substring matchers.
+      throw new QwenOAuthPollError({
+        oauthError: errorData.error,
+        description: errorData.error_description,
+        status: response.status,
+      });
     }
 
     return (await response.json()) as DeviceTokenResponse;
@@ -413,8 +505,8 @@ export class QwenOAuth2Client implements IQwenOAuth2Client {
 
     if (!response.ok) {
       const errorData = await response.text();
-      // Handle 400 errors which might indicate refresh token expiry
-      if (response.status === 400) {
+      // Handle 400/401 errors which indicate refresh token expiry or invalidity
+      if (response.status === 400 || response.status === 401) {
         await clearQwenCredentials();
         throw new CredentialsClearRequiredError(
           "Refresh token expired or invalid. Please use '/auth' to re-authenticate.",
@@ -426,7 +518,21 @@ export class QwenOAuth2Client implements IQwenOAuth2Client {
       );
     }
 
-    const responseData = (await response.json()) as TokenRefreshResponse;
+    let responseText: string;
+    try {
+      responseText = await response.text();
+    } catch {
+      responseText = '';
+    }
+
+    let responseData: TokenRefreshResponse;
+    try {
+      responseData = JSON.parse(responseText) as TokenRefreshResponse;
+    } catch {
+      throw new Error(
+        `Qwen OAuth refresh returned invalid JSON: ${responseText || '(empty response body)'}`,
+      );
+    }
 
     // Check if the response indicates success
     if (isErrorResponse(responseData)) {
@@ -497,26 +603,28 @@ export async function getQwenOAuthClient(
     if (error instanceof TokenManagerError) {
       switch (error.type) {
         case TokenError.NO_REFRESH_TOKEN:
-          console.debug(
+          debugLogger.debug(
             'No refresh token available, proceeding with device flow',
           );
           break;
         case TokenError.REFRESH_FAILED:
-          console.debug('Token refresh failed, proceeding with device flow');
+          debugLogger.debug(
+            'Token refresh failed, proceeding with device flow',
+          );
           break;
         case TokenError.NETWORK_ERROR:
-          console.warn(
+          debugLogger.warn(
             'Network error during token refresh, trying device flow',
           );
           break;
         default:
-          console.warn('Token manager error:', (error as Error).message);
+          debugLogger.warn('Token manager error:', (error as Error).message);
       }
     }
 
     if (options?.requireCachedCredentials) {
       throw new Error(
-        'No cached Qwen-OAuth credentials found. Please re-authenticate.',
+        'Qwen OAuth credentials expired. Please use /auth to re-authenticate with qwen-oauth.',
       );
     }
 
@@ -558,6 +666,109 @@ export async function getQwenOAuthClient(
   }
 }
 
+/**
+ * Displays a formatted box with OAuth device authorization URL.
+ * Uses process.stderr.write() to ensure the auth URL is always visible to users,
+ * especially in non-interactive mode. Using stderr prevents corruption of
+ * structured JSON output (which goes to stdout) and follows the standard Unix
+ * convention of user-facing messages to stderr.
+ */
+function showFallbackMessage(verificationUriComplete: string): void {
+  const title = 'Qwen OAuth Device Authorization';
+  const url = verificationUriComplete;
+  const minWidth = 70;
+  const maxWidth = 80;
+  const boxWidth = Math.min(Math.max(title.length + 4, minWidth), maxWidth);
+
+  // Calculate the width needed for the box (account for padding)
+  const contentWidth = boxWidth - 4; // Subtract 2 spaces and 2 border chars
+
+  // Helper to wrap text to fit within box width
+  const wrapText = (text: string, width: number): string[] => {
+    // For URLs, break at any character if too long
+    if (text.startsWith('http://') || text.startsWith('https://')) {
+      const lines: string[] = [];
+      for (let i = 0; i < text.length; i += width) {
+        lines.push(text.substring(i, i + width));
+      }
+      return lines;
+    }
+
+    // For regular text, break at word boundaries
+    const words = text.split(' ');
+    const lines: string[] = [];
+    let currentLine = '';
+
+    for (const word of words) {
+      if (currentLine.length + word.length + 1 <= width) {
+        currentLine += (currentLine ? ' ' : '') + word;
+      } else {
+        if (currentLine) {
+          lines.push(currentLine);
+        }
+        currentLine = word.length > width ? word.substring(0, width) : word;
+      }
+    }
+    if (currentLine) {
+      lines.push(currentLine);
+    }
+    return lines;
+  };
+
+  // Build the box borders with title centered in top border
+  // Format: +--- Title ---+
+  const titleWithSpaces = ' ' + title + ' ';
+  const totalDashes = boxWidth - 2 - titleWithSpaces.length; // Subtract corners and title
+  const leftDashes = Math.floor(totalDashes / 2);
+  const rightDashes = totalDashes - leftDashes;
+  const topBorder =
+    '+' +
+    '-'.repeat(leftDashes) +
+    titleWithSpaces +
+    '-'.repeat(rightDashes) +
+    '+';
+  const emptyLine = '|' + ' '.repeat(boxWidth - 2) + '|';
+  const bottomBorder = '+' + '-'.repeat(boxWidth - 2) + '+';
+
+  // Build content lines
+  const instructionLines = wrapText(
+    'Please visit the following URL in your browser to authorize:',
+    contentWidth,
+  );
+  const urlLines = wrapText(url, contentWidth);
+  const waitingLine = 'Waiting for authorization to complete...';
+
+  // Write the box
+  process.stderr.write('\n' + topBorder + '\n');
+  process.stderr.write(emptyLine + '\n');
+
+  // Write instructions
+  for (const line of instructionLines) {
+    process.stderr.write(
+      '| ' + line + ' '.repeat(contentWidth - line.length) + ' |\n',
+    );
+  }
+
+  process.stderr.write(emptyLine + '\n');
+
+  // Write URL
+  for (const line of urlLines) {
+    process.stderr.write(
+      '| ' + line + ' '.repeat(contentWidth - line.length) + ' |\n',
+    );
+  }
+
+  process.stderr.write(emptyLine + '\n');
+
+  // Write waiting message
+  process.stderr.write(
+    '| ' + waitingLine + ' '.repeat(contentWidth - waitingLine.length) + ' |\n',
+  );
+
+  process.stderr.write(emptyLine + '\n');
+  process.stderr.write(bottomBorder + '\n\n');
+}
+
 async function authWithQwenDeviceFlow(
   client: QwenOAuth2Client,
   config: Config,
@@ -570,6 +781,56 @@ async function authWithQwenDeviceFlow(
   };
   qwenOAuth2Events.once(QwenOAuth2Event.AuthCancel, cancelHandler);
 
+  // Helper to check cancellation and return appropriate result
+  const checkCancellation = (): AuthResult | null => {
+    if (!isCancelled) {
+      return null;
+    }
+    const message = 'Authentication cancelled by user.';
+    debugLogger.debug('\n' + message);
+    qwenOAuth2Events.emit(QwenOAuth2Event.AuthProgress, 'error', message);
+    return { success: false, reason: 'cancelled', message };
+  };
+
+  // Helper to emit auth progress events
+  const emitAuthProgress = (
+    status: 'polling' | 'success' | 'error' | 'timeout' | 'rate_limit',
+    message: string,
+  ): void => {
+    qwenOAuth2Events.emit(QwenOAuth2Event.AuthProgress, status, message);
+  };
+
+  // Helper to handle browser launch with error handling
+  const launchBrowser = async (url: string): Promise<void> => {
+    let childProcess: ChildProcess | undefined;
+
+    try {
+      // Call open and get the process
+      childProcess = await open(url);
+
+      // CRITICAL FIX: Attach error listener IMMEDIATELY if a process object exists.
+      // We do this outside the 'if' check scope to ensure it's bound as soon as possible.
+      if (childProcess && typeof childProcess.on === 'function') {
+        childProcess.on('error', (err: Error) => {
+          debugLogger.warn(`Browser launch process error: ${err.message}`);
+          debugLogger.info(`Please open this URL manually: ${url}`);
+        });
+
+        // Optional: Also listen for 'close' or 'exit' if needed for cleanup,
+        // but 'error' is the main crasher.
+      } else {
+        // Fallback: If open() didn't return a valid process object, log a warning
+        debugLogger.debug(
+          'open() did not return a valid child process object.',
+        );
+      }
+    } catch (err) {
+      // Handle synchronous errors or promise rejections from open()
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      debugLogger.warn(`Failed to open browser automatically: ${errorMessage}`);
+      debugLogger.info(`Please open this URL manually: ${url}`);
+    }
+  };
   try {
     // Generate PKCE code verifier and challenge
     const { code_verifier, code_challenge } = generatePKCEPair();
@@ -592,48 +853,17 @@ async function authWithQwenDeviceFlow(
     // Emit device authorization event for UI integration immediately
     qwenOAuth2Events.emit(QwenOAuth2Event.AuthUri, deviceAuth);
 
-    const showFallbackMessage = () => {
-      console.log('\n=== Qwen OAuth Device Authorization ===');
-      console.log(
-        'Please visit the following URL in your browser to authorize:',
-      );
-      console.log(`\n${deviceAuth.verification_uri_complete}\n`);
-      console.log('Waiting for authorization to complete...\n');
-    };
-
-    // If browser launch is not suppressed, try to open the URL
-    if (!config.isBrowserLaunchSuppressed()) {
-      try {
-        const childProcess = await open(deviceAuth.verification_uri_complete);
-
-        // IMPORTANT: Attach an error handler to the returned child process.
-        // Without this, if `open` fails to spawn a process (e.g., `xdg-open` is not found
-        // in a minimal Docker container), it will emit an unhandled 'error' event,
-        // causing the entire Node.js process to crash.
-        if (childProcess) {
-          childProcess.on('error', () => {
-            console.debug(
-              'Failed to open browser. Visit this URL to authorize:',
-            );
-            showFallbackMessage();
-          });
-        }
-      } catch (_err) {
-        showFallbackMessage();
-      }
-    } else {
-      // Browser launch is suppressed, show fallback message
-      showFallbackMessage();
+    if (config.isBrowserLaunchSuppressed() || !config.isInteractive()) {
+      showFallbackMessage(deviceAuth.verification_uri_complete);
     }
 
-    // Emit auth progress event
-    qwenOAuth2Events.emit(
-      QwenOAuth2Event.AuthProgress,
-      'polling',
-      'Waiting for authorization...',
-    );
+    // Try to open browser if not suppressed
+    if (!config.isBrowserLaunchSuppressed()) {
+      await launchBrowser(deviceAuth.verification_uri_complete);
+    }
 
-    console.debug('Waiting for authorization...\n');
+    emitAuthProgress('polling', 'Waiting for authorization...');
+    debugLogger.debug('Waiting for authorization...\n');
 
     // Poll for the token
     let pollInterval = 2000; // 2 seconds, can be increased if slow_down is received
@@ -643,15 +873,13 @@ async function authWithQwenDeviceFlow(
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       // Check if authentication was cancelled
-      if (isCancelled) {
-        const message = 'Authentication cancelled by user.';
-        console.debug('\n' + message);
-        qwenOAuth2Events.emit(QwenOAuth2Event.AuthProgress, 'error', message);
-        return { success: false, reason: 'cancelled', message };
+      const cancellationResult = checkCancellation();
+      if (cancellationResult) {
+        return cancellationResult;
       }
 
       try {
-        console.debug('polling for token...');
+        debugLogger.debug('polling for token...');
         const tokenResponse = await client.pollDeviceToken({
           device_code: deviceAuth.device_code,
           code_verifier,
@@ -674,30 +902,21 @@ async function authWithQwenDeviceFlow(
 
           client.setCredentials(credentials);
 
-          // Cache the new tokens
+          // Cache the new tokens. `cacheQwenCredentials` itself folds
+          // in `SharedTokenManager.clearCache()` (PR #4255 review D1) so
+          // we no longer need a paired call here — the previous explicit
+          // post-cache clear was a duplicate that fired clearCache twice
+          // on the success path.
           await cacheQwenCredentials(credentials);
 
-          // IMPORTANT:
-          // SharedTokenManager maintains an in-memory cache and throttles file checks.
-          // If we only write the creds file here, a subsequent `getQwenOAuthClient()`
-          // call in the same process (within the throttle window) may not re-read the
-          // updated file and could incorrectly re-trigger device auth.
-          // Clearing the cache forces the next call to reload from disk.
-          try {
-            SharedTokenManager.getInstance().clearCache();
-          } catch {
-            // In unit tests we sometimes mock SharedTokenManager.getInstance() with a
-            // minimal stub; cache invalidation is best-effort and should not break auth.
-          }
-
-          // Emit auth progress success event
-          qwenOAuth2Events.emit(
-            QwenOAuth2Event.AuthProgress,
+          emitAuthProgress(
             'success',
             'Authentication successful! Access token obtained.',
           );
 
-          console.debug('Authentication successful! Access token obtained.');
+          debugLogger.debug(
+            'Authentication successful! Access token obtained.',
+          );
           return { success: true };
         }
 
@@ -708,16 +927,14 @@ async function authWithQwenDeviceFlow(
           // Handle slow_down error by increasing poll interval
           if (pendingData.slowDown) {
             pollInterval = Math.min(pollInterval * 1.5, 10000); // Increase by 50%, max 10 seconds
-            console.debug(
+            debugLogger.debug(
               `\nServer requested to slow down, increasing poll interval to ${pollInterval}ms'`,
             );
           } else {
             pollInterval = 2000; // Reset to default interval
           }
 
-          // Emit polling progress event
-          qwenOAuth2Events.emit(
-            QwenOAuth2Event.AuthProgress,
+          emitAuthProgress(
             'polling',
             `Polling... (attempt ${attempt + 1}/${maxAttempts})`,
           );
@@ -747,15 +964,9 @@ async function authWithQwenDeviceFlow(
           });
 
           // Check for cancellation after waiting
-          if (isCancelled) {
-            const message = 'Authentication cancelled by user.';
-            console.debug('\n' + message);
-            qwenOAuth2Events.emit(
-              QwenOAuth2Event.AuthProgress,
-              'error',
-              message,
-            );
-            return { success: false, reason: 'cancelled', message };
+          const cancellationResult = checkCancellation();
+          if (cancellationResult) {
+            return cancellationResult;
           }
 
           continue;
@@ -783,14 +994,15 @@ async function authWithQwenDeviceFlow(
           message: string,
           eventType: 'error' | 'rate_limit' = 'error',
         ): AuthResult => {
-          qwenOAuth2Events.emit(
-            QwenOAuth2Event.AuthProgress,
-            eventType,
-            message,
-          );
-          console.error('\n' + message);
+          emitAuthProgress(eventType, message);
           return { success: false, reason, message };
         };
+
+        // Check for cancellation first
+        const cancellationResult = checkCancellation();
+        if (cancellationResult) {
+          return cancellationResult;
+        }
 
         // Handle credential caching failures - stop polling immediately
         if (errorMessage.includes('Failed to cache credentials')) {
@@ -815,32 +1027,22 @@ async function authWithQwenDeviceFlow(
         }
 
         const message = `Error polling for token: ${errorMessage}`;
-        qwenOAuth2Events.emit(QwenOAuth2Event.AuthProgress, 'error', message);
-
-        if (isCancelled) {
-          const message = 'Authentication cancelled by user.';
-          return { success: false, reason: 'cancelled', message };
-        }
+        emitAuthProgress('error', message);
 
         await new Promise((resolve) => setTimeout(resolve, pollInterval));
       }
     }
 
     const timeoutMessage = 'Authorization timeout, please restart the process.';
-
-    // Emit timeout error event
-    qwenOAuth2Events.emit(
-      QwenOAuth2Event.AuthProgress,
-      'timeout',
-      timeoutMessage,
-    );
-
-    console.error('\n' + timeoutMessage);
+    emitAuthProgress('timeout', timeoutMessage);
     return { success: false, reason: 'timeout', message: timeoutMessage };
   } catch (error: unknown) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    const message = `Device authorization flow failed: ${errorMessage}`;
-    console.error(message);
+    const fullErrorMessage = formatFetchErrorForUser(error, {
+      url: QWEN_OAUTH_BASE_URL,
+    });
+    const message = `Device authorization flow failed: ${fullErrorMessage}`;
+
+    emitAuthProgress('error', message);
     return { success: false, reason: 'error', message };
   } finally {
     // Clean up event listener
@@ -848,13 +1050,120 @@ async function authWithQwenDeviceFlow(
   }
 }
 
-async function cacheQwenCredentials(credentials: QwenCredentials) {
+// PR 21 (#4175 Wave 4): exported so the `qwen serve` device-flow registry can
+// persist credentials acquired through the daemon's HTTP route. Mode 0o600
+// matches opencode's `auth.json` to keep tokens unreadable by other users on
+// shared hosts. The constant is exported so tests/auditors can assert intent
+// rather than re-deriving it from a raw octal literal.
+export const QWEN_CREDENTIAL_FILE_MODE = 0o600;
+
+export async function cacheQwenCredentials(
+  credentials: QwenCredentials,
+  opts?: { signal?: AbortSignal },
+) {
   const filePath = getQwenCachedCredentialPath();
   try {
     await fs.mkdir(path.dirname(filePath), { recursive: true });
 
     const credString = JSON.stringify(credentials, null, 2);
-    await fs.writeFile(filePath, credString);
+    // PR #4255 round-11 #2 (gpt-5.5 review): atomic write with
+    // permission hardening BEFORE the secret payload becomes
+    // accessible at the canonical filename. The earlier shape was
+    //   1. fs.writeFile(filePath, creds, {mode: 0o600})  ← creates
+    //      with 0o600 OR retains existing broader perms
+    //   2. fs.chmod(filePath, 0o600)                     ← post-hoc
+    //      tightening
+    // which left a window where, if `oauth_creds.json` already
+    // existed with broader perms (operator pre-creation, prior
+    // version's looser write), the freshly-written tokens were
+    // momentarily readable by other principals before the chmod
+    // closed the gap. A chmod failure on POSIX previously degraded
+    // to a warning while the broadly-readable tokens stayed.
+    //
+    // New shape: write to a temp file (created with 0o600 atomically
+    // via the `mode` flag — which DOES apply on creation since the
+    // path didn't exist), verify perms, then `rename` over the
+    // canonical filename. `fs.rename` is atomic on POSIX (within a
+    // filesystem) and on Windows. The canonical filename never
+    // contains the new tokens until they're already at 0o600.
+    //
+    // PR #4255 fold-in 3 (#10): `signal` threading is preserved —
+    // both `writeFile` AND the temp-file path honor the registry's
+    // persist-timeout + cancelController.
+    const tempPath = `${filePath}.tmp.${process.pid}.${randomUUID()}`;
+    try {
+      await fs.writeFile(tempPath, credString, {
+        mode: QWEN_CREDENTIAL_FILE_MODE,
+        ...(opts?.signal ? { signal: opts.signal } : {}),
+      });
+      // Defensive: if the platform ignored `mode` on creation
+      // (some Windows FSes), explicit chmod tightens the temp BEFORE
+      // it's renamed into place. Failure here is a HARD ERROR — we
+      // refuse to publish broadly-readable tokens to the canonical
+      // path. A non-cooperative FS that can't tighten a 0o600 file
+      // shouldn't be serving credentials anyway.
+      try {
+        await fs.chmod(tempPath, QWEN_CREDENTIAL_FILE_MODE);
+      } catch (chmodErr) {
+        if (process.platform !== 'win32') {
+          throw new Error(
+            `cacheQwenCredentials: refusing to publish credentials — chmod 0o${QWEN_CREDENTIAL_FILE_MODE.toString(8)} on temp file failed: ${
+              chmodErr instanceof Error ? chmodErr.message : String(chmodErr)
+            }`,
+          );
+        }
+        // Windows: chmod's a no-op on most NTFS volumes; permissions
+        // there go through ACLs which we don't manage from here.
+        // Surface a debug breadcrumb for operators on exotic Windows
+        // filesystems but allow the rename to proceed.
+        debugLogger.warn(
+          `cacheQwenCredentials: chmod 0o${QWEN_CREDENTIAL_FILE_MODE.toString(8)} on Windows temp file ${tempPath} failed; relying on NTFS ACL: ${
+            chmodErr instanceof Error ? chmodErr.message : String(chmodErr)
+          }`,
+        );
+      }
+      // Atomic rename. Replaces any existing file at `filePath` in
+      // a single inode swap; readers either see the old creds or
+      // the new creds, never a partial mix.
+      await fs.rename(tempPath, filePath);
+    } catch (writeErr) {
+      // Best-effort cleanup of the temp file — if rename succeeded
+      // there's nothing to clean (path no longer points anywhere);
+      // if it failed there's a leftover .tmp.<pid>.<uuid> file we
+      // shouldn't leave on disk. Swallow ENOENT (already-renamed)
+      // and any other unlink errors since they're not user-actionable.
+      try {
+        await fs.unlink(tempPath);
+      } catch {
+        /* best-effort */
+      }
+      throw writeErr;
+    }
+    // SharedTokenManager throttles file checks and serves an in-memory cache;
+    // without an explicit invalidation a follow-up `getValidCredentials` in
+    // the same process can stay on the previous (often empty) cache and
+    // re-trigger device auth despite the just-written file. The original
+    // device-flow site (L820+L829) paired write+clear; folding the clear
+    // here keeps every caller (#4255 daemon device-flow registry included)
+    // correct without re-pairing the call.
+    try {
+      SharedTokenManager.getInstance().clearCache();
+    } catch (clearErr) {
+      // In production, a failed cache clear means subsequent
+      // `getValidCredentials` reads in the same process may serve
+      // stale (pre-write) credentials until the SharedTokenManager
+      // mtime watcher catches up. That's a recoverable degradation
+      // (worst case: device auth re-prompts), but the silent swallow
+      // it used to be made the symptom invisible. Warn so logs show
+      // it. Unit tests stubbing `SharedTokenManager.getInstance()`
+      // with a minimal shape will also flow through here — acceptable
+      // noise for the production-visibility win.
+      debugLogger.warn(
+        `cacheQwenCredentials: SharedTokenManager.clearCache failed; in-process callers may serve stale credentials until the next mtime poll: ${
+          clearErr instanceof Error ? clearErr.message : String(clearErr)
+        }`,
+      );
+    }
   } catch (error: unknown) {
     // Handle file system errors (e.g., EACCES permission denied)
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -884,7 +1193,7 @@ export async function clearQwenCredentials(): Promise<void> {
   try {
     const filePath = getQwenCachedCredentialPath();
     await fs.unlink(filePath);
-    console.debug('Cached Qwen credentials cleared successfully.');
+    debugLogger.debug('Cached Qwen credentials cleared successfully.');
   } catch (error: unknown) {
     // If file doesn't exist or can't be deleted, we consider it cleared
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
@@ -892,7 +1201,10 @@ export async function clearQwenCredentials(): Promise<void> {
       return;
     }
     // Log other errors but don't throw - clearing credentials should be non-critical
-    console.warn('Warning: Failed to clear cached Qwen credentials:', error);
+    debugLogger.warn(
+      'Warning: Failed to clear cached Qwen credentials:',
+      error,
+    );
   } finally {
     // Also clear SharedTokenManager in-memory cache to prevent stale credentials
     // from being reused within the same process after the file is removed.
@@ -905,7 +1217,7 @@ export async function clearQwenCredentials(): Promise<void> {
 }
 
 function getQwenCachedCredentialPath(): string {
-  return path.join(os.homedir(), QWEN_DIR, QWEN_CREDENTIAL_FILENAME);
+  return path.join(Storage.getGlobalQwenDir(), QWEN_CREDENTIAL_FILENAME);
 }
 
 export const clearCachedCredentialFile = clearQwenCredentials;
