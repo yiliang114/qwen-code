@@ -4107,15 +4107,9 @@ export class Session implements SessionContext {
           shouldStopForLoop ||= r.loopDetected === true;
         }
         if (shouldStopForLoop) {
-          if (shouldStop) {
-            await appendSkippedAfter(
-              parts,
-              batch.calls[batch.calls.length - 1],
-            );
-          }
           return {
             parts,
-            stopAfterPermissionCancel: shouldStop,
+            stopAfterPermissionCancel: false,
             loopDetected: true,
           };
         }
