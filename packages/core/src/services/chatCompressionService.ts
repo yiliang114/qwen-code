@@ -751,9 +751,21 @@ export class ChatCompressionService {
         compressionOutputTokenCount > 0
       ) {
         canCalculateNewTokenCount = true;
+        // When the pending tool result was included in the side-query,
+        // compressionInputTokenCount includes its size but
+        // originalTokenCount (the previous API call's prompt size) does
+        // not. Add the pending tool result's estimated size so the
+        // formula doesn't produce an artificially low newTokenCount
+        // (#6651 review).
+        const pendingTokens = pendingToolResult
+          ? estimateContentTokens(
+              [opts.pendingUserMessage!],
+              slimmingConfig.imageTokenEstimate,
+            )
+          : 0;
         newTokenCount = Math.max(
           0,
-          originalTokenCount -
+          originalTokenCount + pendingTokens -
             (compressionInputTokenCount - 1000) +
             compressionOutputTokenCount,
         );

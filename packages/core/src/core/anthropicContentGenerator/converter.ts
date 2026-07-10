@@ -135,6 +135,14 @@ export class AnthropicContentConverter {
 
     this.processContents(request.contents, messages);
 
+    // Merge consecutive assistant messages before thinking-specific
+    // post-processing so strip/normalize/inject operate on the final
+    // merged turn. If strip ran first, it would preserve thinking-only
+    // turns to avoid empty content, then merge would attach that thinking
+    // to a following tool_use turn — leaking thinking into a no-thinking
+    // request (#6651 review).
+    messages = mergeConsecutiveAssistantMessages(messages);
+
     if (options.stripAssistantThinking) {
       this.stripThinkingFromAssistantMessages(messages);
     }
@@ -147,17 +155,11 @@ export class AnthropicContentConverter {
       this.injectEmptyThinkingOnToolUseTurns(messages);
     }
 
-    // Merge consecutive assistant messages and clean orphaned tool calls.
-    // When the Gemini history has consecutive model turns (e.g. from
-    // streaming chunk-level recording, max_tokens recovery, or adaptive
-    // thinking splits), processContent emits one Anthropic message per
-    // Content. The Anthropic API requires that tool_use blocks be
-    // immediately followed by tool_result blocks in the next message —
-    // consecutive assistant messages break this pairing and cause HTTP 400
-    // "tool_use ids were found without tool_result blocks immediately
-    // after". Mirrors the same functions in the OpenAI converter.
-    messages = mergeConsecutiveAssistantMessages(messages);
+    // Clean orphaned tool_use/tool_result blocks, then merge consecutive
+    // messages of both roles to fix alternation issues created by dropped
+    // messages. Mirrors the pipeline in the OpenAI converter.
     messages = cleanOrphanedToolCalls(messages);
+    messages = mergeConsecutiveUserMessages(messages);
     messages = mergeConsecutiveAssistantMessages(messages);
 
     // Add cache_control to enable prompt caching (if enabled). Prefer the
@@ -930,13 +932,51 @@ function mergeConsecutiveAssistantMessages(
 }
 
 /**
- * Remove tool_use blocks that have no matching tool_result in the
- * immediately following user message, and remove tool_result blocks that
- * have no matching tool_use in the immediately preceding assistant message.
+ * Merge consecutive user messages into a single message.
  *
- * Empty messages produced by the cleanup are dropped entirely. A subsequent
- * mergeConsecutiveAssistantMessages call fixes any alternation issues
- * created by dropped messages.
+ * After {@link cleanOrphanedToolCalls} drops messages, consecutive user
+ * messages may appear. The Anthropic API requires alternating user/assistant
+ * roles, so these must be merged.
+ */
+function mergeConsecutiveUserMessages(
+  messages: AnthropicMessageParam[],
+): AnthropicMessageParam[] {
+  const merged: AnthropicMessageParam[] = [];
+
+  for (const message of messages) {
+    if (
+      message.role === 'user' &&
+      merged.length > 0 &&
+      Array.isArray(message.content)
+    ) {
+      const lastMessage = merged[merged.length - 1]!;
+      if (
+        lastMessage.role === 'user' &&
+        Array.isArray(lastMessage.content)
+      ) {
+        const lastBlocks = lastMessage.content as AnthropicContentBlockParam[];
+        const currentBlocks = message.content as AnthropicContentBlockParam[];
+        lastMessage.content = [...lastBlocks, ...currentBlocks];
+        continue;
+      }
+    }
+    merged.push(message);
+  }
+
+  return merged;
+}
+
+/**
+ * user messages, and remove tool_result blocks that have no matching
+ * tool_use in the immediately preceding assistant message.
+ *
+ * Scans forward through consecutive user messages (matching the OpenAI
+ * converter's behavior) so that split tool results across multiple user
+ * turns are all accounted for.
+ *
+ * Empty messages produced by the cleanup are dropped entirely. Subsequent
+ * mergeConsecutiveUserMessages + mergeConsecutiveAssistantMessages calls
+ * fix any alternation issues created by dropped messages.
  *
  * Mirrors the same-name function in the OpenAI converter.
  */
@@ -961,14 +1001,13 @@ function cleanOrphanedToolCalls(
     }
     if (toolUseIds.size === 0) continue;
 
-    const nextMessage = messages[i + 1];
+    // Scan forward through consecutive user messages to find all
+    // matching tool_results (matches OpenAI converter behavior).
     const toolResultIds = new Set<string>();
-    if (
-      nextMessage &&
-      nextMessage.role === 'user' &&
-      Array.isArray(nextMessage.content)
-    ) {
-      for (const block of nextMessage.content as AnthropicContentBlockParam[]) {
+    for (let j = i + 1; j < messages.length; j++) {
+      const next = messages[j]!;
+      if (next.role !== 'user' || !Array.isArray(next.content)) break;
+      for (const block of next.content as AnthropicContentBlockParam[]) {
         if ((block as { type?: string }).type === 'tool_result') {
           const id = (block as { tool_use_id?: string }).tool_use_id;
           if (id) toolResultIds.add(id);
