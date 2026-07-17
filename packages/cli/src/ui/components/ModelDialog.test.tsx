@@ -493,6 +493,7 @@ describe('<ModelDialog />', () => {
           description: '',
           authType: AuthType.USE_OPENAI,
           baseUrl: 'https://token-plan.example.com/v1',
+          registryBaseUrl: 'https://token-plan.example.com/v1',
           envKey: 'TOKEN_PLAN_KEY',
         },
         {
@@ -501,6 +502,7 @@ describe('<ModelDialog />', () => {
           description: '',
           authType: AuthType.USE_OPENAI,
           baseUrl: 'https://idealab.example.com/v1',
+          registryBaseUrl: 'https://idealab.example.com/v1',
           envKey: 'IDEALAB_KEY',
         },
       ]),
@@ -537,12 +539,55 @@ describe('<ModelDialog />', () => {
     expect(props.onClose).toHaveBeenCalledTimes(1);
   });
 
-  it('falls back to the picker entry baseUrl when switchModel does not propagate it', async () => {
-    // Regression guard for the `after?.baseUrl ?? selectedEntry?.model.baseUrl`
-    // fallback: if switchModel succeeds but getContentGeneratorConfig returns a
-    // config WITHOUT baseUrl, the disambiguator must still be persisted from the
-    // selected picker entry's baseUrl — otherwise an empty-string tombstone would
-    // be written and the wrong same-id provider would resolve on next launch.
+  it('uses the registry route identity when selecting an implicit provider', async () => {
+    const switchModel = vi.fn().mockResolvedValue(undefined);
+    const defaultBaseUrl = 'https://api.openai.com/v1';
+    const { props, mockSettings } = renderComponent({}, {
+      getModel: vi.fn(() => 'qwen3.7-max'),
+      getAuthType: vi.fn(() => AuthType.USE_OPENAI),
+      switchModel,
+      getAllConfiguredModels: vi.fn(() => [
+        {
+          id: 'qwen3.7-max',
+          label: '[Token Plan] qwen3.7-max',
+          authType: AuthType.USE_OPENAI,
+          baseUrl: 'https://token-plan.example.com/v1',
+          registryBaseUrl: 'https://token-plan.example.com/v1',
+          envKey: 'TOKEN_PLAN_KEY',
+        },
+        {
+          id: 'qwen3.7-max',
+          label: '[Implicit] qwen3.7-max',
+          authType: AuthType.USE_OPENAI,
+          baseUrl: defaultBaseUrl,
+          envKey: 'OPENAI_API_KEY',
+        },
+      ]),
+      getContentGeneratorConfig: vi.fn(() => ({
+        authType: AuthType.USE_OPENAI,
+        model: 'qwen3.7-max',
+        baseUrl: defaultBaseUrl,
+      })),
+    } as unknown as Partial<Config>);
+
+    const selectProps = mockedSelect.mock.calls[0][0];
+    expect(selectProps.initialIndex).toBe(1);
+    await selectProps.onSelect(selectProps.items[1].value);
+
+    expect(switchModel).toHaveBeenCalledWith(
+      AuthType.USE_OPENAI,
+      'qwen3.7-max',
+      { baseUrl: undefined },
+    );
+    expect(mockSettings.setValue).toHaveBeenCalledWith(
+      SettingScope.User,
+      'model.baseUrl',
+      '',
+    );
+    expect(props.onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('persists the selected registry route when the resolved config omits baseUrl', async () => {
     const switchModel = vi.fn().mockResolvedValue(undefined);
     const { props, mockSettings } = renderComponent({}, {
       getModel: vi.fn(() => 'qwen3.7-max'),
@@ -555,6 +600,7 @@ describe('<ModelDialog />', () => {
           description: '',
           authType: AuthType.USE_OPENAI,
           baseUrl: 'https://token-plan.example.com/v1',
+          registryBaseUrl: 'https://token-plan.example.com/v1',
           envKey: 'TOKEN_PLAN_KEY',
         },
         {
@@ -563,11 +609,10 @@ describe('<ModelDialog />', () => {
           description: '',
           authType: AuthType.USE_OPENAI,
           baseUrl: 'https://idealab.example.com/v1',
+          registryBaseUrl: 'https://idealab.example.com/v1',
           envKey: 'IDEALAB_KEY',
         },
       ]),
-      // Resolved config has NO baseUrl, so `after?.baseUrl` is undefined and the
-      // `?? selectedEntry?.model.baseUrl` fallback must supply the disambiguator.
       getContentGeneratorConfig: vi.fn(() => ({
         authType: AuthType.USE_OPENAI,
         model: 'qwen3.7-max',
@@ -585,7 +630,6 @@ describe('<ModelDialog />', () => {
       'model.name',
       'qwen3.7-max',
     );
-    // baseUrl comes from the picker entry, not the (baseUrl-less) resolved config.
     expect(mockSettings.setValue).toHaveBeenCalledWith(
       SettingScope.User,
       'model.baseUrl',
@@ -645,6 +689,7 @@ describe('<ModelDialog />', () => {
               description: '',
               authType: AuthType.USE_OPENAI,
               baseUrl: 'https://api.minimaxi.com/v1',
+              registryBaseUrl: 'https://api.minimaxi.com/v1',
               envKey: 'MINIMAX_API_KEY',
               modalities: { image: true, video: true },
               contextWindowSize: 1000000,

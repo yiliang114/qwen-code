@@ -217,6 +217,60 @@ describe('createWorkspaceProvidersStatusProvider', () => {
     expect(second?.isCurrent).toBe(true);
   });
 
+  it('marks an empty-baseUrl provider as the persisted implicit route', async () => {
+    const provider = createWorkspaceProvidersStatusProvider({ env: {} });
+    await writeUserSettings({
+      security: { auth: { selectedType: 'openai' } },
+      model: { name: 'shared-model', baseUrl: '' },
+      modelProviders: {
+        openai: [
+          {
+            id: 'shared-model',
+            name: 'Shared Proxy',
+            baseUrl: 'https://proxy.example/v1',
+          },
+          {
+            id: 'shared-model',
+            name: 'Shared Default',
+            baseUrl: '',
+          },
+        ],
+      },
+    });
+
+    const result = await provider(workspace, false);
+    const models = result.providers.flatMap((entry) => entry.models);
+    const proxy = models.find((model) => model.name === 'Shared Proxy');
+    const implicit = models.find((model) => model.name === 'Shared Default');
+
+    expect(result.current?.modelId).toBe(implicit?.modelId);
+    expect(proxy?.isCurrent).toBe(false);
+    expect(implicit?.isCurrent).toBe(true);
+  });
+
+  it('removes secret URL parts from the resolver baseUrl', async () => {
+    const provider = createWorkspaceProvidersStatusProvider({
+      env: {
+        OPENAI_BASE_URL:
+          'https://user:password@api.example/v1?api_key=secret#private',
+      },
+    });
+    await writeUserSettings({
+      security: { auth: { selectedType: 'openai' } },
+      model: { name: 'implicit-model', baseUrl: '' },
+      modelProviders: {
+        openai: [{ id: 'implicit-model', name: 'Implicit Model' }],
+      },
+    });
+
+    const result = await provider(workspace, false);
+
+    expect(result.current?.baseUrl).toBe('https://api.example/v1');
+    expect(JSON.stringify(result)).not.toContain('password');
+    expect(JSON.stringify(result)).not.toContain('secret');
+    expect(JSON.stringify(result)).not.toContain('private');
+  });
+
   it('marks the fallback route current for an unmatched explicit endpoint', async () => {
     const provider = createWorkspaceProvidersStatusProvider({ env: {} });
     await writeUserSettings({

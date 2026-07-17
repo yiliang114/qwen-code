@@ -675,7 +675,7 @@ describe('modelConfigUtils', () => {
         const settings = makeMockSettings({
           model: {
             name: 'qwen3.7-max',
-            baseUrl: 'https://removed.example.com/v1',
+            baseUrl: 'https://removed.example.com/v1?api_key=secret#private',
           },
           modelProviders: {
             [AuthType.USE_OPENAI]: [tokenPlan, ideaLab],
@@ -694,6 +694,33 @@ describe('modelConfigUtils', () => {
         expect(result.warnings).toEqual(
           expect.arrayContaining([
             expect.stringContaining('https://removed.example.com/v1'),
+          ]),
+        );
+        expect(JSON.stringify(result.warnings)).not.toContain('secret');
+        expect(JSON.stringify(result.warnings)).not.toContain('private');
+      });
+
+      it('warns when the persisted implicit route no longer exists', () => {
+        mockResolved();
+        const settings = makeMockSettings({
+          model: { name: 'qwen3.7-max', baseUrl: '' },
+          modelProviders: {
+            [AuthType.USE_OPENAI]: [tokenPlan],
+          },
+        });
+
+        const result = resolveCliGenerationConfig({
+          argv: {},
+          settings,
+          selectedAuthType: AuthType.USE_OPENAI,
+          env: {},
+        });
+
+        expect(result.warnings).toEqual(
+          expect.arrayContaining([
+            expect.stringContaining(
+              "Persisted model.baseUrl '(default baseUrl)'",
+            ),
           ]),
         );
       });
@@ -715,6 +742,32 @@ describe('modelConfigUtils', () => {
 
         expect(vi.mocked(resolveModelConfig)).toHaveBeenCalledWith(
           expect.objectContaining({ modelProvider: implicitDefault }),
+        );
+        expect(result.registryBaseUrl).toBeNull();
+      });
+
+      it('normalizes an empty provider baseUrl as the implicit route', () => {
+        mockResolved();
+        const emptyBaseUrlDefault = {
+          ...implicitDefault,
+          baseUrl: '',
+        };
+        const settings = makeMockSettings({
+          model: { name: 'qwen3.7-max', baseUrl: '' },
+          modelProviders: {
+            [AuthType.USE_OPENAI]: [tokenPlan, emptyBaseUrlDefault],
+          },
+        });
+
+        const result = resolveCliGenerationConfig({
+          argv: {},
+          settings,
+          selectedAuthType: AuthType.USE_OPENAI,
+          env: {},
+        });
+
+        expect(vi.mocked(resolveModelConfig)).toHaveBeenCalledWith(
+          expect.objectContaining({ modelProvider: emptyBaseUrlDefault }),
         );
         expect(result.registryBaseUrl).toBeNull();
       });

@@ -14,7 +14,9 @@ import { z } from 'zod';
 
 export const ACP_ROUTE_ID_PREFIX = 'qwen-route:v1:';
 
-function getRouteEndpointIdentity(baseUrl: string | undefined): string | null {
+export function getRouteEndpointIdentity(
+  baseUrl: string | undefined,
+): string | null {
   if (!baseUrl) return null;
   try {
     const url = new URL(baseUrl);

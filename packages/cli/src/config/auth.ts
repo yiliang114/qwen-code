@@ -61,7 +61,7 @@ function findModelConfig(
       models.find(
         (m) =>
           m.id === modelId &&
-          (baseUrl === null ? m.baseUrl === undefined : m.baseUrl === baseUrl),
+          (baseUrl === null ? !m.baseUrl : m.baseUrl === baseUrl),
       ) ?? models.find((m) => m.id === modelId)
     );
   }

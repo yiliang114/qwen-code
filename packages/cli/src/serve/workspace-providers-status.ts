@@ -29,6 +29,7 @@ import type { CliGenerationConfigInputs } from '../utils/modelConfigUtils.js';
 import {
   buildAcpModelOptions,
   getCurrentAcpModelId,
+  getRouteEndpointIdentity,
   parseAcpBaseModelId,
   sanitizeProviderBaseUrl,
 } from '../utils/acpModelUtils.js';
@@ -313,10 +314,11 @@ function buildCurrent(
 ): ServeWorkspaceProviderCurrent | undefined {
   if (!authType && !modelId && !baseUrl && !fastModelId && !visionModelId)
     return undefined;
+  const publicBaseUrl = getRouteEndpointIdentity(baseUrl);
   return {
     ...(authType ? { authType: String(authType) } : {}),
     ...(modelId ? { modelId } : {}),
-    ...(baseUrl ? { baseUrl: sanitizeProviderBaseUrl(baseUrl) } : {}),
+    ...(publicBaseUrl ? { baseUrl: publicBaseUrl } : {}),
     ...(fastModelId ? { fastModelId } : {}),
     ...(visionModelId ? { visionModelId } : {}),
   };

@@ -53,10 +53,17 @@ function formatModalities(modalities?: InputModalities): string {
 function buildModelSelectionKey(
   authType: string,
   modelId: string,
-  baseUrl?: string,
+  routeBaseUrl?: string,
 ): string {
   const base = `${authType}::${modelId}`;
-  return baseUrl ? `${base}\0${baseUrl}` : base;
+  return routeBaseUrl ? `${base}\0${routeBaseUrl}` : base;
+}
+
+function getModelSelectionBaseUrl(
+  model: CoreAvailableModel,
+  isAuxModelMode: boolean,
+): string | undefined {
+  return isAuxModelMode ? model.baseUrl : model.registryBaseUrl;
 }
 
 /**
@@ -297,6 +304,9 @@ export function ModelDialog({
   const [highlightedValue, setHighlightedValue] = useState<string | null>(null);
 
   const authType = config?.getAuthType();
+  const isAuxModelMode = Boolean(
+    isFastModelMode || isVoiceModelMode || isVisionModelMode,
+  );
 
   const availableModelEntries = useMemo(() => {
     const allModels = config ? config.getAllConfiguredModels() : [];
@@ -372,7 +382,11 @@ export function ModelDialog({
           const value =
             isRuntime && snapshotId
               ? snapshotId
-              : buildModelSelectionKey(t2, model.id, model.baseUrl);
+              : buildModelSelectionKey(
+                  t2,
+                  model.id,
+                  getModelSelectionBaseUrl(model, isAuxModelMode),
+                );
 
           const isQwenOAuth = t2 === AuthType.QWEN_OAUTH;
 
@@ -425,7 +439,7 @@ export function ModelDialog({
           };
         },
       ),
-    [availableModelEntries],
+    [availableModelEntries, isAuxModelMode],
   );
   const modelOptionRowHeight = MODEL_OPTIONS.some(
     ({ description }) =>
@@ -491,9 +505,7 @@ export function ModelDialog({
     isFastModelMode || isVoiceModelMode || isVisionModelMode
       ? undefined // fast/voice/vision models are never runtime model selections
       : config?.getActiveRuntimeModelSnapshot?.();
-  const currentBaseUrl = config
-    ?.getModelsConfig()
-    .getGenerationConfig()?.baseUrl;
+  const currentRegistryBaseUrl = config?.getCurrentModelRegistryBaseUrl?.();
   // When `/model --fast <bare-id>` validated the model across all providers,
   // the setting persists as a bare model ID (no authType prefix) so that
   // runtime cross-auth lookups still work. Highlight the row that owns it
@@ -559,7 +571,11 @@ export function ModelDialog({
               preferredFastModelEntry.model.baseUrl,
             )
           : authType
-            ? buildModelSelectionKey(authType, preferredModelId, currentBaseUrl)
+            ? buildModelSelectionKey(
+                authType,
+                preferredModelId,
+                currentRegistryBaseUrl ?? undefined,
+              )
             : '';
 
   useKeypress(
@@ -593,11 +609,15 @@ export function ModelDialog({
         const v =
           isRuntime && snapshotId
             ? snapshotId
-            : buildModelSelectionKey(t2, model.id, model.baseUrl);
+            : buildModelSelectionKey(
+                t2,
+                model.id,
+                getModelSelectionBaseUrl(model, isAuxModelMode),
+              );
         return v === key;
       },
     );
-  }, [highlightedValue, preferredKey, availableModelEntries]);
+  }, [highlightedValue, preferredKey, availableModelEntries, isAuxModelMode]);
 
   const handleSelect = useCallback(
     async (selected: string) => {
@@ -607,7 +627,11 @@ export function ModelDialog({
           const value =
             isRuntime && snapshotId
               ? snapshotId
-              : buildModelSelectionKey(t2, model.id, model.baseUrl);
+              : buildModelSelectionKey(
+                  t2,
+                  model.id,
+                  getModelSelectionBaseUrl(model, isAuxModelMode),
+                );
           return value === selected;
         },
       );
@@ -753,6 +777,7 @@ export function ModelDialog({
       let effectiveAuthType: AuthType | undefined;
       let effectiveModelId = selected;
       let isRuntime = false;
+      let selectedBaseUrl: string | undefined;
 
       if (!config) {
         onClose();
@@ -767,7 +792,6 @@ export function ModelDialog({
         let selectedAuthType: AuthType;
         let modelId: string;
 
-        let selectedBaseUrl: string | undefined;
         if (isRuntime) {
           // For runtime models, extract authType from the snapshot ID
           // Format: $runtime|${authType}|${modelId}
@@ -823,15 +847,7 @@ export function ModelDialog({
         after,
         effectiveAuthType,
         effectiveModelId,
-        // Persist the selected provider's baseUrl so the right provider is
-        // restored next launch when several share the same id. Pair it with the
-        // same resolved config that effectiveModelId comes from (`after`) so the
-        // persisted (model.name, model.baseUrl) stays consistent even if
-        // switchModel transforms the id; fall back to the picker entry's
-        // baseUrl. Runtime models are keyed by snapshot id, so no disambiguator.
-        effectiveBaseUrl: isRuntime
-          ? undefined
-          : (after?.baseUrl ?? selectedEntry?.model.baseUrl),
+        effectiveBaseUrl: isRuntime ? undefined : selectedBaseUrl,
         isRuntime,
         persistScope,
       });
@@ -847,6 +863,7 @@ export function ModelDialog({
       isFastModelMode,
       isVoiceModelMode,
       isVisionModelMode,
+      isAuxModelMode,
       availableModelEntries,
       persistScope,
     ],

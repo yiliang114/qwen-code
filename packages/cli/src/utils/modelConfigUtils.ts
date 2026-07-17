@@ -20,7 +20,7 @@ import {
   stripRuntimeSnapshotPrefix,
 } from '@qwen-code/qwen-code-core';
 import type { Settings } from '../config/settings.js';
-import { sanitizeProviderBaseUrl } from './acpModelUtils.js';
+import { getRouteEndpointIdentity } from './acpModelUtils.js';
 
 /**
  * Env var names that hold model selections for each auth type.
@@ -317,20 +317,21 @@ export function resolveCliGenerationConfig(
           (p) =>
             p.id === resolvedModel &&
             (persistedBaseUrl === ''
-              ? p.baseUrl === undefined
+              ? !p.baseUrl
               : p.baseUrl === persistedBaseUrl),
         );
         modelProvider =
           exactMatch ?? providers.find((p) => p.id === resolvedModel);
         // Surface the silent fallback: the paired provider was removed or its
         // baseUrl changed, so traffic now routes to a different same-id provider.
-        if (persistedBaseUrl && !exactMatch && modelProvider) {
+        if (!exactMatch && modelProvider) {
           const fallbackBaseUrl =
-            modelProvider.baseUrl === undefined
-              ? '(default baseUrl)'
-              : sanitizeProviderBaseUrl(modelProvider.baseUrl);
+            getRouteEndpointIdentity(modelProvider.baseUrl) ??
+            '(default baseUrl)';
+          const persistedEndpoint =
+            getRouteEndpointIdentity(persistedBaseUrl) ?? '(default baseUrl)';
           disambiguationWarning =
-            `Persisted model.baseUrl '${sanitizeProviderBaseUrl(persistedBaseUrl)}' no longer matches any provider ` +
+            `Persisted model.baseUrl '${persistedEndpoint}' no longer matches any provider ` +
             `for model '${resolvedModel}' (authType '${authType}'); using the first id match ` +
             `('${fallbackBaseUrl}'). Re-select the model to update it.`;
         }
@@ -448,7 +449,7 @@ export function resolveCliGenerationConfig(
     baseUrl: resolved.config.baseUrl || '',
     generationConfig,
     ...(modelProvider
-      ? { registryBaseUrl: modelProvider.baseUrl ?? null }
+      ? { registryBaseUrl: modelProvider.baseUrl || null }
       : {}),
     sources: resolved.sources,
     warnings: [

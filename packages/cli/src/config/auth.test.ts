@@ -135,7 +135,11 @@ describe('validateAuthMethod', () => {
               baseUrl: 'https://proxy.example/v1',
               envKey: 'TOKEN_PLAN_KEY',
             },
-            { id: 'shared-model', envKey: 'IMPLICIT_KEY' },
+            {
+              id: 'shared-model',
+              baseUrl: '',
+              envKey: 'IMPLICIT_KEY',
+            },
           ],
         },
       },
