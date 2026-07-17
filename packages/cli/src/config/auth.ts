@@ -28,17 +28,18 @@ const DEFAULT_ENV_KEYS: Record<string, string> = {
 /**
  * Find model configuration from modelProviders by authType and modelId.
  * When a baseUrl is given, prefers the exact id+baseUrl match (disambiguating
- * providers that share a model id) and falls back to the first id match if the
- * paired provider was edited/removed. When no baseUrl is given, returns the
- * first id match. Mirrors resolveCliGenerationConfig so pre-flight auth
- * validation checks the same provider that startup resolution selects.
+ * providers that share a model id); null selects the implicit route. Falls
+ * back to the first id match if the paired provider was edited/removed. When
+ * baseUrl is undefined, returns the first id match. Mirrors
+ * resolveCliGenerationConfig so pre-flight auth validation checks the same
+ * provider that startup resolution selects.
  */
 function findModelConfig(
   modelProviders: ModelProvidersConfig | undefined,
   providerProtocol: ProviderProtocolConfig | undefined,
   authType: string,
   modelId: string | undefined,
-  baseUrl?: string,
+  baseUrl?: string | null,
 ): ProviderModelConfig | undefined {
   if (!modelProviders || !modelId) {
     return undefined;
@@ -55,40 +56,47 @@ function findModelConfig(
     return undefined;
   }
 
-  if (baseUrl) {
+  if (baseUrl !== undefined) {
     return (
-      models.find((m) => m.id === modelId && m.baseUrl === baseUrl) ??
-      models.find((m) => m.id === modelId)
+      models.find(
+        (m) =>
+          m.id === modelId &&
+          (baseUrl === null ? m.baseUrl === undefined : m.baseUrl === baseUrl),
+      ) ?? models.find((m) => m.id === modelId)
     );
   }
   return models.find((m) => m.id === modelId);
 }
 
 /**
- * Resolve the selected model id and its paired baseUrl for provider lookup.
- * Prefers the runtime-resolved generation config (which folds in CLI args, env
- * vars, settings, and the selected provider), falling back to the persisted
- * settings.model.{name,baseUrl} when no Config is available yet (pre-flight).
+ * Resolve the selected model id and route identity for provider lookup.
+ * Prefers the live Config, falling back to persisted settings during pre-flight.
  */
 function resolveSelectedModel(
   settings: Settings,
   config?: Config,
-): { modelId: string | undefined; baseUrl: string | undefined } {
+): {
+  modelId: string | undefined;
+  baseUrl: string | null | undefined;
+} {
   const modelsConfig = config?.getModelsConfig();
   if (modelsConfig) {
-    // A live Config is the source of truth: pair its model with its own
-    // resolved baseUrl. Do NOT fall back to settings.model.baseUrl here — that
-    // could pair the runtime-selected model with a stale persisted baseUrl from
-    // a previous selection and validate a different duplicate-id provider.
+    const registryBaseUrl = config?.getCurrentModelRegistryBaseUrl?.();
+    // A live Config is the source of truth: pair its model with its registry
+    // route identity. Do NOT fall back to settings.model.baseUrl here — that
+    // could validate a different duplicate-id provider.
     return {
       modelId: modelsConfig.getModel(),
-      baseUrl: modelsConfig.getGenerationConfig()?.baseUrl,
+      baseUrl:
+        registryBaseUrl !== undefined
+          ? registryBaseUrl
+          : modelsConfig.getGenerationConfig()?.baseUrl,
     };
   }
   // Pre-flight (no Config yet): use the persisted selection as a paired unit.
   return {
     modelId: settings.model?.name,
-    baseUrl: settings.model?.baseUrl,
+    baseUrl: settings.model?.baseUrl === '' ? null : settings.model?.baseUrl,
   };
 }
 

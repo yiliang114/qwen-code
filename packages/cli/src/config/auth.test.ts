@@ -35,6 +35,7 @@ describe('validateAuthMethod', () => {
     delete process.env['ANTHROPIC_BASE_URL'];
     delete process.env['GOOGLE_API_KEY'];
     delete process.env['IDEALAB_KEY'];
+    delete process.env['IMPLICIT_KEY'];
     delete process.env['TOKEN_PLAN_KEY'];
   });
 
@@ -119,6 +120,27 @@ describe('validateAuthMethod', () => {
       },
     } as unknown as ReturnType<typeof settings.loadSettings>);
     process.env['IDEALAB_KEY'] = 'idealab-key';
+
+    expect(validateAuthMethod(AuthType.USE_OPENAI)).toBeNull();
+  });
+
+  it('uses the implicit route env key for an empty baseUrl tombstone', () => {
+    vi.mocked(settings.loadSettings).mockReturnValue({
+      merged: {
+        model: { name: 'shared-model', baseUrl: '' },
+        modelProviders: {
+          openai: [
+            {
+              id: 'shared-model',
+              baseUrl: 'https://proxy.example/v1',
+              envKey: 'TOKEN_PLAN_KEY',
+            },
+            { id: 'shared-model', envKey: 'IMPLICIT_KEY' },
+          ],
+        },
+      },
+    } as unknown as ReturnType<typeof settings.loadSettings>);
+    process.env['IMPLICIT_KEY'] = 'implicit-key';
 
     expect(validateAuthMethod(AuthType.USE_OPENAI)).toBeNull();
   });
@@ -290,6 +312,35 @@ describe('validateAuthMethod', () => {
     const result = validateAuthMethod(AuthType.USE_OPENAI, mockConfig);
     expect(result).toBeNull();
     expect(mockConfig.getModelsConfig).toHaveBeenCalled();
+  });
+
+  it('uses the live implicit route identity instead of its resolved baseUrl', () => {
+    vi.mocked(settings.loadSettings).mockReturnValue({
+      merged: {
+        modelProviders: {
+          openai: [
+            {
+              id: 'shared-model',
+              baseUrl: 'https://default.example/v1',
+              envKey: 'TOKEN_PLAN_KEY',
+            },
+            { id: 'shared-model', envKey: 'IMPLICIT_KEY' },
+          ],
+        },
+      },
+    } as unknown as ReturnType<typeof settings.loadSettings>);
+    const mockConfig = {
+      getCurrentModelRegistryBaseUrl: vi.fn().mockReturnValue(null),
+      getModelsConfig: vi.fn().mockReturnValue({
+        getModel: vi.fn().mockReturnValue('shared-model'),
+        getGenerationConfig: vi
+          .fn()
+          .mockReturnValue({ baseUrl: 'https://default.example/v1' }),
+      }),
+    } as unknown as import('@qwen-code/qwen-code-core').Config;
+    process.env['IMPLICIT_KEY'] = 'implicit-key';
+
+    expect(validateAuthMethod(AuthType.USE_OPENAI, mockConfig)).toBeNull();
   });
 
   it('should fail validation when Config provides different model without matching env key', () => {

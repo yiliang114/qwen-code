@@ -300,31 +300,31 @@ export function resolveCliGenerationConfig(
     );
     if (providers.length > 0) {
       // When multiple providers share the same id, disambiguate by the
-      // persisted settings.model.baseUrl (written by the model picker). This
-      // only applies when the model itself came from settings.model.name.
-      // Fall back to the first id match if the paired provider was edited or
-      // removed (and for the legacy id-only case where no baseUrl was saved),
-      // mirroring auth.ts:findModelConfig.
+      // persisted settings.model.baseUrl (written by the model picker). An
+      // empty-string tombstone selects the implicit route; an absent key is a
+      // legacy id-only selection. Fall back to the first id match if the paired
+      // provider was edited or removed, mirroring auth.ts:findModelConfig.
       //
       // Note: `settings` is already merged across user/workspace/system scopes.
       // Every writer of model.name (the picker, /model, ACP, provider install)
       // also writes model.baseUrl in the SAME scope — a real URL, or an empty
       // string tombstone when there is none. The tombstone matters because an
       // omitted key cannot override a stale model.baseUrl in a lower-priority
-      // scope on merge, but '' (a present value) can. Empty string is treated
-      // as "no disambiguator" here. The only remaining desync is a hand-edited
-      // config that sets model.name in a higher scope with no baseUrl key at
-      // all; the id-only fallback bounds the blast radius to a same-id provider.
+      // scope on merge, but '' (a present value) can.
       const persistedBaseUrl = settings.model?.baseUrl;
-      if (resolvedFromSettings && persistedBaseUrl) {
+      if (resolvedFromSettings && persistedBaseUrl !== undefined) {
         const exactMatch = providers.find(
-          (p) => p.id === resolvedModel && p.baseUrl === persistedBaseUrl,
+          (p) =>
+            p.id === resolvedModel &&
+            (persistedBaseUrl === ''
+              ? p.baseUrl === undefined
+              : p.baseUrl === persistedBaseUrl),
         );
         modelProvider =
           exactMatch ?? providers.find((p) => p.id === resolvedModel);
         // Surface the silent fallback: the paired provider was removed or its
         // baseUrl changed, so traffic now routes to a different same-id provider.
-        if (!exactMatch && modelProvider) {
+        if (persistedBaseUrl && !exactMatch && modelProvider) {
           const fallbackBaseUrl =
             modelProvider.baseUrl === undefined
               ? '(default baseUrl)'

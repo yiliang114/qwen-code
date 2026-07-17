@@ -94,21 +94,12 @@ function buildWorkspaceProvidersStatus(
       ''
     ).trim();
     const hasCurrentModel = currentModelId.length > 0;
-    const modelCameFromSettings =
-      !argv.model && settings.model?.name?.trim() === currentModelId;
-    const currentBaseUrl =
-      modelCameFromSettings && settings.model?.baseUrl !== undefined
-        ? settings.model.baseUrl || undefined
-        : resolvedCliConfig.sources['baseUrl']
-          ? resolvedCliConfig.baseUrl || undefined
-          : undefined;
-    const currentRegistryBaseUrl =
-      modelCameFromSettings && currentAuth
-        ? settings.model?.baseUrl !== undefined
-          ? settings.model.baseUrl || null
-          : (modelsConfig.getResolvedModel(currentAuth, currentModelId)
-              ?.registryBaseUrl ?? null)
-        : undefined;
+    const currentBaseUrl = resolvedCliConfig.sources['baseUrl']
+      ? resolvedCliConfig.baseUrl || undefined
+      : undefined;
+    const currentRegistryBaseUrl = currentAuth
+      ? resolvedCliConfig.registryBaseUrl
+      : undefined;
     const modelOptions = buildAcpModelOptions(
       modelsConfig.getAllConfiguredModels(),
     );

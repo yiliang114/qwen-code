@@ -217,7 +217,7 @@ describe('createWorkspaceProvidersStatusProvider', () => {
     expect(second?.isCurrent).toBe(true);
   });
 
-  it('does not mark a configured route for an unmatched explicit endpoint', async () => {
+  it('marks the fallback route current for an unmatched explicit endpoint', async () => {
     const provider = createWorkspaceProvidersStatusProvider({ env: {} });
     await writeUserSettings({
       security: { auth: { selectedType: 'openai' } },
@@ -243,10 +243,13 @@ describe('createWorkspaceProvidersStatusProvider', () => {
 
     const result = await provider(workspace, false);
     const models = result.providers.flatMap((entry) => entry.models);
+    const first = models.find((model) => model.name === 'Shared One');
+    const second = models.find((model) => model.name === 'Shared Two');
 
-    expect(result.current?.modelId).toBe('shared-model');
-    expect(result.current?.baseUrl).toBe('https://outside.example/v1');
-    expect(models.every((model) => model.isCurrent === false)).toBe(true);
+    expect(result.current?.modelId).toBe(first?.modelId);
+    expect(result.current?.baseUrl).toBe('https://api-one.example/v1');
+    expect(first?.isCurrent).toBe(true);
+    expect(second?.isCurrent).toBe(false);
   });
 
   it('filters fastOnly and voiceOnly models from the workspace provider catalog', async () => {
@@ -346,7 +349,7 @@ describe('createWorkspaceProvidersStatusProvider', () => {
     expect(JSON.stringify(result)).not.toContain(`cur'rent`);
   });
 
-  it('does not mark baseUrl variants current when no baseUrl is resolved', async () => {
+  it('marks the first id match current for legacy settings without baseUrl', async () => {
     const provider = createWorkspaceProvidersStatusProvider({ env: {} });
     await writeUserSettings({
       security: { auth: { selectedType: 'openai' } },
@@ -355,12 +358,12 @@ describe('createWorkspaceProvidersStatusProvider', () => {
         openai: [
           {
             id: 'shared-model',
-            name: 'Shared Default',
+            name: 'Shared Proxy',
+            baseUrl: 'https://proxy.example/v1',
           },
           {
             id: 'shared-model',
-            name: 'Shared Proxy',
-            baseUrl: 'https://proxy.example/v1',
+            name: 'Shared Default',
           },
         ],
       },
@@ -368,13 +371,13 @@ describe('createWorkspaceProvidersStatusProvider', () => {
 
     const result = await provider(workspace, false);
     const models = result.providers.flatMap((p) => p.models);
+    const proxyModel = models.find((m) => m.name === 'Shared Proxy');
     const defaultModel = models.find((m) => m.name === 'Shared Default');
 
-    expect(result.current?.modelId).toBe(defaultModel?.modelId);
-    expect(defaultModel?.isCurrent).toBe(true);
-    expect(
-      models.find((m) => m.baseUrl === 'https://proxy.example/v1')?.isCurrent,
-    ).toBe(false);
+    expect(result.current?.modelId).toBe(proxyModel?.modelId);
+    expect(result.current?.baseUrl).toBe('https://proxy.example/v1');
+    expect(proxyModel?.isCurrent).toBe(true);
+    expect(defaultModel?.isCurrent).toBe(false);
   });
 
   it('uses the auth-specific env model when settings.model.name is absent', async () => {
@@ -384,18 +387,26 @@ describe('createWorkspaceProvidersStatusProvider', () => {
     await writeUserSettings({
       security: { auth: { selectedType: 'openai' } },
       modelProviders: {
-        openai: [{ id: 'env-model', name: 'Env Model' }],
+        openai: [
+          {
+            id: 'env-model',
+            name: 'Env Proxy',
+            baseUrl: 'https://proxy.example/v1',
+          },
+          { id: 'env-model', name: 'Env Default' },
+        ],
       },
     });
 
     const result = await provider(workspace, false);
+    const models = result.providers.flatMap((p) => p.models);
+    const proxyModel = models.find((m) => m.name === 'Env Proxy');
+    const defaultModel = models.find((m) => m.name === 'Env Default');
 
-    expect(result.current?.modelId).toBe('env-model(openai)');
-    expect(
-      result.providers
-        .flatMap((p) => p.models)
-        .find((m) => m.modelId === 'env-model(openai)')?.isCurrent,
-    ).toBe(true);
+    expect(result.current?.modelId).toBe(proxyModel?.modelId);
+    expect(result.current?.baseUrl).toBe('https://proxy.example/v1');
+    expect(proxyModel?.isCurrent).toBe(true);
+    expect(defaultModel?.isCurrent).toBe(false);
   });
 
   it('does not load workspace env files into process.env when env is injected', async () => {

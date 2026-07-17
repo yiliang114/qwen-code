@@ -610,6 +610,10 @@ describe('modelConfigUtils', () => {
         baseUrl: 'https://idealab.example.com/v1',
         envKey: 'IDEALAB_KEY',
       };
+      const implicitDefault: ProviderModelConfig = {
+        id: 'qwen3.7-max',
+        name: '[Default] qwen3.7-max',
+      };
 
       function mockResolved() {
         vi.mocked(resolveModelConfig).mockReturnValue({
@@ -694,28 +698,25 @@ describe('modelConfigUtils', () => {
         );
       });
 
-      it('treats an empty-string tombstone as no disambiguator (first id match)', () => {
-        // A cleared selection persists model.baseUrl: '' so it can override a
-        // stale lower-scope value on merge; the resolver must treat '' as "no
-        // baseUrl" and fall back to the first id match rather than matching a
-        // provider whose baseUrl is literally empty.
+      it('uses an empty-string tombstone to select the implicit route', () => {
         mockResolved();
         const settings = makeMockSettings({
           model: { name: 'qwen3.7-max', baseUrl: '' },
           modelProviders: {
-            [AuthType.USE_OPENAI]: [tokenPlan, ideaLab],
+            [AuthType.USE_OPENAI]: [tokenPlan, implicitDefault],
           },
         });
 
-        resolveCliGenerationConfig({
+        const result = resolveCliGenerationConfig({
           argv: {},
           settings,
           selectedAuthType: AuthType.USE_OPENAI,
         });
 
         expect(vi.mocked(resolveModelConfig)).toHaveBeenCalledWith(
-          expect.objectContaining({ modelProvider: tokenPlan }),
+          expect.objectContaining({ modelProvider: implicitDefault }),
         );
+        expect(result.registryBaseUrl).toBeNull();
       });
 
       it('ignores the persisted baseUrl when the model comes from argv.model, not settings', () => {
