@@ -155,6 +155,15 @@ describe('ChromeDebuggerSession', () => {
     expect(detach).toHaveBeenCalledWith({ tabId: 7 }, expect.any(Function));
   });
 
+  it('can detach immediately during page teardown', async () => {
+    const session = new ChromeDebuggerSession();
+    await session.send('Page.enable');
+
+    session.detachImmediately();
+
+    expect(detach).toHaveBeenCalledWith({ tabId: 7 }, expect.any(Function));
+  });
+
   it('pins commands to one tab for an operation', async () => {
     query
       .mockResolvedValueOnce([{ id: 7, url: 'https://one.example' }])

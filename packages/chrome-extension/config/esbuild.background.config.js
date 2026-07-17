@@ -27,7 +27,10 @@ function resolveEntry(relativePathWithoutExt) {
   return path.join(projectRoot, `${relativePathWithoutExt}.js`);
 }
 
-const entryPoints = [resolveEntry('src/background/service-worker')];
+const entryPoints = [
+  resolveEntry('src/background/service-worker'),
+  resolveEntry('src/sidepanel'),
+];
 
 async function build() {
   const ctx = await esbuild.context({
@@ -45,7 +48,7 @@ async function build() {
   });
 
   if (isWatch) {
-    console.log('Watching background/content scripts...');
+    console.log('Watching extension scripts...');
     await ctx.watch();
   } else {
     const result = await ctx.rebuild();
@@ -55,7 +58,7 @@ async function build() {
       fs.writeFileSync(metafilePath, JSON.stringify(result.metafile, null, 2));
     }
     await ctx.dispose();
-    console.log('Background/content build complete!');
+    console.log('Extension script build complete!');
   }
 }
 

@@ -125,6 +125,18 @@ export class ChromeDebuggerSession implements DebuggerSession {
     await this.detachCurrent();
   }
 
+  detachImmediately(): void {
+    this.attachGeneration += 1;
+    const tabId = this.tabId;
+    this.tabId = null;
+    this.pinnedTabId = null;
+    this.stopKeepalive();
+    if (tabId === null) return;
+    chrome.debugger.detach({ tabId }, () => {
+      void chrome.runtime.lastError;
+    });
+  }
+
   private async detachCurrent(): Promise<void> {
     const tabId = this.tabId;
     this.tabId = null;
