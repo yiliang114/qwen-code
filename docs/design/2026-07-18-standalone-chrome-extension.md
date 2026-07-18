@@ -134,9 +134,9 @@ The default endpoint is the Beijing ModelStudio OpenAI-compatible endpoint:
 `https://dashscope.aliyuncs.com/compatible-mode/v1`
 
 The endpoint remains editable across the fixed Beijing, international, and US
-DashScope hosts, but arbitrary `aliyuncs.com` subdomains are rejected. The
-manifest grants access to those same exact hosts and no arbitrary Internet
-request access.
+DashScope hosts and the China Token Plan host, but arbitrary `aliyuncs.com`
+subdomains are rejected. The manifest grants access to those same exact hosts
+and no arbitrary Internet request access.
 
 The API key is stored in `chrome.storage.session` by default and disappears
 when Chrome exits. The user may explicitly opt into persistence in
@@ -156,7 +156,7 @@ boundaries, and a visible session stop control.
 ## Security boundaries
 
 - Only `http:` and `https:` pages may be automated.
-- Only the three allowlisted DashScope HTTPS hosts and the
+- Only the explicitly allowlisted ModelStudio HTTPS hosts and the
   `/compatible-mode/v1` base path are accepted.
 - The API key is never placed in tool output, page context, URL parameters, or
   logs.

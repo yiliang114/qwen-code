@@ -339,6 +339,16 @@ describe('validateModelBaseUrl', () => {
     ).toBe('https://dashscope.aliyuncs.com/compatible-mode/v1');
   });
 
+  it('allows the China Token Plan endpoint', () => {
+    expect(
+      validateModelBaseUrl(
+        'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
+      ),
+    ).toBe(
+      'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
+    );
+  });
+
   it('rejects endpoints outside aliyuncs.com', () => {
     expect(() => validateModelBaseUrl('https://example.com/v1')).toThrowError(
       'supported ModelStudio',

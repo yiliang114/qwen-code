@@ -25,10 +25,10 @@ Open the toolbar action, enter:
 - a ModelStudio API key.
 
 The default base URL is the Beijing pay-as-you-go endpoint. The allowlist also
-contains the standard international and US DashScope endpoints. The prototype
-does not accept arbitrary `aliyuncs.com` subdomains and does not claim Coding
-Plan support because that plan has client-usage restrictions that need a product
-decision.
+contains the standard international and US DashScope endpoints and the China
+Token Plan endpoint. The prototype does not accept arbitrary `aliyuncs.com`
+subdomains. Use a subscription endpoint only when this interactive browser
+agent is permitted by the plan terms.
 
 The API key is stored in `chrome.storage.session` by default. Selecting
 **Remember the API key after Chrome exits** moves it to

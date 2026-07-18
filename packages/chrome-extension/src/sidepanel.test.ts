@@ -8,6 +8,9 @@ import { readFile } from 'node:fs/promises';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const html = await readFile('public/sidepanel.html', 'utf8');
+const manifest = JSON.parse(
+  await readFile('public/manifest.json', 'utf8'),
+) as chrome.runtime.ManifestV3;
 
 async function loadSidepanel(initial?: {
   local?: Record<string, unknown>;
@@ -89,6 +92,12 @@ describe('standalone side panel', () => {
   it('loads the real side-panel document without a missing element', async () => {
     await expect(loadSidepanel()).resolves.toBeDefined();
     expect(document.getElementById('composer')).not.toBeNull();
+  });
+
+  it('grants access to the China Token Plan endpoint', () => {
+    expect(manifest.host_permissions).toContain(
+      'https://token-plan.cn-beijing.maas.aliyuncs.com/*',
+    );
   });
 
   it('keeps the API key in session storage by default', async () => {

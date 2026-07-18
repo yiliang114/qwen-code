@@ -157,8 +157,9 @@ settingsForm.addEventListener('submit', (event) => {
       settingsPanel.open = false;
     })
     .catch((error: unknown) => {
-      settingsStatus.textContent =
-        error instanceof Error ? error.message : String(error);
+      settingsStatus.textContent = `Error: ${
+        error instanceof Error ? error.message : String(error)
+      }`;
     });
 });
 

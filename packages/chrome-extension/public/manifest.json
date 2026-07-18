@@ -7,7 +7,8 @@
   "host_permissions": [
     "https://dashscope.aliyuncs.com/*",
     "https://dashscope-intl.aliyuncs.com/*",
-    "https://dashscope-us.aliyuncs.com/*"
+    "https://dashscope-us.aliyuncs.com/*",
+    "https://token-plan.cn-beijing.maas.aliyuncs.com/*"
   ],
   "background": {
     "service_worker": "background/service-worker.js",

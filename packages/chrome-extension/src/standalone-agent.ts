@@ -70,6 +70,7 @@ const MODELSTUDIO_HOSTS = new Set([
   'dashscope.aliyuncs.com',
   'dashscope-intl.aliyuncs.com',
   'dashscope-us.aliyuncs.com',
+  'token-plan.cn-beijing.maas.aliyuncs.com',
 ]);
 
 function isToolCall(value: unknown): value is ToolCall {
