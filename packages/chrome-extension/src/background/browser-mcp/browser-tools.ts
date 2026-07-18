@@ -179,6 +179,10 @@ function sanitizeValue(value: unknown, key?: string): unknown {
   );
 }
 
+export function sanitizeBrowserToolValue(value: unknown): unknown {
+  return sanitizeValue(value);
+}
+
 function truncateText(value: string, maxChars: number): string {
   if (value.length <= maxChars) return value;
   return `${value.slice(0, Math.max(0, maxChars - TRUNCATED_MARKER.length))}${TRUNCATED_MARKER}`;
@@ -358,14 +362,25 @@ export const BROWSER_TOOLS: readonly BrowserToolDefinition[] = [
 
 export class BrowserTools implements BrowserToolHandler {
   readonly tools = BROWSER_TOOLS;
-  private readonly elements = new Map<string, number>();
+  private readonly elements = new Map<
+    string,
+    { backendNodeId: number; label: string }
+  >();
   private readonly consoleEntries: ConsoleEntry[] = [];
   private readonly networkEntries = new Map<string, NetworkEntry>();
   private consoleId = 0;
   private readyTabId: number | null = null;
   private navigationGeneration = 0;
 
-  constructor(private readonly session: DebuggerSession) {
+  constructor(
+    private readonly session: DebuggerSession,
+    private readonly captureDiagnostics = true,
+    private readonly approveTool?: (
+      name: string,
+      args: Record<string, unknown>,
+      tab: chrome.tabs.Tab,
+    ) => boolean | Promise<boolean>,
+  ) {
     this.session.onEvent((method, params) => this.handleEvent(method, params));
   }
 
@@ -376,6 +391,28 @@ export class BrowserTools implements BrowserToolHandler {
     try {
       return await this.session.withAttached(async () => {
         await this.ensureReady();
+        if (this.approveTool) {
+          const tab = await this.session.getTab();
+          const generation = this.navigationGeneration;
+          const approved = await this.approveTool(
+            name,
+            await this.approvalArguments(name, args),
+            tab,
+          );
+          if (!approved) return text('User denied this browser action.');
+          const currentTab = await this.session.getTab();
+          if (
+            currentTab.url !== tab.url ||
+            this.navigationGeneration !== generation
+          ) {
+            return {
+              ...text(
+                'The page changed while awaiting approval. Take a new snapshot and retry.',
+              ),
+              isError: true,
+            };
+          }
+        }
         switch (name) {
           case 'take_snapshot':
             return await this.snapshot();
@@ -457,17 +494,22 @@ export class BrowserTools implements BrowserToolHandler {
     this.elements.clear();
     this.consoleEntries.length = 0;
     this.networkEntries.clear();
-    await Promise.all([
+    const commands: Array<Promise<Record<string, unknown>>> = [
       this.session.send('Page.enable'),
       this.session.send('DOM.enable'),
       this.session.send('Accessibility.enable'),
       this.session.send('Runtime.enable'),
-      this.session.send('Log.enable'),
-      this.session.send('Network.enable', {
-        maxTotalBufferSize: MAX_BODY_CHARS * 4,
-        maxResourceBufferSize: MAX_BODY_CHARS,
-      }),
-    ]);
+    ];
+    if (this.captureDiagnostics) {
+      commands.push(
+        this.session.send('Log.enable'),
+        this.session.send('Network.enable', {
+          maxTotalBufferSize: MAX_BODY_CHARS * 4,
+          maxResourceBufferSize: MAX_BODY_CHARS,
+        }),
+      );
+    }
+    await Promise.all(commands);
     this.readyTabId = tabId;
   }
 
@@ -496,17 +538,20 @@ export class BrowserTools implements BrowserToolHandler {
         MAX_STORED_TEXT_CHARS,
       );
       if (!role || (!name && !value && role !== 'RootWebArea')) continue;
-      let ref = '';
-      if (typeof node.backendDOMNodeId === 'number') {
-        ref = `e${this.elements.size + 1}`;
-        this.elements.set(ref, node.backendDOMNodeId);
-      }
       const details = [
         name && JSON.stringify(name),
         value && `value=${JSON.stringify(value)}`,
       ]
         .filter(Boolean)
         .join(' ');
+      let ref = '';
+      if (typeof node.backendDOMNodeId === 'number') {
+        ref = `e${this.elements.size + 1}`;
+        this.elements.set(ref, {
+          backendNodeId: node.backendDOMNodeId,
+          label: `${role}${name ? ` ${JSON.stringify(name)}` : ''}`,
+        });
+      }
       lines.push(
         `${ref ? `[ref=${ref}] ` : ''}${role}${details ? ` ${details}` : ''}`,
       );
@@ -596,13 +641,61 @@ export class BrowserTools implements BrowserToolHandler {
   }
 
   private backendNode(ref: string): number {
-    const id = this.elements.get(ref);
-    if (id === undefined) {
+    const element = this.elements.get(ref);
+    if (!element) {
       throw new Error(
         `Unknown or stale element ref '${ref}'. Run take_snapshot again.`,
       );
     }
-    return id;
+    return element.backendNodeId;
+  }
+
+  private async approvalArguments(
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const ref = args['ref'];
+    if (typeof ref === 'string') {
+      const target = this.elements.get(ref)?.label;
+      return target ? { ...args, target } : args;
+    }
+    const fields = args['fields'];
+    if (Array.isArray(fields)) {
+      return {
+        ...args,
+        fields: fields.map((raw) => {
+          const field = object(raw);
+          const fieldRef = field['ref'];
+          const target =
+            typeof fieldRef === 'string'
+              ? this.elements.get(fieldRef)?.label
+              : undefined;
+          return target ? { ...field, target } : field;
+        }),
+      };
+    }
+    if (name !== 'press_key') return args;
+    const focused = await this.session.send('Runtime.evaluate', {
+      expression: `(() => {
+        const element = document.activeElement;
+        if (!(element instanceof HTMLElement)) return null;
+        return {
+          role: element.getAttribute('role') || element.tagName.toLowerCase(),
+          name: element.getAttribute('aria-label') ||
+            element.getAttribute('name') || element.id || ''
+        };
+      })()`,
+      returnByValue: true,
+    });
+    const target = object(object(focused['result'])['value']);
+    const role = typeof target['role'] === 'string' ? target['role'] : '';
+    const label = typeof target['name'] === 'string' ? target['name'] : '';
+    return role
+      ? {
+          ...args,
+          target: `${role}${label ? ` ${JSON.stringify(label)}` : ''}`,
+        }
+      : args;
   }
 
   private async click(ref: string): Promise<BrowserToolResult> {
@@ -908,6 +1001,7 @@ export class BrowserTools implements BrowserToolHandler {
       this.elements.clear();
       return;
     }
+    if (!this.captureDiagnostics) return;
     if (method === 'Runtime.consoleAPICalled') {
       const args = Array.isArray(params['args']) ? params['args'] : [];
       this.pushConsole({

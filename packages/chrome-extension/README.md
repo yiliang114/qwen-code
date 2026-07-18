@@ -1,104 +1,94 @@
-# @qwen-code/chrome-bridge
+# Qwen Browser Agent — standalone
 
-A Chrome extension that brings Qwen Code into the browser as a thin client of a
-local [`qwen serve`](../../docs/users/qwen-serve.md) daemon — no Native
-Messaging host to install.
+This branch adds a browser-only companion to the daemon-based Qwen Code Chrome
+extension. It reuses Qwen Code's Web Shell, daemon event protocol, permission
+UI, and Chrome debugger tools while running the model/tool loop entirely inside
+Chrome. It does not require `qwen serve`, Native Messaging, or an external MCP
+process.
 
-It does two things:
+It is a browser agent, not a browser-hosted replacement for the Qwen Code CLI.
+Local filesystem, shell, Git, repository context, local MCP servers, hooks, and
+project skills remain exclusive to the daemon-based extension.
 
-- **Side panel** — handles daemon discovery and pairing, then frames the
-  daemon's Web Shell (chat + tools).
-- **Service worker** — hosts Qwen's browser MCP tools and executes them through
-  `chrome.debugger`. Tool calls travel over the daemon's reverse MCP WebSocket.
-
-## Build
-
-```bash
-npm run build        # -> dist/extension (static assets + bundled service worker)
-```
-
-Then load it: `chrome://extensions` → enable Developer mode → **Load unpacked**
-→ pick `dist/extension`.
-
-## Run
-
-The extension cannot spawn a local process, so start the daemon separately:
+## Build and load
 
 ```bash
-qwen serve
+npm run build
 ```
 
-The official extension id is pinned by `qwen serve`, so no browser-related
-environment variables or `--allow-origin` flag are required. Custom or forked
-extension builds must still pass their own origin explicitly:
+Open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and
+select `dist/extension`.
+
+The first launch accepts:
+
+- a Qwen `settings.json` selected with **Import settings.json**; or
+- an Alibaba ModelStudio endpoint, model name, and API key entered manually.
+
+Chrome extensions cannot silently read arbitrary local files. The file picker
+is therefore the closest browser-only equivalent to reading the local Qwen
+configuration. The selected file is parsed locally, and only the active model,
+supported endpoint, and supported API key are imported. MCP definitions and
+unrelated environment variables are ignored.
+
+The API key is stored in `chrome.storage.session` by default. Selecting
+**Remember the API key after Chrome exits** moves it to
+`chrome.storage.local`, which is persistent but not a hardware-backed secret
+store.
+
+## Reused Qwen Code experience
+
+- the complete Web Shell chat surface, Markdown rendering, tool cards, sidebar,
+  model selector, stop control, status bar, and responsive layout;
+- the daemon SDK's session, replay, provider, tool, skill, and permission event
+  shapes through an in-process browser transport;
+- persisted browser-chat sessions, with bounded history and event replay;
+- the existing `BrowserTools` and `ChromeDebuggerSession` implementation;
+- the existing Web Shell permission drawer for state-changing or sensitive
+  tools.
+
+## Browser tools
+
+The model receives all 20 existing extension tools:
+
+- accessibility snapshot and screenshot;
+- navigation, reload, back, and forward;
+- click, fill, multi-field form fill, keyboard, scroll, and wait;
+- JavaScript evaluation;
+- console list, detail, and clear;
+- network request list, detail/body, and clear;
+- page-context HTTP requests.
+
+Snapshot, screenshot, wait, and read-only console/network inspection run
+without an extra prompt. Navigation, page mutation, JavaScript, clearing
+diagnostics, and HTTP requests require explicit approval in the Web Shell.
+Approval is invalidated if the page changes while the decision is pending.
+
+The tools operate through `chrome.debugger`, so Chrome displays its debugger
+banner while a tab is attached.
+
+## Pure-web boundary
+
+The standalone path cannot safely reuse functionality that depends on the local
+Qwen process:
+
+- filesystem, shell, Git, repository context, and `QWEN.md`;
+- local skill discovery or execution;
+- shell-based hooks and policies;
+- stdio MCP servers and local subprocesses;
+- CLI credentials or silent local configuration access;
+- daemon background jobs and schedules.
+
+The standalone transport advertises a built-in browser skill because its
+instructions and tools are bundled in the extension. Adding more bundled,
+reviewed browser-only skills is possible. Executing arbitrary local skills or
+hooks would require the daemon/native-host mode.
+
+## Verify and package
 
 ```bash
-qwen serve --allow-origin chrome-extension://<custom-extension-id>
+npm test
+npm run typecheck
+npm run package
 ```
 
-Paste the pairing code printed by `qwen serve`. The credential remains in
-Chrome storage across extension reloads, but a restarted daemon requires a new
-pairing code because the daemon keeps trust state in memory. Once pairing
-succeeds, the panel opens the chat UI and browser tools register immediately.
-If Chrome storage is cleared while the daemon is still running, restart the
-daemon to generate fresh pairing material.
-
-The first-use exchange sends only an HMAC challenge proof; the pairing code and
-derived credential secret never cross HTTP. The extension verifies the daemon's
-proof before storing that credential, then uses a separate challenge-response
-before sending it over `/acp`. Pairing endpoints intentionally precede bearer
-authentication so an unknown process never receives a stored bearer token. The
-pairing code is time-limited and failed attempts are bounded.
-
-## Browser Automation Tools
-
-Browser debugging tools are implemented in and bundled with this Chrome
-extension. The main `@qwen-code/qwen-code` npm package does not contain an
-external Chrome DevTools MCP server. The first-release catalog covers page
-snapshot/navigation/input, screenshots, JavaScript evaluation, console output,
-and network request/response inspection.
-
-Tools act on the active tab. `evaluate_script` and `send_request` execute in the
-page context and can access that page's authenticated session, so use a dedicated
-browser profile or tab for untrusted sites and keep normal tool approval enabled.
-
-An explicitly configured `QWEN_CDP_MCP_COMMAND` remains a deprecated
-compatibility path targeted for removal in PR2. When present, the extension does
-not register its native tool catalog and instead keeps the CDP tunnel available
-to that adapter.
-
-Relevant `/capabilities` tags:
-
-- `allow_origin` means the extension may frame and call the daemon.
-- `cdp_tunnel_over_ws` means the daemon exposes the reverse CDP tunnel.
-- `client_mcp_over_ws` means extension-hosted tools can register over `/acp`.
-- `browser_automation_mcp` means the legacy external adapter is configured.
-
-## Onboarding states
-
-The side panel probes `GET /health` and `GET /capabilities` and shows one of:
-
-| State                | Meaning                                  | Shown                            |
-| -------------------- | ---------------------------------------- | -------------------------------- |
-| `down`               | no daemon reachable                      | "Start qwen serve" + command     |
-| `needs-upgrade`      | daemon lacks secure extension pairing    | Qwen Code update command         |
-| `needs-restart`      | Chrome lost the active daemon credential | daemon restart guidance          |
-| `needs-allow-origin` | daemon up but `--allow-origin` not set   | "Allow this extension" + command |
-| `needs-pairing`      | daemon reachable, credential not trusted | pairing-code form                |
-| `ready`              | daemon reachable and paired              | the Web Shell (chat)             |
-
-## Packaging for the Chrome Web Store
-
-```bash
-npm run package      # -> chrome-extension.zip (manifest at the zip root)
-```
-
-Upload the zip to the Chrome Web Store Developer Dashboard. The `debugger`
-permission will draw manual review; explain that it is used only after a paired
-local Qwen Code daemon requests a browser debugging action. Host permissions
-are limited to the loopback daemon.
-
-Release the matching Qwen Code CLI before publishing the extension update. The
-pairing handshake intentionally does not downgrade for older daemons; the side
-panel detects them and shows an update command instead of sending browser tools
-to an unauthenticated local process.
+The packaged artifact is `chrome-extension.zip`.

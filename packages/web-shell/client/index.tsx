@@ -1,5 +1,6 @@
 import { type ReactNode } from 'react';
 import { DaemonWorkspaceProvider } from '@qwen-code/webui/daemon-react-sdk';
+import type { DaemonTransport } from '@qwen-code/sdk/daemon';
 import { App, type WebShellProps } from './App';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { RootErrorFallback } from './components/RootErrorFallback';
@@ -24,6 +25,8 @@ export interface WebShellWithProvidersProps extends WebShellProps {
   lockWorkspaceCwd?: string;
   /** Client identity to reuse when attaching to an externally created session. */
   clientId?: string;
+  /** Optional in-process transport for hosts that do not use qwen serve. */
+  transport?: DaemonTransport;
 }
 
 function resolveBaseUrl(baseUrl: string | undefined): string {
@@ -87,6 +90,7 @@ export function WebShellWithProviders(props: WebShellWithProvidersProps) {
     workspaceCwd,
     lockWorkspaceCwd,
     clientId,
+    transport,
     ...webShellProps
   } = props;
   const resolvedBaseUrl = resolveBaseUrl(baseUrl);
@@ -99,7 +103,11 @@ export function WebShellWithProviders(props: WebShellWithProvidersProps) {
           : undefined
       }
     >
-      <DaemonWorkspaceProvider baseUrl={resolvedBaseUrl} token={token}>
+      <DaemonWorkspaceProvider
+        baseUrl={resolvedBaseUrl}
+        token={token}
+        transport={transport}
+      >
         <WorkspaceSessionProvider
           sessionId={sessionId}
           workspaceId={workspaceId}
