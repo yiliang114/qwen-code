@@ -179,6 +179,10 @@ function sanitizeValue(value: unknown, key?: string): unknown {
   );
 }
 
+export function sanitizeBrowserToolValue(value: unknown): unknown {
+  return sanitizeValue(value);
+}
+
 function truncateText(value: string, maxChars: number): string {
   if (value.length <= maxChars) return value;
   return `${value.slice(0, Math.max(0, maxChars - TRUNCATED_MARKER.length))}${TRUNCATED_MARKER}`;

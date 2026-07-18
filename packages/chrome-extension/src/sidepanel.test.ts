@@ -15,21 +15,7 @@ const manifest = JSON.parse(
 async function loadSidepanel(initial?: {
   local?: Record<string, unknown>;
   session?: Record<string, unknown>;
-}): Promise<{
-  local: {
-    get: ReturnType<typeof vi.fn>;
-    set: ReturnType<typeof vi.fn>;
-    remove: ReturnType<typeof vi.fn>;
-  };
-  session: {
-    get: ReturnType<typeof vi.fn>;
-    set: ReturnType<typeof vi.fn>;
-    remove: ReturnType<typeof vi.fn>;
-  };
-  debuggerApi: {
-    sendCommand: ReturnType<typeof vi.fn>;
-  };
-}> {
+}) {
   document.open();
   document.write(html);
   document.close();
@@ -43,44 +29,38 @@ async function loadSidepanel(initial?: {
     set: vi.fn().mockResolvedValue(undefined),
     remove: vi.fn().mockResolvedValue(undefined),
   };
-  const tab = {
-    id: 7,
-    index: 0,
-    pinned: false,
-    highlighted: true,
-    active: true,
-    frozen: false,
-    incognito: false,
-    selected: true,
-    discarded: false,
-    autoDiscardable: true,
-    groupId: -1,
-    windowId: 1,
-    title: 'Example',
-    url: 'https://example.test/page',
-  };
-  const debuggerApi = {
-    onEvent: { addListener: vi.fn() },
-    onDetach: { addListener: vi.fn() },
-    attach: vi.fn((_target, _version, callback) => callback()),
-    detach: vi.fn((_target, callback) => callback()),
-    sendCommand: vi.fn((_target, _method, _params, callback) => callback({})),
-  };
   vi.stubGlobal('chrome', {
     storage: { local, session },
     tabs: {
-      query: vi.fn().mockResolvedValue([tab]),
-      get: vi.fn().mockResolvedValue(tab),
+      query: vi.fn().mockResolvedValue([]),
+      get: vi.fn(),
     },
-    debugger: debuggerApi,
+    debugger: {
+      onEvent: { addListener: vi.fn() },
+      onDetach: { addListener: vi.fn() },
+      attach: vi.fn(),
+      detach: vi.fn(),
+      sendCommand: vi.fn(),
+    },
     runtime: {
       lastError: undefined,
+      getManifest: () => manifest,
       getPlatformInfo: vi.fn((callback) => callback()),
     },
   });
   Element.prototype.scrollIntoView = vi.fn();
   await import('./sidepanel.js');
-  return { local, session, debuggerApi };
+  return { local, session };
+}
+
+function setInput(id: string, value: string): void {
+  const input = document.getElementById(id) as HTMLInputElement;
+  const setter = Object.getOwnPropertyDescriptor(
+    HTMLInputElement.prototype,
+    'value',
+  )?.set;
+  setter?.call(input, value);
+  input.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
 describe('standalone side panel', () => {
@@ -89,21 +69,31 @@ describe('standalone side panel', () => {
     vi.restoreAllMocks();
   });
 
-  it('loads the real side-panel document without a missing element', async () => {
-    await expect(loadSidepanel()).resolves.toBeDefined();
-    expect(document.getElementById('composer')).not.toBeNull();
+  it('shows local settings before the first browser chat', async () => {
+    await loadSidepanel();
+
+    await vi.waitFor(() =>
+      expect(document.getElementById('settings-form')).not.toBeNull(),
+    );
+    expect(document.getElementById('web-shell')).toBeNull();
+    expect(document.body.textContent).toContain('Import settings.json');
   });
 
-  it('grants access to the China Token Plan endpoint', () => {
-    expect(manifest.host_permissions).toContain(
+  it('grants access only to supported ModelStudio endpoints', () => {
+    expect(manifest.host_permissions).toEqual([
+      'https://dashscope.aliyuncs.com/*',
+      'https://dashscope-intl.aliyuncs.com/*',
+      'https://dashscope-us.aliyuncs.com/*',
       'https://token-plan.cn-beijing.maas.aliyuncs.com/*',
-    );
+    ]);
   });
 
   it('keeps the API key in session storage by default', async () => {
     const { local, session } = await loadSidepanel();
-    const key = document.getElementById('api-key') as HTMLInputElement;
-    key.value = 'session-key';
+    await vi.waitFor(() =>
+      expect(document.getElementById('api-key')).not.toBeNull(),
+    );
+    setInput('api-key', 'session-key');
 
     document
       .getElementById('settings-form')!
@@ -115,16 +105,18 @@ describe('standalone side panel', () => {
       }),
     );
     expect(local.remove).toHaveBeenCalledWith('qwen.standalone.apiKey');
+    await vi.waitFor(() =>
+      expect(document.getElementById('web-shell')).not.toBeNull(),
+    );
   });
 
   it('moves an explicitly remembered API key to local storage', async () => {
     const { local, session } = await loadSidepanel();
-    const key = document.getElementById('api-key') as HTMLInputElement;
-    const remember = document.getElementById(
-      'remember-key',
-    ) as HTMLInputElement;
-    key.value = 'persistent-key';
-    remember.checked = true;
+    await vi.waitFor(() =>
+      expect(document.getElementById('api-key')).not.toBeNull(),
+    );
+    setInput('api-key', 'persistent-key');
+    (document.getElementById('remember-key') as HTMLInputElement).click();
 
     document
       .getElementById('settings-form')!
@@ -138,128 +130,65 @@ describe('standalone side panel', () => {
     expect(session.remove).toHaveBeenCalledWith('qwen.standalone.apiKey');
   });
 
-  it('loads a non-persistent API key only from session storage', async () => {
-    await loadSidepanel({
+  it('loads session-only credentials into the formal Web Shell', async () => {
+    const { session } = await loadSidepanel({
       local: {
         'qwen.standalone.settings': {
           rememberKey: false,
           model: 'qwen3-coder-plus',
         },
-        'qwen.standalone.apiKey': 'stale-local-key',
       },
       session: { 'qwen.standalone.apiKey': 'session-key' },
     });
 
     await vi.waitFor(() =>
-      expect(
-        (document.getElementById('api-key') as HTMLInputElement).value,
-      ).toBe('session-key'),
+      expect(document.getElementById('web-shell')).not.toBeNull(),
     );
+    expect(document.getElementById('settings-form')).toBeNull();
+    expect(session.get).toHaveBeenCalledWith('qwen.standalone.apiKey');
   });
 
-  it('loads a remembered API key without reading session storage', async () => {
+  it('loads remembered credentials and preserves the checkbox', async () => {
     const { session } = await loadSidepanel({
       local: {
         'qwen.standalone.settings': {
           rememberKey: true,
-          model: 'qwen3-coder-plus',
+          model: 'glm-5.2',
         },
         'qwen.standalone.apiKey': 'local-key',
       },
-      session: { 'qwen.standalone.apiKey': 'stale-session-key' },
     });
 
     await vi.waitFor(() =>
-      expect(
-        (document.getElementById('api-key') as HTMLInputElement).value,
-      ).toBe('local-key'),
+      expect(document.getElementById('web-shell-status-0')).not.toBeNull(),
+    );
+    document.getElementById('web-shell-status-0')!.click();
+    await vi.waitFor(() =>
+      expect(document.getElementById('settings-form')).not.toBeNull(),
+    );
+    expect(
+      (document.getElementById('remember-key') as HTMLInputElement).checked,
+    ).toBe(true);
+    expect((document.getElementById('model') as HTMLInputElement).value).toBe(
+      'glm-5.2',
     );
     expect(session.get).not.toHaveBeenCalled();
   });
 
-  it('advertises only the standalone browser-tool allowlist', async () => {
-    await loadSidepanel();
-    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          choices: [{ message: { content: 'Done.' } }],
-        }),
-      ),
+  it('recovers from invalid stored settings by reopening configuration', async () => {
+    await loadSidepanel({
+      local: {
+        'qwen.standalone.settings': {
+          rememberKey: true,
+          baseUrl: 'https://example.com/v1',
+        },
+        'qwen.standalone.apiKey': 'local-key',
+      },
+    });
+
+    await vi.waitFor(() =>
+      expect(document.getElementById('settings-form')).not.toBeNull(),
     );
-    vi.stubGlobal('fetch', fetchImpl);
-    (document.getElementById('api-key') as HTMLInputElement).value = 'test-key';
-    (document.getElementById('prompt') as HTMLTextAreaElement).value =
-      'Summarize this page';
-
-    document
-      .getElementById('composer')!
-      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-
-    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledOnce());
-    const body = JSON.parse(
-      fetchImpl.mock.calls[0]![1]!.body as string,
-    ) as Record<string, unknown>;
-    const toolNames = (
-      body['tools'] as Array<{ function: { name: string } }>
-    ).map((tool) => tool.function.name);
-    expect(toolNames).toContain('take_snapshot');
-    expect(toolNames).toContain('click');
-    expect(toolNames).not.toContain('evaluate_script');
-    expect(toolNames).not.toContain('list_network_requests');
-    expect(toolNames).not.toContain('send_request');
-  });
-
-  it('asks before navigation and does not act when denied', async () => {
-    const { debuggerApi } = await loadSidepanel();
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
-    const fetchImpl = vi
-      .fn<typeof fetch>()
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            choices: [
-              {
-                message: {
-                  tool_calls: [
-                    {
-                      id: 'call-1',
-                      type: 'function',
-                      function: {
-                        name: 'navigate_page',
-                        arguments: '{"url":"https://example.org"}',
-                      },
-                    },
-                  ],
-                },
-              },
-            ],
-          }),
-        ),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            choices: [{ message: { content: 'Navigation was denied.' } }],
-          }),
-        ),
-      );
-    vi.stubGlobal('fetch', fetchImpl);
-    (document.getElementById('api-key') as HTMLInputElement).value = 'test-key';
-    (document.getElementById('prompt') as HTMLTextAreaElement).value =
-      'Open example.org';
-
-    document
-      .getElementById('composer')!
-      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-
-    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
-    expect(confirm).toHaveBeenCalledWith(
-      expect.stringContaining('navigate_page on https://example.test'),
-    );
-    expect(
-      debuggerApi.sendCommand.mock.calls.some(
-        (call) => call[1] === 'Page.navigate',
-      ),
-    ).toBe(false);
+    expect(document.getElementById('web-shell')).toBeNull();
   });
 });

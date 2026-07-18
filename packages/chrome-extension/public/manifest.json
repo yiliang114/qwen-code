@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Qwen Browser Agent (Standalone Prototype)",
+  "name": "Qwen Browser Agent (Standalone)",
   "version": "0.1.0",
-  "description": "A browser-only Qwen agent that runs without qwen serve.",
+  "description": "A browser-only Qwen agent with the full Qwen Web Shell UI.",
   "permissions": ["activeTab", "tabs", "storage", "debugger", "sidePanel"],
   "host_permissions": [
     "https://dashscope.aliyuncs.com/*",

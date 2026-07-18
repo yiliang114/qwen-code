@@ -7,6 +7,14 @@
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      '@qwen-code/web-shell': new URL(
+        './src/test/web-shell.tsx',
+        import.meta.url,
+      ).pathname,
+    },
+  },
   test: {
     include: ['src/**/*.test.ts'],
     environment: 'jsdom',

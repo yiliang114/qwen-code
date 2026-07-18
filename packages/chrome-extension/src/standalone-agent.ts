@@ -50,7 +50,17 @@ export interface AgentOptions {
   ) => Promise<BrowserToolResult>;
   fetchImpl?: typeof fetch;
   signal?: AbortSignal;
-  onTool?: (name: string, args: Record<string, unknown>) => void;
+  onTool?: (
+    name: string,
+    args: Record<string, unknown>,
+    toolCallId: string,
+  ) => void;
+  onToolResult?: (
+    name: string,
+    args: Record<string, unknown>,
+    result: BrowserToolResult,
+    toolCallId: string,
+  ) => void;
   maxSteps?: number;
 }
 
@@ -101,7 +111,10 @@ function toolResultText(result: BrowserToolResult): string {
       ? item.text
       : `[${item.mimeType} image omitted from this text-only model request]`,
   );
-  return `${result.isError ? 'Tool error: ' : ''}${parts.join('\n')}`;
+  return `${result.isError ? 'Tool error: ' : ''}${parts.join('\n')}`.slice(
+    0,
+    65_536,
+  );
 }
 
 export function validateModelBaseUrl(value: string): string {
@@ -193,13 +206,13 @@ export async function runAgent(options: AgentOptions): Promise<AgentResult> {
           if (!allowedToolNames.has(call.function.name)) {
             throw new Error(`Tool '${call.function.name}' is unavailable`);
           }
-          options.onTool?.(call.function.name, args);
+          options.onTool?.(call.function.name, args, call.id);
           if (options.signal?.aborted) {
             text = 'User stopped the run before this action.';
           } else {
-            text = toolResultText(
-              await options.callTool(call.function.name, args),
-            );
+            const result = await options.callTool(call.function.name, args);
+            options.onToolResult?.(call.function.name, args, result, call.id);
+            text = toolResultText(result);
           }
         }
       } catch (error) {

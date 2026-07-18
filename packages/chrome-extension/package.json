@@ -1,7 +1,7 @@
 {
   "name": "@qwen-code/chrome-bridge",
   "version": "0.19.11",
-  "description": "Standalone Qwen browser agent prototype",
+  "description": "Standalone Qwen browser agent",
   "private": true,
   "repository": {
     "type": "git",
@@ -38,6 +38,14 @@
     "package": "npm run build && node scripts/package-extension.js && npm run scan:artifacts",
     "clean": "./scripts/clean.sh",
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@qwen-code/sdk": "file:../sdk-typescript",
+    "@qwen-code/web-shell": "file:../web-shell",
+    "@qwen-code/webui": "file:../webui",
+    "lucide-react": "^1.24.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.0.0"
   },
   "engines": {
     "node": ">=22.0.0"
