@@ -68,6 +68,9 @@ describe('main CI failure issue workflow', () => {
     );
     expect(workflow).toContain('--title "${title_prefix} ${WORKFLOW_NAME}');
     expect(workflow).toContain('gh issue comment "${existing_workflow_issue}"');
+    expect(workflow).toMatch(
+      /gh issue comment "\$\{existing_workflow_issue\}"[\s\S]*--body-file "\$\{comment_file\}"/,
+    );
     expect(workflow).toContain('## Additional CI Failure');
     expect(workflow.match(/echo "<!-- \$\{marker\} -->"/g)).toHaveLength(2);
     expect(workflow).toContain('${WORKFLOW_RUN_URL}');
