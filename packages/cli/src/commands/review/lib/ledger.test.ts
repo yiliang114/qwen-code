@@ -13,11 +13,14 @@ import {
   serializeLedger,
   parseLedger,
   stripLedgerMarker,
+  LEDGER_ID_READBACK,
   LEDGER_MAX_FINDINGS,
   LEDGER_MAX_FILE,
   LEDGER_MAX_TITLE,
   LEDGER_MAX_BYTES,
+  LEDGER_MAX_MODEL,
   type Ledger,
+  type LedgerFinding,
 } from './ledger.js';
 
 const LEDGER: Ledger = {
@@ -105,6 +108,221 @@ describe('ledger marker', () => {
   it('round-trips through a posted body', () => {
     const body = `Reviewed. Suggestions inline.\n\n${serializeLedger(LEDGER)}`;
     expect(parseLedger(body)).toEqual(LEDGER);
+  });
+
+  it('round-trips the incremental anchor sha', () => {
+    // The sha is the marker's second job: without it a fresh environment (CI,
+    // another clone) recovers the work list but not "last reviewed at", and
+    // the incremental range degrades to the full diff every time.
+    const anchored: Ledger = { ...LEDGER, sha: 'abc1234def567890' };
+    const body = `Reviewed.\n\n${serializeLedger(anchored)}`;
+    expect(parseLedger(body)).toEqual(anchored);
+  });
+
+  it('round-trips the anchor model beside the sha — incremental is a same-model contract', () => {
+    // The cache pairs `lastCommitSha` with `lastModelId`; the marker's anchor
+    // rode bare, so a round under another model that recovered it would scope
+    // `sha..HEAD` past code the current model never reviewed.
+    const anchored: Ledger = {
+      ...LEDGER,
+      sha: 'abc1234def567890',
+      model: 'qwen3.7-max',
+    };
+    expect(parseLedger(`Reviewed.\n\n${serializeLedger(anchored)}`)).toEqual(
+      anchored,
+    );
+  });
+
+  it('the model rides and falls WITH the anchor, on write and on read', () => {
+    // A model naming no range qualifies nothing: the serializer withholds it
+    // wherever it withholds the sha (fail-closed, truncated), and the parser
+    // drops a hand-edited model whose sha did not survive.
+    expect(serializeLedger({ ...LEDGER, model: 'qwen3.7-max' })).not.toContain(
+      'model',
+    );
+    const truncated = serializeLedger({
+      v: 1,
+      round: 2,
+      sha: 'abc1234def567890',
+      model: 'qwen3.7-max',
+      findings: Array.from({ length: LEDGER_MAX_FINDINGS + 1 }, (_, i) => ({
+        id: `R2-${i}`,
+        sev: 'C' as const,
+        file: 'src/a.ts',
+        title: 'x',
+      })),
+    });
+    expect(parseLedger(truncated)!.model).toBeUndefined();
+    for (const forged of [
+      '<!-- qwen-review-ledger {"v":1,"round":1,"findings":[],"model":"qwen3.7-max"} -->',
+      '<!-- qwen-review-ledger {"v":1,"round":1,"findings":[],"sha":"not hex","model":"qwen3.7-max"} -->',
+    ]) {
+      expect(parseLedger(forged)!.model).toBeUndefined();
+    }
+  });
+
+  it('normalises the model on both sides — trimmed, WHOLE, never a non-string', () => {
+    // The model rides whole or not at all: a truncated id is a prefix, and a
+    // prefix can equal a DIFFERENT model's full id — the same-model gate
+    // would then scope that other model past code it never reviewed
+    // (probe-measured: a 75-char id recovered as its 64-char prefix compared
+    // equal to the prefix's owner). On WRITE an over-cap model takes the
+    // anchor pair with it; on READ an over-cap model is one the serializer
+    // would never have written, so it drops — the gate reads the absence as
+    // a mismatch — and the sha survives.
+    const wide = serializeLedger({
+      v: 1,
+      round: 1,
+      findings: [],
+      sha: 'abc1234',
+      model: `  ${'m'.repeat(LEDGER_MAX_MODEL + 1)}  `,
+    });
+    expect(wide).not.toContain('"model"');
+    expect(wide).not.toContain('"sha"');
+    const forged = parseLedger(
+      `<!-- qwen-review-ledger {"v":1,"round":1,"findings":[],"sha":"abc1234","model":${JSON.stringify('x'.repeat(LEDGER_MAX_MODEL + 1))}} -->`,
+    );
+    expect(forged!.sha).toBe('abc1234');
+    expect(forged!.model).toBeUndefined();
+    // Exactly at the cap the identity rides whole — trimmed on both sides.
+    const full = serializeLedger({
+      v: 1,
+      round: 1,
+      findings: [],
+      sha: 'abc1234',
+      model: `  ${'m'.repeat(LEDGER_MAX_MODEL)}  `,
+    });
+    const recovered = parseLedger(full)!;
+    expect(recovered.model).toHaveLength(LEDGER_MAX_MODEL);
+    expect(recovered.model).toBe('m'.repeat(LEDGER_MAX_MODEL));
+    for (const model of ['', '   ', 42, null]) {
+      const raw = `<!-- qwen-review-ledger {"v":1,"round":1,"findings":[],"sha":"abc1234","model":${JSON.stringify(model)}} -->`;
+      expect(parseLedger(raw)!.model).toBeUndefined();
+    }
+  });
+
+  it('a truncated ledger loses its anchor — a partial work list must not certify a range', () => {
+    // Dropped entries reference code at or before the anchored head; a next
+    // round scoped to `sha..HEAD` would never re-see it, and Step 6 rules
+    // only on entries that are IN the list — the dropped ones would retire
+    // silently. Both halves hold the line: the serializer withholds the sha
+    // when it drops findings, and the parser strips a hand-edited marker
+    // that carries both.
+    const overflowing: Ledger = {
+      v: 1,
+      round: 2,
+      sha: 'abc1234def567890',
+      findings: Array.from({ length: LEDGER_MAX_FINDINGS + 1 }, (_, i) => ({
+        id: `R2-${i}`,
+        sev: 'C' as const,
+        file: 'src/a.ts',
+        title: 'x',
+      })),
+    };
+    const back = parseLedger(serializeLedger(overflowing));
+    expect(back!.dropped).toBeGreaterThan(0);
+    expect(back!.sha).toBeUndefined();
+    const handEdited = parseLedger(
+      '<!-- qwen-review-ledger {"v":1,"round":1,"findings":[],"dropped":3,"sha":"abc1234"} -->',
+    );
+    expect(handEdited!.sha).toBeUndefined();
+    // The count cap binds on READ too: a hand-edited marker carrying MORE
+    // valid entries than the serializer would ever emit — and no `dropped` —
+    // is truncated by this parser, and the entries it sliced off are dropped
+    // findings. Leaving the anchor on it would certify a range whose work
+    // list this very parse made partial (probe-measured on the shipped code:
+    // 51 entries parsed to 50 and KEPT the sha).
+    const overCount = parseLedger(
+      `<!-- qwen-review-ledger ${JSON.stringify({
+        v: 1,
+        round: 2,
+        sha: 'abc1234def567890',
+        findings: Array.from({ length: LEDGER_MAX_FINDINGS + 1 }, (_, i) => ({
+          id: `R2-${i}`,
+          sev: 'C',
+          file: 'a.ts',
+          title: 't',
+        })),
+      })} -->`,
+    )!;
+    expect(overCount.findings).toHaveLength(LEDGER_MAX_FINDINGS);
+    expect(overCount.dropped).toBe(1);
+    expect(overCount.sha).toBeUndefined();
+  });
+
+  it('over the cap, sheds the anchor pair BEFORE the work list', () => {
+    // The model field rides every clean marker, so a round that used to
+    // fit the cap overflows once it joins — and the loop's first casualty
+    // used to be a finding, with `dropped` then withholding the pair in
+    // the same render: the next round lost a ruling AND the anchor. The
+    // pair now sheds first and the whole work list survives; recovery
+    // degrades to the full diff, which the findings ride out.
+    const sha = 'deadbeef'.repeat(5);
+    const model = 'qwen3.7-max';
+    const wide = (i: number): LedgerFinding => ({
+      id: `R2-${i}`,
+      sev: 'S',
+      file: 'p/'.repeat(100).slice(0, LEDGER_MAX_FILE),
+      line: 99999,
+      title: 'x'.repeat(LEDGER_MAX_TITLE),
+    });
+    const small = (i: number): LedgerFinding => ({
+      id: `R2-${i}`,
+      sev: 'S',
+      file: 'a.ts',
+      line: i,
+      title: '',
+    });
+    const anchoredOf = (findings: LedgerFinding[]): string =>
+      serializeLedger({ v: 1, round: 2, findings, sha, model });
+    const anchorlessOf = (findings: LedgerFinding[]): string =>
+      serializeLedger({ v: 1, round: 2, findings });
+    const pairBytes = anchoredOf([]).length - anchorlessOf([]).length;
+    // Fill the ANCHORLESS form toward the cap: an over-cap render
+    // self-sheds, so a true fit is recognized by its signature — the
+    // marker growing by the added finding's width — which a shed render
+    // never shows (it reports `dropped` and shrinks instead).
+    const findings: LedgerFinding[] = [];
+    const fits = (candidate: LedgerFinding): boolean => {
+      const growth =
+        anchorlessOf([...findings, candidate]).length -
+        anchorlessOf(findings).length;
+      return growth >= 50;
+    };
+    for (;;) {
+      const i = findings.length;
+      if (i > LEDGER_MAX_FINDINGS) break;
+      if (fits(wide(i))) findings.push(wide(i));
+      else if (fits(small(i))) findings.push(small(i));
+      else break;
+    }
+    // The filled list sits at the boundary this ordering exists for: the
+    // anchorless form fits the cap, and the anchor pair's bytes beside it
+    // do not. Both halves measured from the below-cap anchorless render,
+    // which never self-sheds.
+    const anchorless = anchorlessOf(findings).length;
+    expect(anchorless).toBeLessThanOrEqual(LEDGER_MAX_BYTES);
+    expect(anchorless + pairBytes).toBeGreaterThan(LEDGER_MAX_BYTES);
+
+    const back = parseLedger(anchoredOf(findings))!;
+    expect(back.findings).toHaveLength(findings.length);
+    expect(back.dropped).toBeUndefined();
+    expect(back.sha).toBeUndefined();
+    expect(back.model).toBeUndefined();
+  });
+
+  it('drops a malformed sha but keeps the ledger — field-level fail-quiet', () => {
+    // The body is another account's writable surface. A garbage anchor must
+    // not cost the next round its work list, and must not survive as an
+    // anchor either — Step 1 would hand it to `git`.
+    const forged = `<!-- qwen-review-ledger {"v":1,"round":1,"findings":[],"sha":"$(rm -rf /)"} -->`;
+    const parsed = parseLedger(forged);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.sha).toBeUndefined();
+    // The serializer holds the same line: a non-hex sha never reaches the body.
+    expect(
+      serializeLedger({ v: 1, round: 1, findings: [], sha: 'not a sha' }),
+    ).not.toContain('sha');
   });
 
   it('is invisible-safe: no `--` survives into the comment payload', () => {
@@ -215,5 +433,29 @@ describe('ledger marker', () => {
   it('leaves an unterminated marker alone rather than truncating the body', () => {
     const body = 'prose <!-- qwen-review-ledger {"v":1 and the rest of it';
     expect(stripLedgerMarker(body)).toBe(body);
+  });
+});
+
+// The prefix-anchored readback both ledger read sides share wholesale:
+// compose-review's ledger builder and presubmit's re-post extractor.
+describe('LEDGER_ID_READBACK', () => {
+  // The shared regex's docstring claims the tolerated terminator set cannot
+  // drift between the two ends — which only holds if the set ITSELF is
+  // pinned: deleting a terminator from the class survives both consuming
+  // suites, and a prose-variant re-post then fails extraction at both ends
+  // and is dropped as a plain location overlap, re-creating #9208 with
+  // every consumer green (#9212 review).
+  const cases: Array<[string, string | null]> = [
+    ['R3-2: claim', 'R3-2'],
+    ['R3-2. claim', 'R3-2'],
+    ['R3-2) claim', 'R3-2'],
+    ['R3-2] claim', 'R3-2'],
+    ['R3-2 claim', 'R3-2'],
+    ['R3-2', 'R3-2'],
+    ['R3-2-1: extended run', null],
+    ['see R3-2: cross-reference', null],
+  ];
+  it.each(cases)('reads %j as %j', (line, expected) => {
+    expect(LEDGER_ID_READBACK.exec(line)?.[1] ?? null).toBe(expected);
   });
 });

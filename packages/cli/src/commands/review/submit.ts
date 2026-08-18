@@ -44,10 +44,12 @@
 // caller's.
 
 import type { CommandModule } from 'yargs';
+import { roundModelIdFrom } from './lib/round-model.js';
 import { atomicWriteFileSync } from '@qwen-code/qwen-code-core';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { writeStdoutLine, writeStderrLine } from '../../utils/stdioHelpers.js';
 import { getCliVersion } from '../../utils/version.js';
+import { operatorReviewSettings } from './lib/review-settings.js';
 import {
   ghWithInput,
   isOwnerRepo,
@@ -58,6 +60,7 @@ import { REVIEW_TMP_DIR, tmpFile } from './lib/paths.js';
 import { parseReceiptIds } from './lib/receipt.js';
 import { composeReview, type ComposeReviewInput } from './compose-review.js';
 import { reviewWriteAuthorization } from './lib/authorization.js';
+import { getPlatformReader, isAoneHost } from './lib/platform/registry.js';
 import {
   CRITICAL_PREFIX,
   SUGGESTION_PREFIX,
@@ -65,9 +68,9 @@ import {
   severityOf,
 } from './lib/inline-counts.js';
 import {
-  REVIEW_FOOTER_RE,
   footerVersion,
   reviewFooter,
+  stripReviewFooter,
 } from './lib/review-footer.js';
 
 /** The only events GitHub's Create Review API accepts. */
@@ -137,9 +140,12 @@ function normalizeInlineComments(
   comments: ReviewComment[],
   modelId: unknown,
   cliVersion: string,
+  attribution: boolean,
 ): ReviewComment[] {
-  if (typeof modelId !== 'string' || modelId.trim() === '') return comments;
-  const footer = reviewFooter(modelId, cliVersion);
+  const footer =
+    attribution && typeof modelId === 'string' && modelId.trim() !== ''
+      ? reviewFooter(modelId, cliVersion)
+      : undefined;
   return comments.map((comment) =>
     // An empty body stays empty: this runs BEFORE the consistency check, and
     // a footer pasted onto '' would hide the emptiness from the refusal that
@@ -147,7 +153,12 @@ function normalizeInlineComments(
     typeof comment.body === 'string' && comment.body.trim() !== ''
       ? {
           ...comment,
-          body: `${comment.body.replace(REVIEW_FOOTER_RE, '')}\n\n${footer}`,
+          // Forged footers are stripped even with attribution off: a comment
+          // authored by the model must not carry one the operator turned off.
+          body:
+            footer === undefined
+              ? stripReviewFooter(comment.body)
+              : `${stripReviewFooter(comment.body)}\n\n${footer}`,
         }
       : comment,
   );
@@ -167,9 +178,18 @@ function normalizeInlineComments(
  * user typed, and why it binds to a target rather than acting as a bearer
  * token.
  */
-function authorization(args: SubmitArgs): { ok: boolean; why: string } {
+function authorization(
+  args: SubmitArgs,
+  defaultComment: boolean,
+): {
+  ok: boolean;
+  why: string;
+  recordedHost?: string;
+  recordedUnbound?: boolean;
+} {
   return reviewWriteAuthorization({
     userAuthorized: args.userAuthorized,
+    defaultComment,
     skillArgs: args.skillArgs,
     pr: args.pr,
     repo: args.repo,
@@ -200,6 +220,8 @@ function authorization(args: SubmitArgs): { ok: boolean; why: string } {
 function compose(
   payload: ReviewPayload,
   cliVersion: string,
+  attribution: boolean,
+  runtimeModelId: string | undefined,
 ): {
   event: string;
   body: string;
@@ -237,6 +259,8 @@ function compose(
       draftedComments: comments,
     },
     cliVersion,
+    attribution,
+    runtimeModelId,
   );
   return { event: r.event, body: r.body, cappedBy: r.cappedBy };
 }
@@ -373,7 +397,17 @@ function inconsistencies(payload: ReviewPayload, event: string): string[] {
   return problems;
 }
 
-export function runSubmit(args: SubmitArgs, cliVersion = 'unknown'): void {
+export function runSubmit(
+  args: SubmitArgs,
+  cliVersion = 'unknown',
+  opts: {
+    /** Append the model/version attribution footer (the `review.attribution` setting). */
+    attribution?: boolean;
+    /** The standing `review.comment` setting, for the authorization gate. */
+    defaultComment?: boolean;
+  } = {},
+): void {
+  const { attribution = true, defaultComment = false } = opts;
   setGhHost(args.host);
 
   // The repo goes straight into the API path. A malformed value does not fail
@@ -400,22 +434,106 @@ export function runSubmit(args: SubmitArgs, cliVersion = 'unknown'): void {
     );
   }
 
-  const auth = authorization(args);
+  const auth = authorization(args, defaultComment);
   if (!auth.ok) {
     // Not an error the caller can retry around — a refusal it must accept. The
     // findings are not lost: they are in the terminal output and the saved
     // report, and the user can ask for them to be posted.
+    // The advice must match the refusal class, or it misdirects the retry:
+    // the gate refuses either because comment was never requested (its `why`
+    // carries `` `--comment` was ``) or because nothing recorded authorises
+    // this target — a binding miss, or no recorded arguments at all. The
+    // second arm's preamble stays neutral ("Nothing recorded…") because a
+    // setting-driven missing-args refusal lands here too, and "The recorded
+    // arguments do not bind" would contradict its `why` ("no review
+    // arguments were recorded"). `--comment` cannot fix the second class —
+    // the flag stands in for nothing a target binding needs, and the
+    // `review.comment` setting already stood in for the flag on exactly
+    // those refusals — so advising it there buys the futile retry loop
+    // authorization.ts's refusal wording exists to prevent.
+    const advice = auth.why.includes('`--comment` was')
+      ? `This is the correct outcome of a review the user did not ask to ` +
+        `publish — report the findings in the terminal and stop. Re-run with ` +
+        `\`--comment\`, or pass --user-authorized only after the user has ` +
+        `asked, in a message they typed, for this review to be published.`
+      : `Nothing recorded authorises binding this target — report the ` +
+        `findings in the terminal and stop. Posting to this pull request ` +
+        `needs a review invoked naming it, or --user-authorized after the ` +
+        `user has asked, in a message they typed, for this review to be ` +
+        `published.`;
     writeStderrLine(
       `REFUSED to post to ${args.repo}#${args.pr}: ${auth.why}.\n` +
         `Posting is a public, irreversible write, and this run has no ` +
-        `authorisation for one. This is the correct outcome of a review the ` +
-        `user did not ask to publish — report the findings in the terminal and ` +
-        `stop. Re-run with \`--comment\`, or pass --user-authorized only after ` +
-        `the user has asked, in a message they typed, for this review to be ` +
-        `published.`,
+        `authorisation for one. ${advice}`,
     );
     writeStdoutLine(
       JSON.stringify({ posted: false, reason: auth.why }, null, 2),
+    );
+    process.exitCode = 3;
+    return;
+  }
+
+  // Posting is GitHub-only in this phase. On an Aone target the Create
+  // Review API does not exist — refuse with the SAME shape as an
+  // unauthorised refusal (stderr explanation, stdout `{"posted": false}`,
+  // exit 3): the skill's Step 7 treats that shape as a complete, correct
+  // outcome, and a throw instead would surface as a failed command an agent
+  // might retry or route around. The refusal sits BELOW the authorisation
+  // gate on purpose — an unauthorised Aone run takes the normal exit-3
+  // path above, and the command no longer dies with a throw before the gate
+  // can rule (an authorised Aone `--dry-run` lands on this same exit-3
+  // refusal: a payload that can never post has no posting-consistency to
+  // validate).
+  //
+  // The platform decision is bound in BOTH directions, because the
+  // runtime-effective host alone fails both ways:
+  //  - Recorded Aone target + non-Aone effective host (an ambient GH_HOST
+  //    export beside a bare-MR-number Aone review) must still refuse —
+  //    otherwise the read-only guarantee leaks and the review POSTs to the
+  //    wrong host's same-named repo. So a recorded Aone host always
+  //    refuses, whatever the environment resolves.
+  //  - Recorded non-Aone target (pr-url host binding) must NOT be vetoed
+  //    by the cwd probe from an Aone-origin clone — the recorded binding
+  //    is the explicit signal the registry's precedence documents.
+  //  - RECORDED but hostless (a bare-MR-number recording with no `--host`
+  //    flag — the canonical Aone invocation shape carries no URL): the
+  //    recording proves a review exists but not WHERE it lives, and the
+  //    runtime environment cannot prove it either. For a public,
+  //    irreversible write that is fail-CLOSED: refuse and name the remedy
+  //    (`--host`), instead of trusting the environment and posting the
+  //    review at github.com's same-named repo.
+  //  - No recording at all: fall back to the flag, then GH_HOST (ghEnv
+  //    inherits the operator's export when no module host is set, so an
+  //    Aone-pointing GH_HOST must hit this refusal, not an opaque gh
+  //    failure), then the cwd clone.
+  // resolveGhHost trims, so a padded `--host` cannot slip past detection.
+  // The findings are not lost: they are in the terminal output and the
+  // saved report.
+  const recordedHost = auth.recordedHost;
+  const aoneWrite =
+    isAoneHost(recordedHost) ||
+    auth.recordedUnbound === true ||
+    (recordedHost === undefined &&
+      (isAoneHost(resolveGhHost(args.host)) ||
+        getPlatformReader({ host: args.host?.trim() || undefined }).kind ===
+          'aone'));
+  if (aoneWrite) {
+    writeStderrLine(
+      `REFUSED to post to ${args.repo}#${args.pr}: posting review comments ` +
+        `to Aone Code is not supported yet (read-only phase). The findings ` +
+        `are in the terminal output and the saved report; post them ` +
+        `manually or wait for the write phase.` +
+        (auth.recordedUnbound === true && !isAoneHost(recordedHost)
+          ? ` (the recorded target names no platform — pass \`--host\` to ` +
+            `prove it is not an Aone MR)`
+          : ''),
+    );
+    writeStdoutLine(
+      JSON.stringify(
+        { posted: false, reason: 'aone-read-only-phase' },
+        null,
+        2,
+      ),
     );
     process.exitCode = 3;
     return;
@@ -438,6 +556,7 @@ export function runSubmit(args: SubmitArgs, cliVersion = 'unknown'): void {
       payload.comments ?? [],
       payload.state?.modelId,
       cliVersion,
+      attribution,
     ),
   };
 
@@ -446,7 +565,19 @@ export function runSubmit(args: SubmitArgs, cliVersion = 'unknown'): void {
   let body: string;
   let cappedBy: string[];
   try {
-    ({ event, body, cappedBy } = compose(payload, cliVersion));
+    ({ event, body, cappedBy } = compose(
+      payload,
+      cliVersion,
+      attribution,
+      // The anchor's certifying identity is the model the runtime published
+      // for this session — Config publishes it per session, the shell tool
+      // injects it into this subprocess. It supersedes the typed id, but the
+      // launching command can still override the env (and a hijacked
+      // orchestrator can forge the marker outright via the API) — the same
+      // forgeable posture DESIGN.md records for the cache path.
+      // The identity this round runs under — see lib/round-model.ts.
+      roundModelIdFrom(process.env),
+    ));
   } catch (err) {
     throw new Error(
       `The review state does not compose into a verdict; refusing to post:\n` +
@@ -588,7 +719,7 @@ export const submitCommand: CommandModule = {
       .option('skill-args', {
         type: 'string',
         describe:
-          "Path to the CLI-written record of the review's invocation arguments (defaults to .qwen/tmp/qwen-skill-args-review.txt). Its `--comment` is what authorises a post. Deliberately NOT the parser's JSON output: that is a document the caller writes, and a caller that wants to post can write anything in it.",
+          "Path to the CLI-written record of the review's invocation arguments (defaults to .qwen/tmp/qwen-skill-args-review.txt). Its `--comment` — or the standing `review.comment` setting — is what authorises a post. Deliberately NOT the parser's JSON output: that is a document the caller writes, and a caller that wants to post can write anything in it.",
       })
       .option('user-authorized', {
         type: 'boolean',
@@ -610,6 +741,10 @@ export const submitCommand: CommandModule = {
     const cliVersion =
       footerVersion(process.env['QWEN_CODE_STARTUP_VERSION']) ??
       (await getCliVersion());
-    runSubmit(argv as unknown as SubmitArgs, cliVersion);
+    const review = operatorReviewSettings();
+    runSubmit(argv as unknown as SubmitArgs, cliVersion, {
+      attribution: review.attribution,
+      defaultComment: review.comment,
+    });
   },
 };
