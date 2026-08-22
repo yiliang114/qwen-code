@@ -4985,6 +4985,7 @@ describe('CoreToolScheduler', () => {
       onAllToolCallsComplete,
       chatRecordingService: {
         recordToolResult,
+        flush: vi.fn().mockResolvedValue(undefined),
       } as unknown as ChatRecordingService,
     });
 

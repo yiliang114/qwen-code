@@ -6076,6 +6076,7 @@ export class CoreToolScheduler {
         }
 
         this.recordToolResults(completedCalls);
+        await this.chatRecordingService?.flush();
 
         if (this.onAllToolCallsComplete) {
           await this.onAllToolCallsComplete(completedCalls);
