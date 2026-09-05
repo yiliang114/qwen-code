@@ -135,6 +135,37 @@ describe('ci.yml disk-pressure evidence', () => {
     );
   });
 
+  it('pins the infra-flake gate that reads the tee capture', () => {
+    const runTests = step('Run tests and generate reports');
+    const tests = runTests.run;
+
+    // PIPESTATUS is reset by any statement between the pipeline and the
+    // capture, so adjacency is the property: inserting one line there leaves
+    // RC=0 and the required Test check goes green on any workspaces failure,
+    // with no other pin in the repo noticing. Comments are allowed between.
+    assert.match(
+      tests,
+      /\| tee "\$WORKSPACES_LOG"\n(?:#[^\n]*\n)*RC=\$\{PIPESTATUS\[0\]\} TEE_RC=\$\{PIPESTATUS\[1\]\}\nif /,
+    );
+
+    // tee's own status must gate the verdict: a sink that hit a write error on
+    // this TMPDIR leaves a truncated capture, and "no FAIL line" measured over
+    // a prefix of the run is not evidence. The switch is compared against '1'
+    // rather than '!= 0' so an operator's 'off' or a typo disables the
+    // tolerance instead of silently leaving it on.
+    assert.match(
+      tests,
+      /if \[ "\$RC" -ne 0 \] && \[ "\$TEE_RC" -eq 0 \] && \[ "\$\{QWEN_CI_TOLERATE_RPC_TIMEOUT:-1\}" = '1' \]; then\n {2}node \.github\/scripts\/ci\/classify-infra-flake\.mjs/,
+    );
+
+    // The reader's `:-1` default keeps the tolerance on if this binding is
+    // dropped or renamed, so pin the binding beside the shell comparison.
+    assert.equal(
+      runTests.env['QWEN_CI_TOLERATE_RPC_TIMEOUT'],
+      "${{ vars.QWEN_CI_TOLERATE_RPC_TIMEOUT || '1' }}",
+    );
+  });
+
   it('gives lint_and_static the same sampler and its own collector', () => {
     // The install step is pinned byte-identical to test's by
     // ci-platform-lanes.test.js's shared-prelude equality; what that pin
