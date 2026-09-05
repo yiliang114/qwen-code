@@ -147,6 +147,28 @@ test('fails closed when a blamed workspace wrote no junit', () => {
   assert.match(verdict.reason, /packages\/core wrote no junit\.xml/);
 });
 
+test('fails closed on a blamed workspace outside packages/', () => {
+  // `npm run test:ci:workspaces` runs the integrations/* workspaces too, so
+  // npm can blame one of them. A blame line the pattern drops is a dead
+  // workspace that is never junit-checked, tolerated on the strength of an
+  // unrelated leg's RPC timeout.
+  const log = `${ALL_GREEN_RPC_LOG}\n${TS}npm error path /_work/qwen-code/qwen-code/integrations/external-context`;
+  assert.deepEqual(failingWorkspaceDirs(log), [
+    'packages/cli',
+    'packages/core',
+    'integrations/external-context',
+  ]);
+  const verdict = classify({
+    logText: log,
+    readJunit: junitFor(['packages/cli/junit.xml', 'packages/core/junit.xml']),
+  });
+  assert.equal(verdict.tolerated, false);
+  assert.match(
+    verdict.reason,
+    /integrations\/external-context wrote no junit\.xml/,
+  );
+});
+
 test('fails closed when junit reports failures', () => {
   const verdict = classify({
     logText: ALL_GREEN_RPC_LOG,
@@ -155,6 +177,24 @@ test('fails closed when junit reports failures', () => {
   });
   assert.equal(verdict.tolerated, false);
   assert.match(verdict.reason, /packages\/cli\/junit\.xml reports 2 failure/);
+});
+
+test('fails closed when a blamed workspace recorded zero tests', () => {
+  // What vitest writes when its include matched nothing: a well-formed report
+  // with tests="0" and a non-zero exit. "No failure recorded" is not evidence
+  // that anything ran.
+  const verdict = classify({
+    logText: ALL_GREEN_RPC_LOG,
+    readJunit: (relative) =>
+      relative === 'packages/core/junit.xml'
+        ? '<testsuites name="vitest tests" tests="0" failures="0" errors="0" time="0"></testsuites>'
+        : junit(),
+  });
+  assert.equal(verdict.tolerated, false);
+  assert.match(
+    verdict.reason,
+    /packages\/core\/junit\.xml reports 0 test\(s\)/,
+  );
 });
 
 test('fails closed when npm blamed no workspace', () => {

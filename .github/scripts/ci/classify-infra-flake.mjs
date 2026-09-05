@@ -43,13 +43,14 @@ import { extractFailingTests } from './main-failure-signature.mjs';
  *
  * Tolerating is only safe on positive evidence, so every branch below fails
  * closed. The exit is attributed to a workspace only when npm named that
- * workspace, that workspace wrote a junit.xml, and its totals report zero
- * failures — a worker that was OOM-killed or segfaulted writes no junit and
- * stays red. Any real `FAIL` line anywhere in the log also keeps the run red,
- * because junit's `failures` counter is per file and a suite that died during
- * collection can leave a file's totals at zero. And the unhandled-error count
- * vitest itself prints must equal the number of RPC timeouts, so an unrelated
- * unhandled error riding along in the same run is never masked by them.
+ * workspace, that workspace wrote a junit.xml, and its totals report at least
+ * one test and zero failures — a worker that was OOM-killed or segfaulted
+ * writes no junit and stays red. Any real `FAIL` line anywhere in the log also
+ * keeps the run red, because junit's `failures` counter is per file and a
+ * suite that died during collection can leave a file's totals at zero. And the
+ * unhandled-error count vitest itself prints must equal the number of RPC
+ * timeouts, so an unrelated unhandled error riding along in the same run is
+ * never masked by them.
  *
  * The verdict is a warning, never silence: the pool being over capacity is the
  * actual defect, and a green job that hides it would remove the only pressure
@@ -66,8 +67,13 @@ const CAUGHT_UNHANDLED_PATTERN =
   /Vitest caught (\d+) unhandled errors? during the test run/g;
 
 /** Only the Linux `test` leg runs on the ECS pool, so only POSIX separators
- * are matched; the macOS and Windows legs do not call this classifier. */
-const NPM_ERROR_PATH_PATTERN = /^npm error path .*\/(packages\/\S+)$/gm;
+ * are matched; the macOS and Windows legs do not call this classifier. The
+ * alternation spans every workspace glob in the root package.json
+ * (`packages/*`, `packages/channels/*`, `integrations/*`): a blame line this
+ * pattern drops names a workspace that is then never junit-checked, so a
+ * workspace root added later must be added here in the same commit. */
+const NPM_ERROR_PATH_PATTERN =
+  /^npm error path .*?\/((?:packages|integrations)\/\S+)$/gm;
 
 const TESTSUITES_OPEN_PATTERN = /<testsuites\b[^>]*>/;
 
@@ -212,6 +218,17 @@ export function classify(options = {}) {
       return refuse(`${workspace}/junit.xml carries no <testsuites> totals`, {
         workspaces,
       });
+    }
+    // "No test failed" and "no test ran" are different claims. A workspace
+    // whose include matched nothing — a renamed test directory, a narrowed
+    // glob — exits 1 having written a well-formed report with tests="0", and
+    // certifying that as "every test passed" would green a suite that has
+    // silently stopped existing.
+    if (!totals.tests) {
+      return refuse(
+        `${workspace}/junit.xml reports ${totals.tests} test(s) — nothing was recorded`,
+        { workspaces },
+      );
     }
     if (totals.failures !== 0) {
       return refuse(
