@@ -2902,6 +2902,7 @@ describe('CoreToolScheduler', () => {
         toolOutputBatchBudget: 10_000,
         chatRecordingService: {
           recordToolResult,
+          flush: vi.fn().mockResolvedValue(undefined),
         } as unknown as ChatRecordingService,
       });
 
