@@ -483,34 +483,54 @@ function channelSettingsScope(workspaceCwd: string): SettingsFile {
   return loaded.workspaceSettingsActive ? loaded.workspace : loaded.user;
 }
 
-function workspaceValues(workspaceCwd: string): {
-  channels: Record<string, Record<string, unknown>>;
-  startupNames: string[];
-} {
-  const settings = channelSettingsScope(workspaceCwd).settings;
-  const rawChannels = isRecord(settings.channels) ? settings.channels : {};
+function channelRecordMap(value: unknown): Record<string, Record<string, unknown>> {
+  const rawChannels = isRecord(value) ? value : {};
   const channels: Record<string, Record<string, unknown>> = {};
   for (const [name, config] of Object.entries(rawChannels)) {
     if (isRecord(config)) channels[name] = config;
   }
+  return channels;
+}
+
+function snapshotFrom(values: {
+  channels: Record<string, Record<string, unknown>>;
+  startupNames: string[];
+}): ChannelSettingsSnapshot {
+  return {
+    revision: revisionOf(values.channels, values.startupNames),
+    channels: { ...values.channels },
+    startupNames: [...values.startupNames],
+  };
+}
+
+function workspaceValues(workspaceCwd: string): {
+  channels: Record<string, Record<string, unknown>>;
+  storedChannels: Record<string, Record<string, unknown>>;
+  startupNames: string[];
+} {
+  const scope = channelSettingsScope(workspaceCwd);
+  const settings = scope.settings;
   const startupNames = Array.isArray(settings.serve?.channels)
     ? settings.serve.channels.filter(
         (name): name is string => typeof name === 'string',
       )
     : [];
-  return { channels, startupNames };
+  return {
+    channels: channelRecordMap(settings.channels),
+    // A save replaces the whole `channels` subtree, so the write set has to be
+    // built from the stored form. `settings` is env-resolved: deriving the
+    // write set from it rewrites every untouched channel's `$VAR` reference as
+    // the resolved literal, materializing secrets in plaintext on disk.
+    storedChannels: channelRecordMap(scope.originalSettings.channels),
+    startupNames,
+  };
 }
 
 export class WorkspaceChannelSettingsStore {
   constructor(private readonly workspaceCwd: string) {}
 
   snapshot(): ChannelSettingsSnapshot {
-    const { channels, startupNames } = workspaceValues(this.workspaceCwd);
-    return {
-      revision: revisionOf(channels, startupNames),
-      channels: { ...channels },
-      startupNames: [...startupNames],
-    };
+    return snapshotFrom(workspaceValues(this.workspaceCwd));
   }
 
   async upsert(
@@ -548,15 +568,28 @@ export class WorkspaceChannelSettingsStore {
       }
     }
 
-    const current = this.assertRevision(options.expectedRevision);
+    const { current, storedChannels } = this.assertRevision(
+      options.expectedRevision,
+    );
     const storedPrevious = current.channels[name] ?? {};
     const previous =
       storedPrevious['type'] === options.config.type ? storedPrevious : {};
+    // The same config as it is stored on disk, without env resolution.
+    const storedOnDisk = storedChannels[name] ?? {};
+    const previousOnDisk =
+      storedOnDisk['type'] === options.config.type ? storedOnDisk : {};
     const nextConfig: Record<string, unknown> = { ...options.config };
+    const storedSecrets: Record<string, unknown> = {};
     for (const key of secretKeys) {
       const update = secretUpdates[key] ?? { operation: 'preserve' };
       const value = applySecretUpdate(previous[key], update);
       if (value !== undefined) nextConfig[key] = value;
+      // Validation below runs against the resolved value; what gets persisted
+      // keeps the stored reference, so preserving a secret does not bake the
+      // resolved literal into the settings file.
+      if (update.operation === 'preserve' && previousOnDisk[key] !== undefined) {
+        storedSecrets[key] = previousOnDisk[key];
+      }
     }
     assertManagedConfig(nextConfig, previous, plugin.management.fields);
     const multiSessionError = multiSessionCompatibilityError(name, {
@@ -597,7 +630,10 @@ export class WorkspaceChannelSettingsStore {
       );
     }
 
-    const channels = { ...current.channels, [name]: nextConfig };
+    const channels = {
+      ...storedChannels,
+      [name]: { ...nextConfig, ...storedSecrets },
+    };
     saveSettings(
       channelSettingsScope(this.workspaceCwd),
       { channels },
@@ -612,8 +648,10 @@ export class WorkspaceChannelSettingsStore {
     options: ChannelSettingsMutationOptions,
   ): Promise<ChannelSettingsSnapshot> {
     assertSafeChannelName(name);
-    const current = this.assertRevision(options.expectedRevision);
-    const channels = { ...current.channels };
+    const { current, storedChannels } = this.assertRevision(
+      options.expectedRevision,
+    );
+    const channels = { ...storedChannels };
     delete channels[name];
     const hasAllSentinel = current.startupNames.some(isAllStartupName);
     const startupNames = hasAllSentinel
@@ -649,14 +687,18 @@ export class WorkspaceChannelSettingsStore {
     return this.snapshot();
   }
 
-  private assertRevision(expectedRevision: string): ChannelSettingsSnapshot {
-    const current = this.snapshot();
+  private assertRevision(expectedRevision: string): {
+    current: ChannelSettingsSnapshot;
+    storedChannels: Record<string, Record<string, unknown>>;
+  } {
+    const values = workspaceValues(this.workspaceCwd);
+    const current = snapshotFrom(values);
     if (current.revision !== expectedRevision) {
       throw new ChannelSettingsError(
         'channel_settings_conflict',
         'Channel settings changed; reload before trying again.',
       );
     }
-    return current;
+    return { current, storedChannels: values.storedChannels };
   }
 }

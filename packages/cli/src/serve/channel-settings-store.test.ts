@@ -19,7 +19,7 @@ import {
 import stripJsonComments from 'strip-json-comments';
 import type { ChannelPlugin } from '@qwen-code/channel-base';
 import { registerPlugin } from '../commands/channel/channel-registry.js';
-import { resetHomeEnvBootstrapForTesting } from '../config/settings.js';
+import { loadSettings, resetHomeEnvBootstrapForTesting } from '../config/settings.js';
 import { WorkspaceChannelSettingsStore } from './channel-settings-store.js';
 
 let mockHomeDir = '';
@@ -179,32 +179,46 @@ describe('WorkspaceChannelSettingsStore', () => {
   });
 
   it('preserves an existing secret unless replace or clear is explicit', async () => {
-    const store = new WorkspaceChannelSettingsStore(workspace);
-    const first = store.snapshot();
+    // The stored secret is an environment reference, so the assertion below only
+    // means something with the variable defined: while it is unset, resolution
+    // is a no-op and the reference survives whether or not the write set is
+    // derived from the stored form.
+    const savedBotToken = process.env['BOT_TOKEN'];
+    process.env['BOT_TOKEN'] = 'sekret-plaintext';
+    try {
+      const store = new WorkspaceChannelSettingsStore(workspace);
+      const first = store.snapshot();
 
-    await store.upsert('bot', {
-      expectedRevision: first.revision,
-      config: {
+      await store.upsert('bot', {
+        expectedRevision: first.revision,
+        config: {
+          type: 'management-validation-test',
+          clientId: 'client-id',
+          senderPolicy: 'pairing',
+        },
+        secrets: { clientSecret: { operation: 'preserve' } },
+      });
+
+      expect(
+        (
+          readWorkspaceSettings()['channels'] as Record<
+            string,
+            Record<string, unknown>
+          >
+        )['bot'],
+      ).toEqual({
         type: 'management-validation-test',
         clientId: 'client-id',
         senderPolicy: 'pairing',
-      },
-      secrets: { clientSecret: { operation: 'preserve' } },
-    });
-
-    expect(
-      (
-        readWorkspaceSettings()['channels'] as Record<
-          string,
-          Record<string, unknown>
-        >
-      )['bot'],
-    ).toEqual({
-      type: 'management-validation-test',
-      clientId: 'client-id',
-      senderPolicy: 'pairing',
-      clientSecret: '$BOT_TOKEN',
-    });
+        clientSecret: '$BOT_TOKEN',
+      });
+    } finally {
+      if (savedBotToken === undefined) {
+        delete process.env['BOT_TOKEN'];
+      } else {
+        process.env['BOT_TOKEN'] = savedBotToken;
+      }
+    }
   });
 
   it('preserves an existing secret when its operation is omitted', async () => {
@@ -1961,6 +1975,29 @@ describe('WorkspaceChannelSettingsStore', () => {
   });
 
   describe('home-directory workspace', () => {
+    // The home-directory layout with the user scope redirected away from
+    // `<workspace>/.qwen`, so a write that targets the workspace scope lands in
+    // a file no scope reads. `mockHomeDir` has to be a directory that exists:
+    // the loader calls `realpathSync` on the home directory unguarded.
+    const useRedirectedUserScope = (userSettings: Record<string, unknown>) => {
+      const redirectedHome = path.join(testRoot, 'redirected-home');
+      const userSettingsPath = path.join(redirectedHome, 'settings.json');
+      fs.mkdirSync(redirectedHome, { recursive: true });
+      fs.writeFileSync(userSettingsPath, JSON.stringify(userSettings));
+      process.env['QWEN_HOME'] = redirectedHome;
+      mockHomeDir = workspace;
+      resetHomeEnvBootstrapForTesting();
+      return userSettingsPath;
+    };
+
+    const readUserSettings = (userSettingsPath: string) =>
+      JSON.parse(
+        stripJsonComments(fs.readFileSync(userSettingsPath, 'utf8')),
+      ) as {
+        channels?: Record<string, Record<string, unknown>>;
+        serve?: { channels?: string[] };
+      };
+
     it('keeps channel configs readable when the workspace is the home directory', async () => {
       // A daemon whose workspace is the user's home directory disables the
       // workspace settings scope; the shared settings file is attributed to
@@ -1976,6 +2013,15 @@ describe('WorkspaceChannelSettingsStore', () => {
         // otherwise resolve the real home directory and write outside
         // testRoot while the suite still reports green.
         expect(os.homedir()).toBe(workspace);
+        // Pin the branch under test: the loader has to attribute the shared
+        // settings file to the user scope. Mocking `os.homedir()` alone does not
+        // prove that — if the mock ever stops reaching the loader, this test
+        // would silently exercise the workspace-scope branch against the real
+        // `~/.qwen/settings.json` and still pass.
+        expect(
+          loadSettings(workspace, { skipLoadEnvironment: true })
+            .workspaceSettingsActive,
+        ).toBe(false);
 
         const store = new WorkspaceChannelSettingsStore(workspace);
         const initial = store.snapshot();
@@ -2063,6 +2109,112 @@ describe('WorkspaceChannelSettingsStore', () => {
         expect(readWorkspaceSettings()['channels']).not.toHaveProperty(
           'home-bot',
         );
+      } finally {
+        resetHomeEnvBootstrapForTesting();
+      }
+    });
+
+    it("keeps a sibling channel's stored environment reference on save", async () => {
+      const userSettingsPath = useRedirectedUserScope({
+        $version: 4,
+        channels: {
+          bot: {
+            type: 'management-validation-test',
+            clientId: 'client-id',
+            clientSecret: '$BOT_TOKEN',
+          },
+        },
+      });
+      const savedBotToken = process.env['BOT_TOKEN'];
+      process.env['BOT_TOKEN'] = 'sekret-plaintext';
+      try {
+        const store = new WorkspaceChannelSettingsStore(workspace);
+
+        // A save replaces the whole `channels` subtree, so the untouched
+        // sibling is rewritten from whatever the write set is derived from.
+        // Deriving it from the resolved settings would leave the literal token
+        // at rest in the user-global file.
+        await store.upsert('alerts', {
+          expectedRevision: store.snapshot().revision,
+          config: {
+            type: 'management-validation-test',
+            clientId: 'alerts-client',
+          },
+          secrets: { clientSecret: { operation: 'replace', value: 'a' } },
+        });
+
+        expect(
+          readUserSettings(userSettingsPath).channels?.['bot']?.[
+            'clientSecret'
+          ],
+        ).toBe('$BOT_TOKEN');
+      } finally {
+        if (savedBotToken === undefined) {
+          delete process.env['BOT_TOKEN'];
+        } else {
+          process.env['BOT_TOKEN'] = savedBotToken;
+        }
+        resetHomeEnvBootstrapForTesting();
+      }
+    });
+
+    it('removes channel configs from the scope it reads them from', async () => {
+      const userSettingsPath = useRedirectedUserScope({
+        $version: 4,
+        channels: {
+          'user-bot': {
+            type: 'management-validation-test',
+            clientId: 'user-client',
+            clientSecret: 'user-secret',
+          },
+        },
+      });
+      try {
+        const store = new WorkspaceChannelSettingsStore(workspace);
+
+        const next = await store.remove('user-bot', {
+          expectedRevision: store.snapshot().revision,
+        });
+
+        expect(next.channels).not.toHaveProperty('user-bot');
+        expect(readUserSettings(userSettingsPath).channels).not.toHaveProperty(
+          'user-bot',
+        );
+        // A remove aimed at the workspace scope would still answer with a
+        // snapshot that looks empty while the channel and its credentials stay
+        // in the file every read path consults.
+        expect(readWorkspaceSettings()['channels']).toHaveProperty('bot');
+      } finally {
+        resetHomeEnvBootstrapForTesting();
+      }
+    });
+
+    it('writes the startup channel list to the scope it reads it from', async () => {
+      const userSettingsPath = useRedirectedUserScope({
+        $version: 4,
+        channels: {
+          'home-bot': {
+            type: 'management-validation-test',
+            clientId: 'home-client',
+            clientSecret: 'home-secret',
+          },
+        },
+        serve: { channels: [] },
+      });
+      try {
+        const store = new WorkspaceChannelSettingsStore(workspace);
+
+        const next = await store.setStartupNames(['home-bot'], {
+          expectedRevision: store.snapshot().revision,
+        });
+
+        expect(next.startupNames).toEqual(['home-bot']);
+        expect(readUserSettings(userSettingsPath).serve?.channels).toEqual([
+          'home-bot',
+        ]);
+        // Written to the workspace scope instead, the toggle is a silent no-op:
+        // nothing reads that file in this layout.
+        expect(readWorkspaceSettings()['serve']).not.toHaveProperty('channels');
       } finally {
         resetHomeEnvBootstrapForTesting();
       }
