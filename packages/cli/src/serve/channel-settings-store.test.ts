@@ -222,15 +222,68 @@ describe('WorkspaceChannelSettingsStore', () => {
   });
 
   it('preserves an existing secret when its operation is omitted', async () => {
-    const store = new WorkspaceChannelSettingsStore(workspace);
+    // As in the test above, the stored reference only proves the write set came
+    // from the stored form while the variable resolves to something else.
+    const savedBotToken = process.env['BOT_TOKEN'];
+    process.env['BOT_TOKEN'] = 'sekret-plaintext';
+    try {
+      const store = new WorkspaceChannelSettingsStore(workspace);
 
-    await store.upsert('bot', {
-      expectedRevision: store.snapshot().revision,
+      await store.upsert('bot', {
+        expectedRevision: store.snapshot().revision,
+        config: {
+          type: 'management-validation-test',
+          clientId: 'client-id',
+          senderPolicy: 'pairing',
+        },
+      });
+
+      expect(
+        (
+          readWorkspaceSettings()['channels'] as Record<
+            string,
+            Record<string, unknown>
+          >
+        )['bot']?.['clientSecret'],
+      ).toBe('$BOT_TOKEN');
+    } finally {
+      if (savedBotToken === undefined) {
+        delete process.env['BOT_TOKEN'];
+      } else {
+        process.env['BOT_TOKEN'] = savedBotToken;
+      }
+    }
+  });
+
+  it('does not read a channel planted under a reserved key', async () => {
+    // `__proto__` stays an own key through JSON.parse, so a settings file can
+    // carry a channel the read view never lists. Building the stored-form map by
+    // assignment would make it that map's prototype instead, and a later upsert
+    // of the planted name would persist the planted secret the user never
+    // supplied and validation never saw.
+    writeWorkspaceSettings(`{
+  "$version": 4,
+  "channels": {
+    "__proto__": {
+      "planted-bot": {
+        "type": "management-validation-test",
+        "clientId": "planted-client",
+        "optionalSecret": "$ATTACKER_TOKEN"
+      }
+    }
+  }
+}\n`);
+    const store = new WorkspaceChannelSettingsStore(workspace);
+    const initial = store.snapshot();
+    expect(initial.channels).toEqual({});
+
+    await store.upsert('planted-bot', {
+      expectedRevision: initial.revision,
       config: {
         type: 'management-validation-test',
-        clientId: 'client-id',
-        senderPolicy: 'pairing',
+        clientId: 'user-client',
       },
+      secrets: { clientSecret: { operation: 'replace', value: 'user-secret' } },
     });
 
     expect(
@@ -239,8 +292,12 @@ describe('WorkspaceChannelSettingsStore', () => {
           string,
           Record<string, unknown>
         >
-      )['bot']?.['clientSecret'],
-    ).toBe('$BOT_TOKEN');
+      )['planted-bot'],
+    ).toEqual({
+      type: 'management-validation-test',
+      clientId: 'user-client',
+      clientSecret: 'user-secret',
+    });
   });
 
   it('accepts chat-and-thread session scope', async () => {
@@ -2064,25 +2121,16 @@ describe('WorkspaceChannelSettingsStore', () => {
       // another directory. Reads come from the redirected file, so writes have
       // to land there too instead of `<workspace>/.qwen/settings.json`, which
       // no scope reads in this layout.
-      const redirectedHome = path.join(testRoot, 'redirected-home');
-      const redirectedSettingsPath = path.join(redirectedHome, 'settings.json');
-      fs.mkdirSync(redirectedHome, { recursive: true });
-      fs.writeFileSync(
-        redirectedSettingsPath,
-        JSON.stringify({
-          $version: 4,
-          channels: {
-            'user-bot': {
-              type: 'management-validation-test',
-              clientId: 'user-client',
-              clientSecret: 'user-secret',
-            },
+      const userSettingsPath = useRedirectedUserScope({
+        $version: 4,
+        channels: {
+          'user-bot': {
+            type: 'management-validation-test',
+            clientId: 'user-client',
+            clientSecret: 'user-secret',
           },
-        }),
-      );
-      process.env['QWEN_HOME'] = redirectedHome;
-      mockHomeDir = workspace;
-      resetHomeEnvBootstrapForTesting();
+        },
+      });
       try {
         const store = new WorkspaceChannelSettingsStore(workspace);
         const initial = store.snapshot();
@@ -2100,10 +2148,9 @@ describe('WorkspaceChannelSettingsStore', () => {
         expect(next.channels).toHaveProperty('home-bot');
         expect(next.channels).toHaveProperty('user-bot');
 
-        const written = JSON.parse(
-          stripJsonComments(fs.readFileSync(redirectedSettingsPath, 'utf8')),
-        ) as { channels?: Record<string, unknown> };
-        expect(written.channels).toHaveProperty('home-bot');
+        expect(readUserSettings(userSettingsPath).channels).toHaveProperty(
+          'home-bot',
+        );
         // The workspace-scope file must not turn into a second channel store
         // that no read path consults.
         expect(readWorkspaceSettings()['channels']).not.toHaveProperty(
@@ -2148,6 +2195,15 @@ describe('WorkspaceChannelSettingsStore', () => {
             'clientSecret'
           ],
         ).toBe('$BOT_TOKEN');
+        // Pin the destination too: the redirected user file already holds
+        // `bot.clientSecret: '$BOT_TOKEN'`, so without these the assertion above
+        // still passes when the write goes to the workspace scope instead.
+        expect(readUserSettings(userSettingsPath).channels).toHaveProperty(
+          'alerts',
+        );
+        expect(readWorkspaceSettings()['channels']).not.toHaveProperty(
+          'alerts',
+        );
       } finally {
         if (savedBotToken === undefined) {
           delete process.env['BOT_TOKEN'];
