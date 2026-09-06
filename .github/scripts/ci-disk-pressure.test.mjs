@@ -142,10 +142,11 @@ describe('ci.yml disk-pressure evidence', () => {
     // PIPESTATUS is reset by any statement between the pipeline and the
     // capture, so adjacency is the property: inserting one line there leaves
     // RC=0 and the required Test check goes green on any workspaces failure,
-    // with no other pin in the repo noticing. Comments are allowed between.
+    // with no other pin in the repo noticing. Comments are allowed on either
+    // side of the capture; a statement is not.
     assert.match(
       tests,
-      /\| tee "\$WORKSPACES_LOG"\n(?:#[^\n]*\n)*RC=\$\{PIPESTATUS\[0\]\} TEE_RC=\$\{PIPESTATUS\[1\]\}\nif /,
+      /\| tee "\$WORKSPACES_LOG"\n(?:#[^\n]*\n)*RC=\$\{PIPESTATUS\[0\]\} TEE_RC=\$\{PIPESTATUS\[1\]\}\n(?:#[^\n]*\n)*if /,
     );
 
     // tee's own status must gate the verdict: a sink that hit a write error on
@@ -153,9 +154,19 @@ describe('ci.yml disk-pressure evidence', () => {
     // a prefix of the run is not evidence. The switch is compared against '1'
     // rather than '!= 0' so an operator's 'off' or a typo disables the
     // tolerance instead of silently leaving it on.
+    //
+    // The producer side of the same truncation: RC is compared against 1 —
+    // npm's "a workspace lifecycle script failed" — rather than non-zero, so a
+    // top-level npm or cross-env wrapper OOM-killed (137) or heap-aborted (134)
+    // skips the classifier instead of certifying the prefix of the walk it
+    // managed to print. Widening this back to `-ne 0` is the mutation.
     assert.match(
       tests,
-      /if \[ "\$RC" -ne 0 \] && \[ "\$TEE_RC" -eq 0 \] && \[ "\$\{QWEN_CI_TOLERATE_RPC_TIMEOUT:-1\}" = '1' \]; then\n {2}node \.github\/scripts\/ci\/classify-infra-flake\.mjs/,
+      /if \[ "\$RC" -eq 1 \] && \[ "\$TEE_RC" -eq 0 \] && \[ "\$\{QWEN_CI_TOLERATE_RPC_TIMEOUT:-1\}" = '1' \]; then\n {2}node \.github\/scripts\/ci\/classify-infra-flake\.mjs/,
+    );
+    assert.ok(
+      !tests.includes('[ "$RC" -ne 0 ] && [ "$TEE_RC" -eq 0 ]'),
+      'the classifier gate must not run on a producer that died by signal',
     );
 
     // The reader's `:-1` default keeps the tolerance on if this binding is

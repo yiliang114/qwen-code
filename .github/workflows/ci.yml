@@ -775,7 +775,17 @@ jobs:
           # — leaves a truncated capture, and every "no FAIL line" gate would
           # then be reading a prefix of the run.
           RC=${PIPESTATUS[0]} TEE_RC=${PIPESTATUS[1]}
-          if [ "$RC" -ne 0 ] && [ "$TEE_RC" -eq 0 ] && [ "${QWEN_CI_TOLERATE_RPC_TIMEOUT:-1}" = '1' ]; then
+          # RC must be exactly 1, not merely non-zero: 1 is npm's "a workspace
+          # lifecycle script failed", the only exit whose capture is a complete
+          # walk of the workspaces. A producer killed outright — the top-level
+          # npm or its cross-env node wrapper OOM-killed (137) or heap-aborted
+          # (134) under the same NODE_OPTIONS=--max-old-space-size=3072 —
+          # leaves a capture that stops mid-walk, and the classifier can then
+          # only validate the legs npm blamed before it died: a workspace that
+          # never started has no blame line and no junit to check, so the
+          # verdict would certify a prefix of the run. tee's status covers the
+          # sink; this covers the producer. Every other code stays red.
+          if [ "$RC" -eq 1 ] && [ "$TEE_RC" -eq 0 ] && [ "${QWEN_CI_TOLERATE_RPC_TIMEOUT:-1}" = '1' ]; then
             node .github/scripts/ci/classify-infra-flake.mjs --log "$WORKSPACES_LOG" --root . --samples "$DISK_SAMPLES" --runner-name "${RUNNER_NAME:-}" && RC=0
           fi
           if [ "$RC" -eq 0 ]; then
