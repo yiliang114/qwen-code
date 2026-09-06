@@ -17,11 +17,13 @@ import {
   classify,
   countCaughtUnhandled,
   countRpcTimeouts,
+  expectedLegNames,
   failingWorkspaceDirs,
   junitTotals,
   normalizeLog,
   peakLoad,
   runCli,
+  startedLegNames,
   warningLine,
   workspaceSections,
 } from './classify-infra-flake.mjs';
@@ -334,6 +336,193 @@ test('attributes every workspace root the root package.json declares', () => {
   }
 });
 
+test('derives the walk from the root package.json, its exclusions and the script filter', () => {
+  // `expectedLegNames` is the completeness gate's expectation, so its three
+  // inputs each have a failure mode worth pinning: a `dir/*` entry has to be
+  // enumerated (a leg dropped from the expectation is a leg whose absence the
+  // gate cannot see), a `!` entry has to be removed (counting one refuses every
+  // complete run, and the tolerance silently stops firing), and a workspace
+  // without `test:ci` has to be skipped because `--if-present` skips it too.
+  const files = new Map([
+    [
+      'r/package.json',
+      JSON.stringify({
+        workspaces: ['packages/*', 'integrations/x', '!packages/skip'],
+      }),
+    ],
+    [
+      'r/packages/a/package.json',
+      JSON.stringify({ name: 'a-pkg', scripts: { 'test:ci': 'vitest run' } }),
+    ],
+    [
+      'r/packages/b/package.json',
+      JSON.stringify({ name: 'b-pkg', scripts: { test: 'vitest run' } }),
+    ],
+    [
+      'r/packages/skip/package.json',
+      JSON.stringify({
+        name: 'skip-pkg',
+        scripts: { 'test:ci': 'vitest run' },
+      }),
+    ],
+    [
+      'r/integrations/x/package.json',
+      JSON.stringify({ name: 'x-pkg', scripts: { 'test:ci': 'vitest run' } }),
+    ],
+  ]);
+  const read = (path) => {
+    const value = files.get(path);
+    if (value === undefined) {
+      throw Object.assign(new Error(`ENOENT: ${path}`), { code: 'ENOENT' });
+    }
+    return value;
+  };
+  const dirs = new Map([['r/packages', ['a', 'b', 'skip', 'NOTES.md']]]);
+  const listDir = (path) => {
+    const entries = dirs.get(path);
+    if (!entries) {
+      throw Object.assign(new Error(`ENOENT: ${path}`), { code: 'ENOENT' });
+    }
+    return entries.map((name) => ({
+      name,
+      isDirectory: () => !name.endsWith('.md'),
+    }));
+  };
+  assert.deepEqual(expectedLegNames('r', read, listDir), ['a-pkg', 'x-pkg']);
+});
+
+test('returns null rather than an invented expectation on a glob it cannot expand', () => {
+  // Null is "gate unavailable", not "no legs expected": classify skips the
+  // completeness check instead of refusing every run against an expectation of
+  // zero. The next test is what keeps the unavailable case from being silent.
+  const read = (path) => {
+    if (path === join('r', 'package.json')) {
+      return JSON.stringify({ workspaces: ['packages/**'] });
+    }
+    throw Object.assign(new Error(`ENOENT: ${path}`), { code: 'ENOENT' });
+  };
+  const listDir = () => {
+    throw new Error('a ** glob must not be enumerated as a single level');
+  };
+  assert.equal(expectedLegNames('r', read, listDir), null);
+  assert.equal(expectedLegNames('/no-such-root-here'), null);
+});
+
+test('pins the derived walk against this repo own package.json', () => {
+  // Same contract as the NPM_ERROR_PATH_PATTERN test above, on the other side
+  // of the gate: if the root `workspaces` list ever takes a shape
+  // `expectedLegNames` returns null for, the completeness gate goes unavailable
+  // in production with nothing red to say so. Reading the expectation from the
+  // real root turns that into a failing test instead.
+  const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
+  const pkg = JSON.parse(
+    readFileSync(new URL('../../../package.json', import.meta.url), 'utf8'),
+  );
+  const expected = expectedLegNames(repoRoot);
+  assert.ok(
+    Array.isArray(expected),
+    'expectedLegNames returned null for this repo — the workspaces list took a ' +
+      'shape it cannot expand, so the completeness gate is now unavailable',
+  );
+  assert.ok(
+    expected.length >= 20,
+    `derived only ${expected.length} legs; npm's walk of this root starts 22`,
+  );
+  // A negated entry npm skips must not be counted: it would refuse every
+  // complete run, which is fail-closed but leaves the tolerance permanently
+  // dead with only a refusal to explain why.
+  for (const entry of pkg.workspaces.filter((item) => item.startsWith('!'))) {
+    const dir = entry.slice(1);
+    let name;
+    try {
+      name = JSON.parse(
+        readFileSync(new URL(`../../../${dir}/package.json`, import.meta.url)),
+      ).name;
+    } catch {
+      continue; // nothing on disk to be wrongly counted
+    }
+    assert.ok(
+      !expected.includes(name),
+      `"${dir}" is negated in the workspaces list but ${name} is in the expectation`,
+    );
+  }
+});
+
+test('refuses a capture whose walk never reached every declared leg', () => {
+  // R2-2's surviving arm. `test:ci:workspaces` is `cross-env … npm run test:ci
+  // --workspaces --if-present --`, and cross-env 7.0.3 rewrites a child that
+  // died by signal into exit 1 (`crossEnvExitCode = signal === 'SIGINT' ? 0 :
+  // 1`), so when the OOM killer takes the npm that walks the workspaces the
+  // lane's gate still sees RC=1 and hands classify() a prefix. The legs after
+  // the kill printed nothing — no banner, no blame line, no junit — so every
+  // per-leg gate passes on the one leg that did report.
+  const CLI = '@qwen-code/qwen-code';
+  const CORE = '@qwen-code/qwen-code-core';
+  const SHELL = '@qwen-code/web-shell';
+  const banner = (name) => `${TS}> ${name}@0.20.0 test:ci`;
+  const readJunit = junitFor(['packages/cli/junit.xml']);
+  // cli's leg in full, then core's banner and nothing after it: core was
+  // running when the producer died, so the walk never reached web-shell.
+  const truncated = [
+    banner(CLI),
+    ALL_GREEN_RPC_LOG.split(
+      `${TS}npm error path /_work/qwen-code/qwen-code/packages/core`,
+    )[0],
+    banner(CORE),
+  ].join('\n');
+
+  assert.deepEqual([...startedLegNames(truncated)].sort(), [CLI, CORE].sort());
+
+  // Precondition, and the reason this gate is the only one that sees the arm:
+  // with no expectation supplied the same prefix is certified. Deleting the
+  // completeness check leaves this assertion passing and reds the next one.
+  const unguarded = classify({ logText: truncated, readJunit });
+  assert.equal(
+    unguarded.tolerated,
+    true,
+    `the fixture is no longer a clean prefix: ${unguarded.reason}`,
+  );
+
+  const verdict = classify({
+    logText: truncated,
+    readJunit,
+    expectedLegs: [CLI, CORE, SHELL],
+  });
+  assert.equal(verdict.tolerated, false);
+  assert.match(verdict.reason, /walk is incomplete/);
+  assert.deepEqual(verdict.missingLegs, [SHELL]);
+
+  // And the same capture with the missing leg's banner present is tolerated
+  // again, so the refusal is about the walk and not about the fixture.
+  assert.equal(
+    classify({
+      logText: `${truncated}\n${banner(SHELL)}`,
+      readJunit,
+      expectedLegs: [CLI, CORE, SHELL],
+    }).tolerated,
+    true,
+  );
+});
+
+test('keeps the tolerance alive on a complete walk of the declared legs', () => {
+  // The direction the completeness gate must not break: a run where every
+  // declared leg announced itself is still tolerated, banners and all. Uses the
+  // expectation derived from this repo, not a hand-written one, so the two
+  // halves of the gate are pinned against the same source of truth.
+  const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
+  const expected = expectedLegNames(repoRoot);
+  assert.ok(Array.isArray(expected) && expected.length > 0);
+  const banners = expected.map((name) => `${TS}> ${name}@0.20.0 test:ci`);
+  const verdict = classify({
+    logText: [...banners, ALL_GREEN_RPC_LOG].join('\n'),
+    readJunit: junitFor(['packages/cli/junit.xml', 'packages/core/junit.xml']),
+    runnerName: 'ecs-qwen-hk5-2',
+    expectedLegs: expected,
+  });
+  assert.equal(verdict.tolerated, true, verdict.reason);
+  assert.deepEqual(verdict.workspaces, ['packages/cli', 'packages/core']);
+});
+
 test('normalizes ANSI escapes and Actions timestamps', () => {
   // The escapes sit INSIDE the spans the patterns match, not only around
   // them: a log fetched through the API has vitest colourizing the count and
@@ -382,6 +571,15 @@ test('carries the load evidence into a single-line warning', () => {
   assert.match(line, /ecs-qwen-hk5-2/);
   assert.match(line, /236\.42/);
   assert.match(line, /#10879/);
+  // Scoped to the leg, not to the step: the step runs `npm run test:scripts`
+  // after this line is written and takes RC from it, so a step-scoped claim
+  // would be the job's only annotation on a step that then reddens for an
+  // unrelated real reason. Reverting the wording to "Test step tolerated …
+  // Every test passed" reds these two.
+  assert.ok(!line.includes('Test step tolerated'));
+  assert.ok(!line.includes('Every test passed'));
+  assert.match(line, /^::warning::Workspaces leg tolerated /);
+  assert.match(line, /Every workspace test passed; that exit came from/);
 });
 
 test('omits load and runner from the warning when unknown', () => {
@@ -723,8 +921,59 @@ test('carries the verdict across the process boundary the lane spawns', () => {
 
     const tolerated = spawn();
     assert.equal(tolerated.status, 0, tolerated.stderr);
-    assert.match(tolerated.stdout, /^::warning::Test step tolerated/m);
+    assert.match(tolerated.stdout, /^::warning::Workspaces leg tolerated/m);
     assert.match(tolerated.stdout, /peak host load 236\.42/);
+
+    // The completeness gate, end to end: nothing above crosses the process
+    // boundary on it, because the expectation is derived inside `runCli` from
+    // `--root` and never appears in argv. Dropping `expectedLegs:` from the
+    // classify() call in runCli leaves every unit test green and reds this.
+    //
+    // The temp root has had no package.json until here, which is also the
+    // documented unavailable case: no expectation, no gate, tolerated above.
+    // Now give it a root that declares three legs and a capture where only two
+    // announced themselves — the shape a producer killed mid-walk leaves.
+    const pkg = (name) =>
+      JSON.stringify({ name, version: '1.0.0', scripts: { 'test:ci': 'x' } });
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({ name: 'root', workspaces: ['packages/*'] }),
+    );
+    for (const [dir, name] of [
+      ['packages/cli', 'cli-pkg'],
+      ['packages/core', 'core-pkg'],
+      ['packages/web-shell', 'web-shell-pkg'],
+    ]) {
+      mkdirSync(join(root, dir), { recursive: true });
+      writeFileSync(join(root, dir, 'package.json'), pkg(name));
+    }
+    const banner = (name) => `> ${name}@1.0.0 test:ci`;
+    writeFileSync(
+      logPath,
+      [banner('cli-pkg'), ALL_GREEN_RPC_LOG, banner('core-pkg')].join('\n'),
+    );
+    const incomplete = spawn();
+    assert.equal(incomplete.status, 1, incomplete.stdout);
+    assert.match(
+      incomplete.stderr,
+      /^infra-flake: not tolerated — the workspace walk is incomplete — 1 of 3 leg\(s\) npm should have started never printed a banner \(web-shell-pkg\)/m,
+    );
+    assert.match(incomplete.stdout, /^::error title=/m);
+
+    // The same capture with the third banner is tolerated again, so the
+    // refusal above is about the walk and not about the new package.json files.
+    writeFileSync(
+      logPath,
+      [
+        banner('cli-pkg'),
+        ALL_GREEN_RPC_LOG,
+        banner('core-pkg'),
+        banner('web-shell-pkg'),
+      ].join('\n'),
+    );
+    const complete = spawn();
+    assert.equal(complete.status, 0, complete.stderr);
+    assert.match(complete.stdout, /^::warning::Workspaces leg tolerated/m);
 
     // One failing junit turns the same log into a refusal: exit 1 is what the
     // lane's `&& RC=0` reads, and the reason has to reach both streams — the

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFileSync, realpathSync } from 'node:fs';
+import { readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -24,10 +24,14 @@ import {
  *
  * Nothing already in the lane covers it. `--retry=2` retries individual tests,
  * while this is reported after the run. `testTimeout`/`hookTimeout` (60s on
- * ECS) bound a test, not the collector channel — the RPC's own budget is a
- * fixed 60s (#10438). The 110-minute step ceiling never engages: no job in
- * that sample was cancelled, and the longest test step finished on its own at
- * 96m55s.
+ * ECS) bound a test, not the collector channel — the RPC's own budget is
+ * birpc's `DEFAULT_TIMEOUT = 6e4`, which vitest 3.2.7 does not override at its
+ * `createBirpc` call site, and the message is its `onTimeoutError` hook
+ * (`[vitest-worker]: Timeout calling "<fn>"`). So raising the budget is not a
+ * config knob this lane owns: it is a change to the pinned vitest, and one the
+ * worker→collector channel would still lose under 200+ load. The 110-minute
+ * step ceiling never engages: no job in that sample was cancelled, and the
+ * longest test step finished on its own at 96m55s.
  *
  * The sanctioned fix elsewhere in this repo is `dangerouslyIgnoreUnhandledErrors`,
  * which every vitest config already carries as `process.platform !== 'linux'`
@@ -60,6 +64,16 @@ import {
  * workspace must carry an RPC timeout in the section npm printed for it, so a
  * leg that died *after* flushing a clean junit is not certified on the
  * strength of a neighbouring leg's timeout.
+ *
+ * And the evidence set must be complete, because every gate above is only as
+ * good as the capture it reads. A producer that dies mid-walk leaves a prefix:
+ * the legs after the kill printed nothing, so they are absent rather than
+ * suspicious, and per-leg attribution certifies the one leg that did report.
+ * npm prints a `> <name>@<version> test:ci` banner for every leg it starts and
+ * no marker at all when the walk ends — an ordinary lifecycle failure just
+ * stops after the last leg — so the started set compared against the legs the
+ * root `package.json` declares is the only completeness evidence the capture
+ * carries. A missing leg refuses; see `expectedLegNames`.
  *
  * The verdict is a warning, never silence: the pool being over capacity is the
  * actual defect, and a green job that hides it would remove the only pressure
@@ -197,6 +211,95 @@ export function workspaceSections(logText) {
   return sections;
 }
 
+/** npm's per-leg banner, printed when it *starts* a workspace script:
+ * `> <name>@<version> test:ci`. Measured on npm 11.17.0 against `npm run
+ * test:ci --workspaces --if-present --`: one banner per leg, before that leg's
+ * own output, and the walk continues past a failing leg rather than aborting.
+ * Extra arguments passed after `--` land on the command line *below* the
+ * banner, so the banner text itself does not vary with `--retry`. */
+const NPM_LEG_BANNER_PATTERN = /^> (\S+)@\S+ test:ci$/gm;
+
+/** Package names of the legs the capture shows npm starting. */
+export function startedLegNames(logText) {
+  const names = new Set();
+  for (const match of stripCapturedOutput(normalizeLog(logText)).matchAll(
+    NPM_LEG_BANNER_PATTERN,
+  )) {
+    names.add(match[1]);
+  }
+  return names;
+}
+
+/**
+ * Package names of the legs `npm run test:ci --workspaces --if-present` starts:
+ * every entry of the root `package.json` `workspaces` list — minus its `!`
+ * exclusions — whose own package.json declares `test:ci`. That list is npm's
+ * own source of truth for the walk, so it is the only expectation the
+ * completeness gate can be measured against without asking npm at runtime.
+ *
+ * Returns null when the expectation cannot be derived: an unreadable root, or a
+ * `workspaces` entry whose glob this helper does not expand — it reads a bare
+ * directory and a single-level `dir/*`, which is all the root declares today.
+ * Null means "gate unavailable", not "no legs expected", and `classify` then
+ * skips the completeness check rather than inventing an expectation. The
+ * derivation itself is pinned against this repo's own package.json by
+ * classify-infra-flake.test.mjs, so a glob shape this helper cannot read turns
+ * a test red instead of silently dropping the gate.
+ */
+export function expectedLegNames(
+  root,
+  read = readFileSync,
+  listDir = readdirSync,
+) {
+  const GLOB_CHARS = /[*?[\]{}]/;
+  try {
+    const pkg = JSON.parse(read(join(root, 'package.json'), 'utf8'));
+    const entries = Array.isArray(pkg.workspaces) ? pkg.workspaces : [];
+    if (entries.length === 0) return null;
+    const excluded = new Set();
+    const dirs = [];
+    for (const entry of entries) {
+      const negative = entry.startsWith('!');
+      const pattern = negative ? entry.slice(1) : entry;
+      if (pattern.endsWith('/*') && !GLOB_CHARS.test(pattern.slice(0, -2))) {
+        const parent = pattern.slice(0, -2);
+        for (const child of listDir(join(root, parent), {
+          withFileTypes: true,
+        })) {
+          if (!child.isDirectory()) continue;
+          const dir = join(parent, child.name);
+          if (negative) excluded.add(dir);
+          else dirs.push(dir);
+        }
+      } else if (!GLOB_CHARS.test(pattern)) {
+        if (negative) excluded.add(pattern);
+        else dirs.push(pattern);
+      } else {
+        return null;
+      }
+    }
+    const names = new Set();
+    for (const dir of dirs) {
+      if (excluded.has(dir)) continue;
+      let workspace;
+      try {
+        workspace = JSON.parse(read(join(root, dir, 'package.json'), 'utf8'));
+      } catch {
+        continue; // no package.json: not a workspace npm would run
+      }
+      if (
+        typeof workspace.name === 'string' &&
+        workspace.scripts?.['test:ci']
+      ) {
+        names.add(workspace.name);
+      }
+    }
+    return [...names];
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The `<testsuites>` root totals, or null when the document does not carry
  * them. Vitest always writes `tests`/`failures`/`errors`/`time` and never
@@ -238,9 +341,18 @@ function refuse(reason, detail = {}) {
  * @param options.readJunit     (workspaceRelativePath) => file contents; throws when absent
  * @param options.samplesText   optional DFSAMPLE lines, for the warning only
  * @param options.runnerName    optional, for the warning only
+ * @param options.expectedLegs  optional package names the walk should have
+ *                              started (see `expectedLegNames`); omitted or
+ *                              null skips the completeness gate
  */
 export function classify(options = {}) {
-  const { logText, readJunit, samplesText = '', runnerName = '' } = options;
+  const {
+    logText,
+    readJunit,
+    samplesText = '',
+    runnerName = '',
+    expectedLegs = null,
+  } = options;
   if (typeof readJunit !== 'function') {
     return refuse('no junit reader supplied');
   }
@@ -278,6 +390,30 @@ export function classify(options = {}) {
   if (workspaces.length === 0) {
     return refuse('npm named no failing workspace to attribute the exit to');
   }
+
+  // Completeness before attribution: everything below reads only the legs this
+  // capture happens to contain. `test:ci:workspaces` is `cross-env … npm run
+  // test:ci --workspaces --if-present --`, and cross-env rewrites a child that
+  // died by signal into exit 1 (`crossEnvExitCode = signal === 'SIGINT' ? 0 :
+  // 1`, cross-env 7.0.3), so the producer's status cannot distinguish "every
+  // leg ran and these failed" from "the OOM killer took npm mid-walk" — both
+  // reach this function as RC=1. The legs after the kill printed nothing at
+  // all, so they are absent rather than suspicious: refusing on a leg that
+  // never announced itself is the only gate that sees a prefix.
+  if (Array.isArray(expectedLegs) && expectedLegs.length > 0) {
+    const started = startedLegNames(log);
+    const missing = expectedLegs.filter((name) => !started.has(name));
+    if (missing.length > 0) {
+      return refuse(
+        `the workspace walk is incomplete — ${missing.length} of ${expectedLegs.length} ` +
+          `leg(s) npm should have started never printed a banner ` +
+          `(${missing.slice(0, 3).join(', ')}${missing.length > 3 ? ', …' : ''}), ` +
+          `so this capture is a prefix of the run`,
+        { missingLegs: missing },
+      );
+    }
+  }
+
   const sections = workspaceSections(log);
 
   for (const workspace of workspaces) {
@@ -343,20 +479,36 @@ export function classify(options = {}) {
   };
 }
 
-/** The single-line annotation the lane emits when a verdict is tolerated. */
+/**
+ * The single-line annotation the lane emits when a verdict is tolerated.
+ *
+ * Scoped to the leg that was classified, not to the step: the step runs
+ * `npm run test:scripts` *after* this line is written and takes its own exit
+ * code from that leg, so a step-scoped claim — "Test step tolerated", "Every
+ * test passed" — can end up the job's only annotation on a step that then
+ * reddens for an unrelated real reason, pointing a triager at pool capacity
+ * for a failure a test caused. The refusal path keeps its step-scoped title
+ * because a refusal leaves RC non-zero, which skips that second leg.
+ */
 export function warningLine(verdict) {
   const load =
     verdict.peakLoad === null ? '' : ` peak host load ${verdict.peakLoad},`;
   const runner = verdict.runnerName ? ` on ${verdict.runnerName},` : '';
   return (
-    `::warning::Test step tolerated a runner-capacity artifact:${runner}${load} ` +
+    `::warning::Workspaces leg tolerated a runner-capacity artifact:${runner}${load} ` +
     `${verdict.rpcTimeouts} vitest worker "onTaskUpdate" RPC timeout(s) with 0 failing tests ` +
-    `(${verdict.workspaces.join(', ')}). Every test passed; the exit came from worker IPC ` +
-    `starving on CPU. The pool is over capacity — see #10879.`
+    `(${verdict.workspaces.join(', ')}). Every workspace test passed; that exit came from ` +
+    `worker IPC starving on CPU. The pool is over capacity — see #10879.`
   );
 }
 
-export function runCli(argv, { readFileSync: read = readFileSync } = {}) {
+export function runCli(
+  argv,
+  {
+    readFileSync: read = readFileSync,
+    readdirSync: listDir = readdirSync,
+  } = {},
+) {
   const args = new Map();
   for (let index = 0; index < argv.length; index += 2) {
     if (!argv[index]?.startsWith('--') || argv[index + 1] === undefined) {
@@ -375,6 +527,11 @@ export function runCli(argv, { readFileSync: read = readFileSync } = {}) {
     logText: read(logPath, 'utf8'),
     samplesText: samplesPath ? readOrEmpty(read, samplesPath) : '',
     runnerName: args.get('runner-name') ?? '',
+    // Derived from the checkout `--root` names, never from the log: the log is
+    // the artifact being judged complete, so it cannot supply its own
+    // expectation. Null (an unreadable root, or a workspace glob this helper
+    // does not expand) skips that gate rather than inventing an expectation.
+    expectedLegs: expectedLegNames(root, read, listDir),
     readJunit: (relative) => read(join(root, relative), 'utf8'),
   });
 
