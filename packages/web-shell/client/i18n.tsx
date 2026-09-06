@@ -6676,7 +6676,7 @@ const ZH: Messages = {
   'channels.editor.field.shared.multiSession': '命名任务',
   'channels.editor.field.shared.instructions': '指引',
   'channels.editor.field.shared.instructions.description':
-    '注入到每个 channel 会话上下文中的指引。部分 channel 在设置后会用它替换自身的默认指引。',
+    '注入到每个频道会话上下文中的指引。部分频道在设置后会用它替换自身的默认指引。',
   'channels.editor.field.shared.multiSession.description':
     '在 daemon 托管模式下，为每位用户保留相互隔离的命名任务目录。',
   'channels.editor.policy.pairing.title': '配对模式',
