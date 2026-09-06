@@ -573,6 +573,46 @@ describe('ChannelEditorDialog', () => {
     );
   });
 
+  it('loads a stored multi-line instructions value into the textarea and saves it unchanged', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    // Edit mode: createChannelEditorDraft loads a stored string untrimmed
+    // (channel-editor-state.ts:110) while assignField trims on save
+    // (channel-editor-state.ts:249), so the fixture carries no outer
+    // whitespace and the round trip must be exact. Without the draft value
+    // threaded into the Textarea, an operator editing a configured channel
+    // sees an empty box and their first keystroke replaces the whole block.
+    await renderDialog({
+      descriptor: MULTILINE_INSTRUCTIONS,
+      instance: {
+        ...INSTANCE,
+        config: { ...INSTANCE.config, instructions: 'line one\nline two' },
+      },
+      onSave,
+    });
+
+    const instructions = fieldByLabel('Instructions');
+    expect(instructions).toBeInstanceOf(HTMLTextAreaElement);
+    expect((instructions as HTMLTextAreaElement).value).toBe(
+      'line one\nline two',
+    );
+
+    const save = Array.from(document.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Save',
+    );
+    await act(async () => {
+      save?.click();
+    });
+
+    expect(onSave).toHaveBeenCalledWith(
+      'release-bot',
+      expect.objectContaining({
+        config: expect.objectContaining({
+          instructions: 'line one\nline two',
+        }),
+      }),
+    );
+  });
+
   it('submits a new instance with typed fields and the current revision', async () => {
     const onSave = vi.fn().mockResolvedValue(undefined);
     await renderDialog({ onSave });
