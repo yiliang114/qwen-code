@@ -367,12 +367,12 @@ describe('WorkspaceChannelSettingsStore', () => {
       // All three reserved keys stay own keys through JSON.parse, so a settings
       // file can carry a channel the read view must never list. Building the
       // stored-form map by assignment turns `__proto__` into that map's
-      // prototype and `constructor`/`prototype` into plain own properties, so a
-      // later upsert of the planted name would persist the planted secret the
-      // user never supplied and validation never saw. The read view is the
-      // discriminating assertion here: `toEqual` compares own enumerable keys,
-      // which a `__proto__`-polluted map has none of, so only the persisted
-      // write set proves anything for that one key.
+      // prototype, which the spread read view cannot see, and turns
+      // `constructor`/`prototype` into own properties it lists and hashes into
+      // the revision. So the read view is the discriminating assertion here,
+      // and only for `constructor`/`prototype`; the `__proto__` arm is defence
+      // in depth. The persisted subtree carries no reserved key even unguarded,
+      // so the write-set assertion below pins the user's channel, not the guard.
       writeWorkspaceSettings(`{
   "$version": 4,
   "channels": {
@@ -2020,6 +2020,43 @@ describe('WorkspaceChannelSettingsStore', () => {
       useLocalGh: true,
       senderPolicy: 'allowlist',
       groupPolicy: 'open',
+    });
+  });
+
+  it("does not carry a previous type's stored secret into a changed type", async () => {
+    writeWorkspaceSettings(`{
+  "$version": 4,
+  "channels": { "bot": {
+    "type": "gitlab",
+    "token": "$GL_TOKEN",
+    "senderPolicy": "open",
+    "groupPolicy": "open"
+  } }
+}\n`);
+
+    await withEnv({ GL_TOKEN: 'gl-pat-PLAIN' }, async () => {
+      const store = new WorkspaceChannelSettingsStore(workspace);
+      const initial = store.snapshot();
+
+      await store.upsert('bot', {
+        expectedRevision: initial.revision,
+        config: {
+          type: 'github',
+          useLocalGh: true,
+          senderPolicy: 'open',
+          groupPolicy: 'open',
+        },
+      });
+
+      // gitlab and github both declare `token`, but github's is optional and
+      // `useLocalGh` satisfies its validation, so nothing on the write path
+      // rejects a reference carried over from the previous type.
+      const persisted = readStoredChannel('bot');
+      expect(persisted).toMatchObject({ type: 'github', useLocalGh: true });
+      expect(persisted).not.toHaveProperty('token');
+      expect(fs.readFileSync(settingsPath, 'utf8')).not.toContain(
+        'gl-pat-PLAIN',
+      );
     });
   });
 

@@ -489,11 +489,11 @@ function channelRecordMap(
   const rawChannels = isRecord(value) ? value : {};
   const channels: Record<string, Record<string, unknown>> = {};
   for (const [name, config] of Object.entries(rawChannels)) {
-    // A settings file keeps `__proto__` as an own key through JSON.parse, and
-    // assigning it here would set this map's prototype instead of adding an
-    // entry: the planted value stays invisible to the spread read view while
-    // `storedChannels[name]` still resolves it into a write set. The write path
-    // already rejects these names, so the read side skips the same set.
+    // A settings file keeps these keys as own keys through JSON.parse, and
+    // assigning them here would set this map's prototype (`__proto__`) or list
+    // a planted channel the read view never validated and hash it into the
+    // revision (`constructor`/`prototype`). The write path already rejects
+    // these names, so the read side skips the same set.
     if (UNSAFE_OBJECT_KEYS.has(name)) continue;
     if (isRecord(config)) channels[name] = config;
   }
