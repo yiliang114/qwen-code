@@ -775,10 +775,16 @@ describe('channel registry', () => {
         .map((entry) => entry.type),
     ).toEqual(['dingtalk', 'dws', 'wecom', 'feishu', 'github', 'gitlab']);
     // The registry skips the shared `instructions` injection for any channel
-    // that declares its own, so pin the served descriptor for every manageable
-    // built-in: one field, the multiline render hint (without it the editor
-    // falls back to a single-line input that flattens stored guidance on the
-    // first edit) and the neutral copy that does not promise additive merge.
+    // that declares its own, so pin the render invariants the editor depends on
+    // for every manageable built-in: exactly one field, plus the multiline hint
+    // (without it the editor falls back to a single-line input that flattens
+    // stored guidance on the first edit). The copy guarantee is scoped to the
+    // injected descriptor, because a channel declaring its own `instructions`
+    // takes the skip branch and may carry tailored neutral copy, and it is
+    // asserted where an operator actually reads it
+    // (ChannelEditorDialog.test.tsx): fieldDescription resolves
+    // `${labelKey}.description` and falls back to this literal only when that
+    // i18n key is missing.
     for (const entry of builtinCatalog.filter((item) => item.manageable)) {
       const instructions = entry.fields.filter(
         (field) => field.key === 'instructions',
@@ -788,9 +794,14 @@ describe('channel registry', () => {
         kind: 'string',
         multiline: true,
       });
-      expect(instructions[0].description).toContain(
-        'replace their own default guidance',
-      );
+      const declaresOwnInstructions = (
+        await getPlugin(entry.type)
+      )?.management?.fields?.some((field) => field.key === 'instructions');
+      if (!declaresOwnInstructions) {
+        expect(instructions[0].description).toContain(
+          'replace their own default guidance',
+        );
+      }
     }
     expect(
       catalog.find((entry) => entry.type === 'dingtalk')?.fields,

@@ -158,9 +158,9 @@ const EXCLUSIVE_MINIMUM: DaemonChannelTypeDescriptor = {
 
 // The shared `instructions` control the channel registry injects into every
 // manageable channel (channel-registry.ts), plus a plain string sibling. The
-// descriptor label for `instructions` intentionally differs from the i18n
-// value so a missing i18n key surfaces the untranslated fallback instead of
-// passing the assertions below.
+// descriptor label and description for `instructions` intentionally differ from
+// the i18n values so a missing i18n key surfaces the untranslated fallback
+// instead of passing the assertions below.
 const MULTILINE_INSTRUCTIONS: DaemonChannelTypeDescriptor = {
   type: 'example',
   displayName: 'Example',
@@ -169,6 +169,7 @@ const MULTILINE_INSTRUCTIONS: DaemonChannelTypeDescriptor = {
     {
       key: 'instructions',
       label: 'Session instructions (descriptor)',
+      description: 'DESCRIPTOR FALLBACK COPY',
       kind: 'string',
       multiline: true,
     },
@@ -226,12 +227,15 @@ const { I18nProvider } = await import('../../i18n');
 let container: HTMLDivElement;
 let root: Root;
 
-async function renderDialog(
-  props: Partial<React.ComponentProps<typeof ChannelEditorDialog>> = {},
-) {
+async function renderDialog({
+  language = 'en',
+  ...props
+}: Partial<React.ComponentProps<typeof ChannelEditorDialog>> & {
+  language?: 'en' | 'zh-CN';
+} = {}) {
   await act(async () => {
     root.render(
-      <I18nProvider language="en">
+      <I18nProvider language={language}>
         <ChannelEditorDialog
           open
           descriptor={DINGTALK}
@@ -316,6 +320,12 @@ function sectionHeadingOf(element: HTMLElement | null): string | null {
     ?.querySelector('h3')
     ?.textContent?.trim();
   return heading ?? null;
+}
+
+// FieldShell renders the field description as the first <p> inside the field
+// wrapper that also holds the control, after the label header.
+function descriptionOf(element: HTMLElement | null): string {
+  return element?.parentElement?.querySelector('p')?.textContent?.trim() ?? '';
 }
 
 beforeEach(() => {
@@ -537,6 +547,37 @@ describe('ChannelEditorDialog', () => {
     expect(sectionHeadingOf(fieldByLabel('API endpoint (descriptor)'))).toBe(
       'Credentials',
     );
+  });
+
+  it('renders the localized instructions copy above the textarea instead of the descriptor literal', async () => {
+    await renderDialog({ descriptor: MULTILINE_INSTRUCTIONS });
+
+    // `instructions` is the only multiline field in the fixture, so the single
+    // textarea anchors the field. fieldDescription resolves
+    // `${labelKey}.description` and returns the i18n value whenever the key
+    // translates, so this — not the registry literal the catalog serves — is
+    // what an operator reads. It is also the only place the replace-not-append
+    // behaviour is documented: an additive promise would have a DingTalk
+    // operator save over the default identity block that DingtalkAdapter.ts
+    // installs only when config.instructions is falsy.
+    const description = descriptionOf(document.querySelector('textarea'));
+    expect(description).toContain('replace their own default guidance');
+    expect(description).not.toContain('DESCRIPTOR FALLBACK COPY');
+  });
+
+  it('localizes the instructions copy for zh-CN operators', async () => {
+    await renderDialog({
+      descriptor: MULTILINE_INSTRUCTIONS,
+      language: 'zh-CN',
+    });
+
+    // getTranslator resolves `messages[key] ?? EN[key] ?? key`, so an assertion
+    // phrased only as "not the raw key", or as an English substring, still
+    // passes on the EN fallback once the ZH entry is deleted. `替换` occurs only
+    // in the ZH value, so this goes red on that mutation.
+    const description = descriptionOf(document.querySelector('textarea'));
+    expect(description).toContain('替换');
+    expect(description).not.toContain('DESCRIPTOR FALLBACK COPY');
   });
 
   it('saves a multi-line instructions value with the newline intact', async () => {
