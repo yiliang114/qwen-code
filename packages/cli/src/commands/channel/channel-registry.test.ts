@@ -774,6 +774,24 @@ describe('channel registry', () => {
         .filter((entry) => entry.manageable)
         .map((entry) => entry.type),
     ).toEqual(['dingtalk', 'dws', 'wecom', 'feishu', 'github', 'gitlab']);
+    // The registry skips the shared `instructions` injection for any channel
+    // that declares its own, so pin the served descriptor for every manageable
+    // built-in: one field, the multiline render hint (without it the editor
+    // falls back to a single-line input that flattens stored guidance on the
+    // first edit) and the neutral copy that does not promise additive merge.
+    for (const entry of builtinCatalog.filter((item) => item.manageable)) {
+      const instructions = entry.fields.filter(
+        (field) => field.key === 'instructions',
+      );
+      expect(instructions).toHaveLength(1);
+      expect(instructions[0]).toMatchObject({
+        kind: 'string',
+        multiline: true,
+      });
+      expect(instructions[0].description).toContain(
+        'replace their own default guidance',
+      );
+    }
     expect(
       catalog.find((entry) => entry.type === 'dingtalk')?.fields,
     ).toContainEqual(
