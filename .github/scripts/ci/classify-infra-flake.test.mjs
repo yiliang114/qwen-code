@@ -217,6 +217,21 @@ test('reads totals only from a well-formed testsuites root', () => {
   assert.deepEqual(junitTotals(junit()), { tests: 28672, failures: 0 });
   assert.deepEqual(junitTotals(junit(3)), { tests: 28672, failures: 3 });
   assert.equal(junitTotals('<testsuites tests="5"></testsuites>'), null);
+  // Both halves of the refuse guard: a reporter that stopped emitting `tests`
+  // is a shape change under us, and absence must never be read as zero.
+  assert.equal(
+    junitTotals('<testsuites failures="0" errors="0" time="1"></testsuites>'),
+    null,
+  );
+  // Real vitest junit nests per-file <testsuite> elements carrying their own
+  // counters. Only the root's totals describe the run, so a root that omits
+  // them is refused even though a child's counters are readable.
+  assert.equal(
+    junitTotals(
+      '<testsuites name="vitest tests"><testsuite tests="5" failures="0"></testsuite></testsuites>',
+    ),
+    null,
+  );
   assert.equal(junitTotals('not xml'), null);
   assert.equal(junitTotals(''), null);
 });
@@ -227,10 +242,14 @@ test('attributes nested workspaces to their full packages path', () => {
 });
 
 test('normalizes ANSI escapes and Actions timestamps', () => {
+  // The escapes sit INSIDE the spans the patterns match, not only around
+  // them: a log fetched through the API has vitest colourizing the count and
+  // the RPC method name, and a leading SGR on the blame line. Wrapping-only
+  // escapes would leave every assertion below green with the strip removed.
   const decorated = [
-    `${TS}${ESC}[41m${ESC}[1mVitest caught 1 unhandled error during the test run.${ESC}[22m${ESC}[49m`,
-    `${TS}${ESC}[31mError: ${RPC_TIMEOUT_SIGNATURE}${ESC}[39m`,
-    `${TS}npm error path /_work/qwen-code/qwen-code/packages/cli`,
+    `${TS}${ESC}[41mVitest caught ${ESC}[1m1${ESC}[22m unhandled error during the test run.${ESC}[49m`,
+    `${TS}${ESC}[31mError: [vitest-worker]: Timeout calling ${ESC}[1m"onTaskUpdate"${ESC}[22m${ESC}[39m`,
+    `${TS}${ESC}[31mnpm error path /_work/qwen-code/qwen-code/packages/cli${ESC}[39m`,
   ].join('\n');
   assert.equal(countRpcTimeouts(decorated), 1);
   assert.equal(countCaughtUnhandled(decorated), 1);
@@ -246,6 +265,11 @@ test('takes the peak 1-minute load from the DFSAMPLE timeline', () => {
   assert.equal(peakLoad(samples), 236.42);
   assert.equal(peakLoad(''), null);
   assert.equal(peakLoad('DFSAMPLE 07:33:36 load[not-a-number]'), null);
+  // The regex accepts `1.2.3` but Number() rejects it, so this is the only
+  // input that reaches the isFinite guard: without it `peak` becomes NaN,
+  // which warningLine's `=== null` test does not catch and would print
+  // "peak host load NaN," into the annotation.
+  assert.equal(peakLoad('DFSAMPLE 07:33:36 load[1.2.3]'), null);
 });
 
 test('carries the load evidence into a single-line warning', () => {
@@ -280,8 +304,11 @@ test('omits load and runner from the warning when unknown', () => {
 });
 
 test('runCli exits 0 on a tolerated verdict and 1 otherwise', () => {
+  const SAMPLES =
+    'DFSAMPLE 08:53:48 tmpdir[/var/tmp/x] load[236.42 234.69 229.50] hosttests[74]';
   const files = new Map([
     ['/log.txt', ALL_GREEN_RPC_LOG],
+    ['/samples.log', SAMPLES],
     ['packages/cli/junit.xml', junit()],
     ['packages/core/junit.xml', junit()],
   ]);
@@ -295,6 +322,13 @@ test('runCli exits 0 on a tolerated verdict and 1 otherwise', () => {
   const stderr = process.stderr.write.bind(process.stderr);
   process.stdout.write = (chunk) => (lines.push(String(chunk)), true);
   process.stderr.write = (chunk) => (lines.push(String(chunk)), true);
+  // Each invocation's own output, so an assertion can name the call that
+  // produced it rather than searching the whole transcript.
+  const call = (argv) => {
+    const from = lines.length;
+    const code = runCli(argv, { readFileSync: read });
+    return { code, out: lines.slice(from) };
+  };
   try {
     assert.equal(
       runCli(['--log', '/log.txt', '--root', '.'], { readFileSync: read }),
@@ -305,6 +339,35 @@ test('runCli exits 0 on a tolerated verdict and 1 otherwise', () => {
         readFileSync: read,
       }),
       1,
+    );
+    // The lane passes `--samples "$DISK_SAMPLES"` (ci.yml), so the load figure
+    // has to survive the argv plumbing into the annotation — it is the whole
+    // point of emitting one.
+    const withSamples = call([
+      '--log',
+      '/log.txt',
+      '--root',
+      '.',
+      '--samples',
+      '/samples.log',
+    ]);
+    assert.equal(withSamples.code, 0);
+    assert.match(withSamples.out.join(''), /peak host load 236\.42/);
+    // A sampler that never wrote its file — the ENOSPC this same step documents
+    // — must not cost the verdict: readOrEmpty swallows it, so the run stays
+    // tolerated instead of throwing out of runCli into a false red.
+    const noSamples = call([
+      '--log',
+      '/log.txt',
+      '--root',
+      '.',
+      '--samples',
+      '/missing-samples.log',
+    ]);
+    assert.equal(noSamples.code, 0);
+    assert.ok(
+      noSamples.out.some((line) => line.startsWith('::warning::')),
+      'an unreadable samples file must not suppress the annotation',
     );
     assert.throws(
       () => runCli(['--log'], { readFileSync: read }),
