@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -197,6 +198,28 @@ test('fails closed when a blamed workspace recorded zero tests', () => {
   );
 });
 
+test('fails closed when a blamed workspace junit was truncated mid-write', () => {
+  // The realistic shape when the host this step is measuring runs out of disk
+  // or the reporter is killed mid-write: the <testsuites> start tag never
+  // closes, so junitTotals returns null. This is the only caller of that null,
+  // and without the branch that consumes it `totals.tests` throws a TypeError
+  // out of classify and out of runCli — an uncaught crash where the lane needs
+  // a refusal, and no unit-level pin of junitTotals can see it.
+  const truncated =
+    '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites name="vitest tests" tests="23531" failures="0"';
+  assert.equal(junitTotals(truncated), null);
+  const verdict = classify({
+    logText: ALL_GREEN_RPC_LOG,
+    readJunit: (relative) =>
+      relative === 'packages/core/junit.xml' ? truncated : junit(),
+  });
+  assert.equal(verdict.tolerated, false);
+  assert.match(
+    verdict.reason,
+    /packages\/core\/junit\.xml carries no <testsuites> totals/,
+  );
+});
+
 test('fails closed when npm blamed no workspace', () => {
   const log = [
     `${TS}Vitest caught 1 unhandled error during the test run.`,
@@ -239,6 +262,37 @@ test('reads totals only from a well-formed testsuites root', () => {
 test('attributes nested workspaces to their full packages path', () => {
   const log = `${TS}npm error path /_work/qwen-code/qwen-code/packages/channels/base`;
   assert.deepEqual(failingWorkspaceDirs(log), ['packages/channels/base']);
+});
+
+test('attributes every workspace root the root package.json declares', () => {
+  // `npm run test:ci:workspaces` walks exactly the root package.json
+  // `workspaces` list, so that list — not the comment above the pattern — is
+  // the source of truth for NPM_ERROR_PATH_PATTERN's alternation. A root the
+  // pattern drops produces a blame line the classifier ignores, and the
+  // workspace it names is then never junit-checked: the run is tolerated on
+  // the strength of a different leg's RPC timeout. Reading the expectation
+  // from package.json turns "a new workspace root was added" into a red test
+  // instead of a comment that has to be remembered in the same commit.
+  const pkg = JSON.parse(
+    readFileSync(new URL('../../../package.json', import.meta.url), 'utf8'),
+  );
+  const roots = [
+    ...new Set(
+      pkg.workspaces
+        .filter((entry) => !entry.startsWith('!'))
+        .map((entry) => entry.split('/')[0]),
+    ),
+  ];
+  assert.ok(roots.length > 0, 'root package.json declares no workspaces');
+  for (const root of roots) {
+    const log = `${TS}npm error path /_work/qwen-code/qwen-code/${root}/some-workspace`;
+    assert.deepEqual(
+      failingWorkspaceDirs(log),
+      [`${root}/some-workspace`],
+      `NPM_ERROR_PATH_PATTERN drops the "${root}" workspace root declared in ` +
+        'package.json — add it to the alternation in the same commit',
+    );
+  }
 });
 
 test('normalizes ANSI escapes and Actions timestamps', () => {
@@ -369,9 +423,21 @@ test('runCli exits 0 on a tolerated verdict and 1 otherwise', () => {
       noSamples.out.some((line) => line.startsWith('::warning::')),
       'an unreadable samples file must not suppress the annotation',
     );
+    // Two guards, two inputs, two assertions. `runCli(['--log'])` reaches the
+    // pair guard — the one ci.yml's invocation depends on, since a workflow
+    // edit that drops a value must throw rather than parse the next flag as
+    // that value's flag name. `--log is required` is only reachable with
+    // well-formed pairs. One alternation over both messages let either guard
+    // be deleted with the suite still green: without the pair guard,
+    // `runCli(['--log'])` falls through to the missing-log throw, which the
+    // alternation also accepted.
     assert.throws(
       () => runCli(['--log'], { readFileSync: read }),
-      /--log is required|--<name> <value>/,
+      /expected --<name> <value> pairs/,
+    );
+    assert.throws(
+      () => runCli(['--root', '.'], { readFileSync: read }),
+      /--log is required/,
     );
   } finally {
     process.stdout.write = stdout;
