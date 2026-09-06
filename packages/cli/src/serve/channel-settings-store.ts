@@ -483,7 +483,9 @@ function channelSettingsScope(workspaceCwd: string): SettingsFile {
   return loaded.workspaceSettingsActive ? loaded.workspace : loaded.user;
 }
 
-function channelRecordMap(value: unknown): Record<string, Record<string, unknown>> {
+function channelRecordMap(
+  value: unknown,
+): Record<string, Record<string, unknown>> {
   const rawChannels = isRecord(value) ? value : {};
   const channels: Record<string, Record<string, unknown>> = {};
   for (const [name, config] of Object.entries(rawChannels)) {
@@ -578,12 +580,17 @@ export class WorkspaceChannelSettingsStore {
       options.expectedRevision,
     );
     const storedPrevious = current.channels[name] ?? {};
-    const previous =
-      storedPrevious['type'] === options.config.type ? storedPrevious : {};
+    // Decide the type match once, from the env-resolved stored config: a stored
+    // `type` that is itself an environment reference never equals the resolved
+    // type the request carries, so gating the stored-form lookup below on the
+    // raw value would disagree with this gate, skip the restore, and persist
+    // the resolved secret in plaintext. The gate itself has to stay — on a
+    // genuine type change the previous type's stored secret must not carry over.
+    const hasPreviousOfType = storedPrevious['type'] === options.config.type;
+    const previous = hasPreviousOfType ? storedPrevious : {};
     // The same config as it is stored on disk, without env resolution.
     const storedOnDisk = storedChannels[name] ?? {};
-    const previousOnDisk =
-      storedOnDisk['type'] === options.config.type ? storedOnDisk : {};
+    const previousOnDisk = hasPreviousOfType ? storedOnDisk : {};
     const nextConfig: Record<string, unknown> = { ...options.config };
     const storedSecrets: Record<string, unknown> = {};
     for (const key of secretKeys) {
@@ -593,7 +600,10 @@ export class WorkspaceChannelSettingsStore {
       // Validation below runs against the resolved value; what gets persisted
       // keeps the stored reference, so preserving a secret does not bake the
       // resolved literal into the settings file.
-      if (update.operation === 'preserve' && previousOnDisk[key] !== undefined) {
+      if (
+        update.operation === 'preserve' &&
+        previousOnDisk[key] !== undefined
+      ) {
         storedSecrets[key] = previousOnDisk[key];
       }
     }
