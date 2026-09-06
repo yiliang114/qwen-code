@@ -561,6 +561,15 @@ export class WorkspaceChannelSettingsStore {
         .filter((field) => field.kind === 'secret')
         .map((field) => field.key),
     );
+    // Restoring a stored `$VAR` reference is only legal on a descriptor that
+    // declares `envResolvable`: `assertDescriptorValue` rejects a bare reference
+    // on any other field, and the restore below runs after that check, so
+    // restoring one would persist a value the daemon refuses to read back.
+    const envResolvableKeys = new Set(
+      plugin.management.fields
+        .filter((field) => field.envResolvable)
+        .map((field) => field.key),
+    );
     for (const key of Object.keys(secretUpdates)) {
       if (!secretKeys.has(key)) {
         throw invalidSecret(
@@ -592,20 +601,41 @@ export class WorkspaceChannelSettingsStore {
     const storedOnDisk = storedChannels[name] ?? {};
     const previousOnDisk = hasPreviousOfType ? storedOnDisk : {};
     const nextConfig: Record<string, unknown> = { ...options.config };
-    const storedSecrets: Record<string, unknown> = {};
+    const storedReferences: Record<string, unknown> = {};
     for (const key of secretKeys) {
       const update = secretUpdates[key] ?? { operation: 'preserve' };
       const value = applySecretUpdate(previous[key], update);
       if (value !== undefined) nextConfig[key] = value;
       // Validation below runs against the resolved value; what gets persisted
       // keeps the stored reference, so preserving a secret does not bake the
-      // resolved literal into the settings file.
+      // resolved literal into the settings file. A field that does not declare
+      // `envResolvable` is left out: a hand-written reference there is a value
+      // this store's own validator rejects, and writing it back would make
+      // every later upsert of the channel fail on a field the caller never sent.
       if (
         update.operation === 'preserve' &&
-        previousOnDisk[key] !== undefined
+        previousOnDisk[key] !== undefined &&
+        envResolvableKeys.has(key)
       ) {
-        storedSecrets[key] = previousOnDisk[key];
+        storedReferences[key] = previousOnDisk[key];
       }
+    }
+    // The same restore for the edited channel's non-secret environment
+    // references. `GET channels` hands the editor the env-resolved snapshot, so
+    // a client can only echo the resolved literal back; without this pass,
+    // saving any unrelated field would replace the user's `$VAR` with that
+    // literal for this channel while sibling channels keep theirs. Only a value
+    // the client returned unchanged is restored, so a deliberate edit still
+    // persists what was submitted.
+    for (const field of plugin.management.fields) {
+      const key = field.key;
+      if (!field.envResolvable || secretKeys.has(key)) continue;
+      const onDisk = previousOnDisk[key];
+      if (typeof onDisk !== 'string' || !isEnvironmentReference(onDisk)) {
+        continue;
+      }
+      if (nextConfig[key] !== previous[key]) continue;
+      storedReferences[key] = onDisk;
     }
     assertManagedConfig(nextConfig, previous, plugin.management.fields);
     const multiSessionError = multiSessionCompatibilityError(name, {
@@ -648,7 +678,7 @@ export class WorkspaceChannelSettingsStore {
 
     const channels = {
       ...storedChannels,
-      [name]: { ...nextConfig, ...storedSecrets },
+      [name]: { ...nextConfig, ...storedReferences },
     };
     saveSettings(
       channelSettingsScope(this.workspaceCwd),

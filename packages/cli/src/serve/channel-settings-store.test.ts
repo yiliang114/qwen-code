@@ -57,6 +57,40 @@ describe('WorkspaceChannelSettingsStore', () => {
       stripJsonComments(fs.readFileSync(settingsPath, 'utf8')),
     ) as Record<string, unknown>;
 
+  const readStoredChannel = (
+    name: string,
+  ): Record<string, unknown> | undefined =>
+    (
+      readWorkspaceSettings()['channels'] as Record<
+        string,
+        Record<string, unknown>
+      >
+    )[name];
+
+  // A stored `$VAR` reference only proves the write set came from the stored
+  // form while the variable resolves to something else, so the reference tests
+  // below all run with their variables defined.
+  const withEnv = async (
+    vars: Record<string, string>,
+    body: () => Promise<void>,
+  ): Promise<void> => {
+    const saved = Object.fromEntries(
+      Object.keys(vars).map((key) => [key, process.env[key]]),
+    );
+    Object.assign(process.env, vars);
+    try {
+      await body();
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+    }
+  };
+
   beforeAll(() => {
     registerPlugin({
       channelType: 'management-validation-test',
@@ -380,6 +414,142 @@ describe('WorkspaceChannelSettingsStore', () => {
       });
     },
   );
+
+  it('keeps a non-secret stored reference when an unrelated field is edited', async () => {
+    writeWorkspaceSettings(`{
+  "$version": 4,
+  "channels": {
+    "bot": {
+      "type": "management-validation-test",
+      "clientId": "$CLIENT_ID",
+      "clientSecret": "$BOT_TOKEN",
+      "senderPolicy": "open"
+    }
+  }
+}\n`);
+
+    await withEnv(
+      { CLIENT_ID: 'resolved-client-id', BOT_TOKEN: 'sekret-plaintext' },
+      async () => {
+        const store = new WorkspaceChannelSettingsStore(workspace);
+        const first = store.snapshot();
+        // The editor seeds its form from this env-resolved snapshot, so the
+        // literal below is the only value a client can send back for a field the
+        // operator never touched.
+        expect(first.channels['bot']?.['clientId']).toBe('resolved-client-id');
+
+        await store.upsert('bot', {
+          expectedRevision: first.revision,
+          config: {
+            type: 'management-validation-test',
+            clientId: 'resolved-client-id',
+            senderPolicy: 'pairing',
+          },
+          secrets: { clientSecret: { operation: 'preserve' } },
+        });
+
+        expect(readStoredChannel('bot')).toEqual({
+          type: 'management-validation-test',
+          clientId: '$CLIENT_ID',
+          clientSecret: '$BOT_TOKEN',
+          senderPolicy: 'pairing',
+        });
+      },
+    );
+  });
+
+  it('persists a deliberately edited value over a stored reference', async () => {
+    writeWorkspaceSettings(`{
+  "$version": 4,
+  "channels": {
+    "bot": {
+      "type": "management-validation-test",
+      "clientId": "$CLIENT_ID",
+      "clientSecret": "$BOT_TOKEN",
+      "senderPolicy": "open"
+    }
+  }
+}\n`);
+
+    await withEnv(
+      { CLIENT_ID: 'resolved-client-id', BOT_TOKEN: 'sekret-plaintext' },
+      async () => {
+        const store = new WorkspaceChannelSettingsStore(workspace);
+        const first = store.snapshot();
+
+        await store.upsert('bot', {
+          expectedRevision: first.revision,
+          config: {
+            type: 'management-validation-test',
+            clientId: 'pinned-client-id',
+            senderPolicy: 'open',
+          },
+          secrets: { clientSecret: { operation: 'preserve' } },
+        });
+
+        // Restoring only an echoed-back value is what keeps this from swallowing
+        // a real edit: the operator asked for a literal, so a literal is stored.
+        expect(readStoredChannel('bot')).toEqual({
+          type: 'management-validation-test',
+          clientId: 'pinned-client-id',
+          clientSecret: '$BOT_TOKEN',
+          senderPolicy: 'open',
+        });
+      },
+    );
+  });
+
+  it('does not write back a reference on a secret field that forbids one', async () => {
+    // `optionalSecret` declares no `envResolvable`, so `assertDescriptorValue`
+    // rejects a bare `$OPT` there. The restore runs after validation, so writing
+    // a hand-authored reference back would persist a value the daemon refuses to
+    // read: the next start without OPT resolves it to the placeholder itself and
+    // every later upsert throws on a field the caller never sent.
+    writeWorkspaceSettings(`{
+  "$version": 4,
+  "channels": {
+    "bot": {
+      "type": "management-validation-test",
+      "clientId": "client-id",
+      "clientSecret": "$BOT_TOKEN",
+      "optionalSecret": "$OPT",
+      "senderPolicy": "open"
+    }
+  }
+}\n`);
+
+    await withEnv(
+      { OPT: 'hunter2', BOT_TOKEN: 'sekret-plaintext' },
+      async () => {
+        const store = new WorkspaceChannelSettingsStore(workspace);
+        const first = store.snapshot();
+        expect(first.channels['bot']?.['optionalSecret']).toBe('hunter2');
+
+        await store.upsert('bot', {
+          expectedRevision: first.revision,
+          config: {
+            type: 'management-validation-test',
+            clientId: 'client-id',
+            senderPolicy: 'pairing',
+          },
+          secrets: {
+            clientSecret: { operation: 'preserve' },
+            optionalSecret: { operation: 'preserve' },
+          },
+        });
+
+        // `clientSecret` keeps its reference (it declares `envResolvable`), so the
+        // gate is the descriptor and not a blanket "never restore a secret".
+        expect(readStoredChannel('bot')).toEqual({
+          type: 'management-validation-test',
+          clientId: 'client-id',
+          clientSecret: '$BOT_TOKEN',
+          optionalSecret: 'hunter2',
+          senderPolicy: 'pairing',
+        });
+      },
+    );
+  });
 
   it('accepts chat-and-thread session scope', async () => {
     const store = new WorkspaceChannelSettingsStore(workspace);
