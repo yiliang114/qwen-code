@@ -795,6 +795,13 @@ jobs:
           # sink; this covers the producer. Every other code stays red.
           if [ "$RC" -eq 1 ] && [ "$TEE_RC" -eq 0 ] && [ "${QWEN_CI_TOLERATE_RPC_TIMEOUT:-1}" = '1' ]; then
             node .github/scripts/ci/classify-infra-flake.mjs --log "$WORKSPACES_LOG" --root . --samples "$DISK_SAMPLES" --runner-name "${RUNNER_NAME:-}" && RC=0
+          elif [ "$RC" -ne 0 ]; then
+            # The third outcome is the silent one. A refusal writes its reason
+            # and a tolerance writes its warning, but a gate that was false
+            # writes nothing, and GitHub never echoes a step `env:` value — so
+            # name the switch and both statuses, keeping "looked and refused"
+            # distinguishable from "never ran" and from "tolerance is off".
+            echo "::notice::infra-flake classifier skipped — RC=$RC TEE_RC=$TEE_RC tolerate='${QWEN_CI_TOLERATE_RPC_TIMEOUT:-1}'"
           fi
           if [ "$RC" -eq 0 ]; then
             npm run test:scripts -- "${retry_arg[@]}"

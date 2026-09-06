@@ -1,6 +1,16 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import {
   RPC_TIMEOUT_SIGNATURE,
@@ -121,6 +131,32 @@ test('keeps a run red when an unrelated unhandled error rides along', () => {
   assert.match(verdict.reason, /something else escaped/);
   assert.equal(verdict.caughtUnhandled, 2);
   assert.equal(verdict.rpcTimeouts, 1);
+});
+
+// More signature lines than vitest's own tally: the shape a truncated capture
+// leaves when a project's `Vitest caught N` line is lost and its signatures
+// survive — the two counts are read from merged streams whose lines are not
+// atomic, so the equality gate has to refuse in this direction too.
+const SHORT_TALLY_LOG = [
+  `${TS}Vitest caught 1 unhandled error during the test run.`,
+  `${TS}Error: ${RPC_TIMEOUT_SIGNATURE}`,
+  `${TS}Error: ${RPC_TIMEOUT_SIGNATURE}`,
+  `${TS} Test Files  1014 passed (1014)`,
+  `${TS}      Tests  28582 passed (28582)`,
+  `${TS}npm error path /_work/qwen-code/qwen-code/packages/cli`,
+].join('\n');
+
+test('keeps a run red when signatures outnumber vitest own tally', () => {
+  assert.equal(countRpcTimeouts(SHORT_TALLY_LOG), 2);
+  assert.equal(countCaughtUnhandled(SHORT_TALLY_LOG), 1);
+  const verdict = classify({
+    logText: SHORT_TALLY_LOG,
+    readJunit: junitFor(['packages/cli/junit.xml']),
+  });
+  assert.equal(verdict.tolerated, false);
+  assert.match(verdict.reason, /something else escaped/);
+  assert.equal(verdict.rpcTimeouts, 2);
+  assert.equal(verdict.caughtUnhandled, 1);
 });
 
 test('keeps a run red when no RPC timeout is present', () => {
@@ -642,4 +678,66 @@ test('annotates a refused verdict, not stderr alone', () => {
   assert.ok(
     lines.some((line) => line.startsWith('infra-flake: not tolerated')),
   );
+});
+
+const SCRIPT_PATH = fileURLToPath(
+  new URL('./classify-infra-flake.mjs', import.meta.url),
+);
+
+test('carries the verdict across the process boundary the lane spawns', () => {
+  // Every case above calls runCli in-process and compares its return value, so
+  // the module-scope `process.exitCode = runCli(...)` — the line that makes that
+  // return the lane's exit status — is executed by none of them. Dropping the
+  // assignment keeps this suite green while the script exits 0 on a refusal, and
+  // ci.yml's `&& RC=0` then greens the required Test check on a run where tests
+  // failed. Spawn it the way the lane does, flags included.
+  const root = mkdtempSync(join(tmpdir(), 'infra-flake-cli-'));
+  try {
+    const logPath = join(root, 'test-ci-workspaces.log');
+    const samplesPath = join(root, 'disk-samples.log');
+    writeFileSync(logPath, ALL_GREEN_RPC_LOG);
+    writeFileSync(
+      samplesPath,
+      'DFSAMPLE 08:53:48 tmpdir[/var/tmp/x] load[236.42 234.69 229.50] hosttests[74]',
+    );
+    for (const workspace of ['packages/cli', 'packages/core']) {
+      mkdirSync(join(root, workspace), { recursive: true });
+      writeFileSync(join(root, workspace, 'junit.xml'), junit());
+    }
+    const spawn = () =>
+      spawnSync(
+        process.execPath,
+        [
+          SCRIPT_PATH,
+          '--log',
+          logPath,
+          '--root',
+          root,
+          '--samples',
+          samplesPath,
+          '--runner-name',
+          'ecs-qwen-hk5-2',
+        ],
+        { encoding: 'utf8' },
+      );
+
+    const tolerated = spawn();
+    assert.equal(tolerated.status, 0, tolerated.stderr);
+    assert.match(tolerated.stdout, /^::warning::Test step tolerated/m);
+    assert.match(tolerated.stdout, /peak host load 236\.42/);
+
+    // One failing junit turns the same log into a refusal: exit 1 is what the
+    // lane's `&& RC=0` reads, and the reason has to reach both streams — the
+    // annotation for the job page, the stderr line for a local invocation.
+    writeFileSync(join(root, 'packages/cli/junit.xml'), junit(2));
+    const refused = spawn();
+    assert.equal(refused.status, 1, refused.stdout);
+    assert.match(
+      refused.stderr,
+      /^infra-flake: not tolerated — packages\/cli\/junit\.xml reports 2 failure/m,
+    );
+    assert.match(refused.stdout, /^::error title=/m);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

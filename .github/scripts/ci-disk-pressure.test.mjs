@@ -169,6 +169,16 @@ describe('ci.yml disk-pressure evidence', () => {
       'the classifier gate must not run on a producer that died by signal',
     );
 
+    // The gate being false is a third outcome, and the only one that emits
+    // nothing: a refusal writes its reason, a tolerance writes its warning, and
+    // GitHub never echoes a step `env:` value. Without this branch a red step
+    // whose producer died by signal — or whose switch an operator turned off —
+    // is indistinguishable in the log from a classifier that looked and refused.
+    assert.match(
+      tests,
+      /elif \[ "\$RC" -ne 0 \]; then\n(?: {2}#[^\n]*\n)* {2}echo "::notice::infra-flake classifier skipped[^\n]*RC=\$RC TEE_RC=\$TEE_RC tolerate='\$\{QWEN_CI_TOLERATE_RPC_TIMEOUT:-1\}'"\nfi/,
+    );
+
     // The reader's `:-1` default keeps the tolerance on if this binding is
     // dropped or renamed, so pin the binding beside the shell comparison.
     assert.equal(
