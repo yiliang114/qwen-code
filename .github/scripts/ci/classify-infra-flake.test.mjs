@@ -9,10 +9,13 @@ import {
   countRpcTimeouts,
   failingWorkspaceDirs,
   junitTotals,
+  normalizeLog,
   peakLoad,
   runCli,
   warningLine,
+  workspaceSections,
 } from './classify-infra-flake.mjs';
+import { stripLogDecoration } from './main-failure-signature.mjs';
 
 const TS = '2026-09-05T08:53:44.1714368Z ';
 const ESC = '\u001B';
@@ -446,5 +449,197 @@ test('runCli exits 0 on a tolerated verdict and 1 otherwise', () => {
   assert.ok(
     lines.some((line) => line.startsWith('::warning::')),
     'a tolerated verdict must be announced, never silent',
+  );
+});
+
+// The two counts classify() gates on are whole-log sums, so a log whose
+// signatures all sit in ONE leg's output still balances them while a second
+// leg exited for a reason nobody checked. Both fixtures below are green-junit,
+// no-FAIL, count-balanced runs; the only thing that keeps them red is the
+// per-workspace section requirement.
+
+// cli printed a complete green summary and exited 1 with no RPC timeout of
+// its own; core is the leg that starved.
+const SIGNATURES_ONLY_IN_SECOND_SECTION_LOG = [
+  `${TS} Test Files  1014 passed (1014)`,
+  `${TS}      Tests  28582 passed (28582)`,
+  `${TS}npm error code 1`,
+  `${TS}npm error path /_work/qwen-code/qwen-code/packages/cli`,
+  `${TS}Vitest caught 1 unhandled error during the test run.`,
+  `${TS}Error: ${RPC_TIMEOUT_SIGNATURE}`,
+  `${TS} Test Files  643 passed (644)`,
+  `${TS}      Tests  23521 passed (23521)`,
+  `${TS}npm error code 1`,
+  `${TS}npm error path /_work/qwen-code/qwen-code/packages/core`,
+].join('\n');
+
+// core flushed a complete junit, then died in the post-reporter window (137 is
+// a signal death, not vitest's own exit). Nothing in the log distinguishes it
+// from a starved worker except whose section the timeout is in.
+const POST_JUNIT_DEATH_LOG = [
+  `${TS}Vitest caught 3 unhandled errors during the test run.`,
+  `${TS}Error: ${RPC_TIMEOUT_SIGNATURE}`,
+  `${TS}Error: ${RPC_TIMEOUT_SIGNATURE}`,
+  `${TS}Error: ${RPC_TIMEOUT_SIGNATURE}`,
+  `${TS} Test Files  1014 passed (1014)`,
+  `${TS}JUNIT report written to /_work/qwen-code/qwen-code/packages/cli/junit.xml`,
+  `${TS}npm error code 1`,
+  `${TS}npm error path /_work/qwen-code/qwen-code/packages/cli`,
+  `${TS} Test Files  643 passed (644)`,
+  `${TS}      Tests  23521 passed (23521)`,
+  `${TS}JUNIT report written to /_work/qwen-code/qwen-code/packages/core/junit.xml`,
+  `${TS}npm error code 137`,
+  `${TS}npm error path /_work/qwen-code/qwen-code/packages/core`,
+].join('\n');
+
+test('refuses a leg whose own npm section carries no RPC timeout', () => {
+  // Balanced counts, no FAIL line, both junits clean: without the per-section
+  // requirement this returns tolerated and the annotation names packages/cli
+  // as a leg whose "worker IPC starv[ed] on CPU".
+  assert.equal(countRpcTimeouts(SIGNATURES_ONLY_IN_SECOND_SECTION_LOG), 1);
+  assert.equal(countCaughtUnhandled(SIGNATURES_ONLY_IN_SECOND_SECTION_LOG), 1);
+  const verdict = classify({
+    logText: SIGNATURES_ONLY_IN_SECOND_SECTION_LOG,
+    readJunit: junitFor(['packages/cli/junit.xml', 'packages/core/junit.xml']),
+  });
+  assert.equal(verdict.tolerated, false);
+  assert.match(verdict.reason, /packages\/cli/);
+  assert.match(verdict.reason, /own npm section/);
+});
+
+test('refuses a leg killed after it flushed a complete green junit', () => {
+  assert.equal(countRpcTimeouts(POST_JUNIT_DEATH_LOG), 3);
+  assert.equal(countCaughtUnhandled(POST_JUNIT_DEATH_LOG), 3);
+  const verdict = classify({
+    logText: POST_JUNIT_DEATH_LOG,
+    readJunit: junitFor(['packages/cli/junit.xml', 'packages/core/junit.xml']),
+  });
+  assert.equal(verdict.tolerated, false);
+  assert.match(verdict.reason, /packages\/core/);
+  assert.match(verdict.reason, /own npm section/);
+  // cli IS attributable, so the refusal has to name core and not stop at the
+  // first workspace: a fix that refused on any section would also pass the two
+  // assertions above while never tolerating the real all-green shape.
+  assert.equal(
+    countRpcTimeouts(
+      workspaceSections(POST_JUNIT_DEATH_LOG).get('packages/cli'),
+    ),
+    3,
+  );
+});
+
+test('attributes each blamed workspace the section npm printed for it', () => {
+  const sections = workspaceSections(ALL_GREEN_RPC_LOG);
+  assert.deepEqual([...sections.keys()], ['packages/cli', 'packages/core']);
+  // 3 from the cli leg plus 1 from core — the split the tolerated fixture's
+  // `rpcTimeouts === 4` already assumes, now pinned per workspace.
+  assert.equal(countRpcTimeouts(sections.get('packages/cli')), 3);
+  assert.equal(countRpcTimeouts(sections.get('packages/core')), 1);
+});
+
+// The log being classified is the code under test's own stdout, so text a test
+// prints is PR-controlled. Vitest attributes printed output to a `stdout |`
+// region; counting inside one lets a leg's real non-RPC unhandled error be
+// balanced by printed copies of the signature and the tally.
+const PRINTED_EVIDENCE_LOG = [
+  `${TS}Vitest caught 1 unhandled error during the test run.`,
+  `${TS}⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯ Unhandled Error ⎯⎯⎯⎯⎯⎯⎯⎯`,
+  `${TS}Error: write after end`,
+  `${TS} Test Files  211 passed (211)`,
+  `${TS}      Tests  9480 passed (9480)`,
+  `${TS}stdout | src/replay-ci-log.test.ts > replays a captured CI log`,
+  `${TS}Vitest caught 1 unhandled error during the test run.`,
+  `${TS}Error: ${RPC_TIMEOUT_SIGNATURE}`,
+  `${TS}Error: ${RPC_TIMEOUT_SIGNATURE}`,
+  `${TS}npm error path /_work/qwen-code/qwen-code/packages/core`,
+].join('\n');
+
+test('never counts a signature or a tally a test printed itself', () => {
+  // Counting the printed region balances the equality gate at 2 === 2 while the
+  // only real unhandled error is a `write after end` — the archive-safety class
+  // the module header says must stay fatal.
+  assert.equal(countRpcTimeouts(PRINTED_EVIDENCE_LOG), 0);
+  assert.equal(countCaughtUnhandled(PRINTED_EVIDENCE_LOG), 1);
+  const verdict = classify({
+    logText: PRINTED_EVIDENCE_LOG,
+    readJunit: junitFor(['packages/core/junit.xml']),
+  });
+  assert.equal(verdict.tolerated, false);
+});
+
+test('keeps npm blame lines that follow a captured-output region', () => {
+  // The over-strip guard: if `npm error` did not end a captured region, the
+  // blame line above would be swallowed with the printed text, no workspace
+  // would be attributable, and every run would refuse — the tolerance would
+  // stop firing with nothing red to say so.
+  const sections = workspaceSections(PRINTED_EVIDENCE_LOG);
+  assert.deepEqual([...sections.keys()], ['packages/core']);
+  assert.match(sections.get('packages/core'), /^npm error path/m);
+});
+
+test('normalizes via the shared transport strip, not a private copy', () => {
+  // The knowledge "an Actions log line is an RFC3339 prefix plus SGR escapes"
+  // lives in main-failure-signature.mjs. A second copy here would keep this
+  // suite green on its own fixture while the anchored /^npm error path …/
+  // silently stopped matching production logs.
+  const decorated = `${TS}${ESC}[31mnpm error path /_work/x/packages/cli${ESC}[39m`;
+  assert.equal(normalizeLog(decorated), stripLogDecoration(decorated));
+  assert.equal(
+    normalizeLog(`plain\n${decorated}`),
+    ['plain', stripLogDecoration(decorated)].join('\n'),
+  );
+  const source = readFileSync(
+    new URL('./classify-infra-flake.mjs', import.meta.url),
+    'utf8',
+  );
+  for (const name of ['ANSI_PATTERN', 'LOG_TIMESTAMP_PATTERN']) {
+    assert.ok(
+      !new RegExp(`const ${name}\\b`).test(source),
+      `classify-infra-flake.mjs re-declares ${name} — import stripLogDecoration ` +
+        'from main-failure-signature.mjs instead, so a transport change is fixed once',
+    );
+  }
+});
+
+test('annotates a refused verdict, not stderr alone', () => {
+  // The release lane's sibling step annotates both outcomes; a bare stderr line
+  // in a hundred-thousand-line log is not where an operator looks for the
+  // reason a rerun would or would not help.
+  const files = new Map([
+    ['/log.txt', ALL_GREEN_RPC_LOG],
+    ['packages/cli/junit.xml', junit()],
+  ]);
+  const read = (path) => {
+    if (!files.has(path))
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    return files.get(path);
+  };
+  const lines = [];
+  const stdout = process.stdout.write.bind(process.stdout);
+  const stderr = process.stderr.write.bind(process.stderr);
+  process.stdout.write = (chunk) => (lines.push(String(chunk)), true);
+  process.stderr.write = (chunk) => (lines.push(String(chunk)), true);
+  let code;
+  try {
+    // core's junit is missing, so this refuses on a named workspace.
+    code = runCli(['--log', '/log.txt', '--root', '.'], { readFileSync: read });
+  } finally {
+    process.stdout.write = stdout;
+    process.stderr.write = stderr;
+  }
+  assert.equal(code, 1);
+  const annotation = lines.find((line) => line.startsWith('::error title='));
+  assert.ok(
+    annotation,
+    'a refused verdict must surface as a titled annotation, not only stderr',
+  );
+  // One line: a newline would terminate the workflow command and leak the
+  // remainder into the log as ordinary text.
+  assert.equal(annotation.split('\n').length, 2, 'trailing newline only');
+  assert.match(annotation, /did not tolerate it::/);
+  assert.match(annotation, /wrote no junit\.xml/);
+  // The stderr line stays: it is what a local invocation reads.
+  assert.ok(
+    lines.some((line) => line.startsWith('infra-flake: not tolerated')),
   );
 });

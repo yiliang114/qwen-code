@@ -3,7 +3,10 @@ import { readFileSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { extractFailingTests } from './main-failure-signature.mjs';
+import {
+  extractFailingTests,
+  stripLogDecoration,
+} from './main-failure-signature.mjs';
 
 /**
  * Decide whether a red `npm run test:ci:workspaces` was caused by the runner
@@ -47,10 +50,16 @@ import { extractFailingTests } from './main-failure-signature.mjs';
  * one test and zero failures — a worker that was OOM-killed or segfaulted
  * writes no junit and stays red. Any real `FAIL` line anywhere in the log also
  * keeps the run red, because junit's `failures` counter is per file and a
- * suite that died during collection can leave a file's totals at zero. And the
+ * suite that died during collection can leave a file's totals at zero. The
  * unhandled-error count vitest itself prints must equal the number of RPC
  * timeouts, so an unrelated unhandled error riding along in the same run is
- * never masked by them.
+ * never masked by them — and both counts are taken after dropping the regions
+ * vitest attributes to a test's own `stdout`/`stderr`, because this log is the
+ * code under test's output, and text a test printed is not evidence about the
+ * runner. Attribution is per workspace as well as per run: every blamed
+ * workspace must carry an RPC timeout in the section npm printed for it, so a
+ * leg that died *after* flushing a clean junit is not certified on the
+ * strength of a neighbouring leg's timeout.
  *
  * The verdict is a warning, never silence: the pool being over capacity is the
  * actual defect, and a green job that hides it would remove the only pressure
@@ -77,9 +86,22 @@ const NPM_ERROR_PATH_PATTERN =
 
 const TESTSUITES_OPEN_PATTERN = /<testsuites\b[^>]*>/;
 
-// eslint-disable-next-line no-control-regex -- matches the ESC that opens an SGR sequence
-const ANSI_PATTERN = /\u001B\[[0-9;?]*[A-Za-z]/g;
-const LOG_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s?/;
+/** Vitest prints a test's own captured output under one of these headers. */
+const CAPTURED_OUTPUT_HEADER = /^\s*(?:stdout|stderr) \| /;
+
+/**
+ * Line shapes only the reporter or npm emits, so one of them ends a captured
+ * region. `npm error` must be here: a trailing captured block is often the
+ * last thing a leg prints before npm's blame block, and swallowing that block
+ * would leave `failingWorkspaceDirs` empty and refuse every run — the
+ * tolerance would stop firing with nothing red to say so.
+ *
+ * Not here on purpose: `Vitest caught`. A printed copy of the tally is
+ * textually identical to vitest's own, so treating it as an exit would let a
+ * test end the region early and have its later printed lines counted.
+ */
+const CAPTURED_OUTPUT_EXIT =
+  /^\s*(?:\u23af{3,}|Test Files\b|Tests\s|\u276f)|^npm error\b/;
 
 /**
  * Strip what the log transport adds rather than what the runner printed. The
@@ -91,20 +113,51 @@ const LOG_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s?/;
 export function normalizeLog(logText) {
   return String(logText ?? '')
     .split('\n')
-    .map((line) =>
-      line.replace(ANSI_PATTERN, '').replace(LOG_TIMESTAMP_PATTERN, ''),
-    )
+    .map((line) => stripLogDecoration(line))
     .join('\n');
 }
 
+/**
+ * Drop the regions vitest attributes to a test's own `stdout`/`stderr`. This
+ * log is the code under test's output, so anything a test prints is
+ * PR-controlled text: left in, it is indistinguishable from the runner's own
+ * report, and printed copies of the signature and the tally balance the
+ * equality gate below while a real non-RPC unhandled error rides through.
+ * `main-failure-signature.mjs` guards its FAIL gate the same way.
+ *
+ * Residual limit, stated rather than solved: the region boundaries are text
+ * too, so a test that prints one of the exit shapes can still end a region
+ * early. What this closes is the accidental case — a log fixture, an
+ * error-message assertion or a replayed CI log in a tee'd workspace — and it
+ * only ever lowers the counts, which pushes every gate toward refusal.
+ */
+export function stripCapturedOutput(normalizedText) {
+  const kept = [];
+  let capturing = false;
+  for (const line of String(normalizedText ?? '').split('\n')) {
+    if (capturing) {
+      if (!CAPTURED_OUTPUT_EXIT.test(line)) continue;
+      capturing = false;
+    }
+    if (CAPTURED_OUTPUT_HEADER.test(line)) {
+      capturing = true;
+      continue;
+    }
+    kept.push(line);
+  }
+  return kept.join('\n');
+}
+
+/** RPC-timeout signatures in the runner's own output, not in printed text. */
 export function countRpcTimeouts(logText) {
-  return normalizeLog(logText).split(RPC_TIMEOUT_SIGNATURE).length - 1;
+  const own = stripCapturedOutput(normalizeLog(logText));
+  return own.split(RPC_TIMEOUT_SIGNATURE).length - 1;
 }
 
 /** Sum of vitest's own per-project unhandled-error tallies. */
 export function countCaughtUnhandled(logText) {
   let total = 0;
-  for (const match of normalizeLog(logText).matchAll(
+  for (const match of stripCapturedOutput(normalizeLog(logText)).matchAll(
     CAUGHT_UNHANDLED_PATTERN,
   )) {
     total += Number(match[1]);
@@ -119,6 +172,29 @@ export function failingWorkspaceDirs(logText) {
     dirs.add(match[1]);
   }
   return [...dirs];
+}
+
+/**
+ * The log text npm printed on each blamed workspace's own behalf, keyed by
+ * workspace dir: everything between the previous `npm error path` line (or the
+ * log start) and this one, blame line included. npm prints a failing
+ * workspace's error block immediately after that workspace's own output and
+ * then continues to the next workspace, so exactly one attributable section
+ * per blamed workspace exists in the real log — and a leg's RPC timeouts sit
+ * in its own section, not in a neighbour's.
+ */
+export function workspaceSections(logText) {
+  const log = stripCapturedOutput(normalizeLog(logText));
+  const sections = new Map();
+  let start = 0;
+  for (const match of log.matchAll(NPM_ERROR_PATH_PATTERN)) {
+    const end = match.index + match[0].length;
+    const workspace = match[1];
+    const section = (sections.get(workspace) ?? '') + log.slice(start, end);
+    sections.set(workspace, section);
+    start = end;
+  }
+  return sections;
 }
 
 /**
@@ -202,6 +278,7 @@ export function classify(options = {}) {
   if (workspaces.length === 0) {
     return refuse('npm named no failing workspace to attribute the exit to');
   }
+  const sections = workspaceSections(log);
 
   for (const workspace of workspaces) {
     let xml;
@@ -233,6 +310,22 @@ export function classify(options = {}) {
     if (totals.failures !== 0) {
       return refuse(
         `${workspace}/junit.xml reports ${totals.failures} failure(s)`,
+        { workspaces },
+      );
+    }
+    // The two counts above are whole-log sums, and a clean junit only proves
+    // this leg recorded no failing test — not that the exit came from its own
+    // starved worker. A leg that dies *after* flushing that junit (vitest's
+    // process-level unhandledRejection handler sets exitCode 1 and exits
+    // without going through the tally; a coverage write or a heap abort lands
+    // in the same post-reporter window) would otherwise be certified on the
+    // strength of a different leg's timeout, and `warningLine` would then name
+    // it as a leg whose "worker IPC starv[ed] on CPU". So require the
+    // signature in the section npm printed for this workspace.
+    const ownSignatures = countRpcTimeouts(sections.get(workspace) ?? '');
+    if (ownSignatures === 0) {
+      return refuse(
+        `${workspace} exited nonzero with no "${RPC_TIMEOUT_SIGNATURE}" in its own npm section`,
         { workspaces },
       );
     }
@@ -287,6 +380,17 @@ export function runCli(argv, { readFileSync: read = readFileSync } = {}) {
 
   if (!verdict.tolerated) {
     process.stderr.write(`infra-flake: not tolerated — ${verdict.reason}\n`);
+    // The step is red either way, but the reason is the part an operator
+    // needs, and one stderr line in a hundred-thousand-line log is not where
+    // they look. The release lane's sibling step annotates its refusals for
+    // exactly this reason ("Workspace tests exited 1 on a Vitest transport
+    // timeout"). Whitespace is collapsed to keep the annotation on one line: a
+    // newline would terminate the workflow command and leak the remainder into
+    // the log as ordinary text.
+    const reason = String(verdict.reason).replace(/\s+/g, ' ');
+    process.stdout.write(
+      `::error title=Test step failed; the infra-flake classifier did not tolerate it::${reason}\n`,
+    );
     return 1;
   }
   process.stdout.write(`${warningLine(verdict)}\n`);
