@@ -169,6 +169,51 @@ describe('ci.yml disk-pressure evidence', () => {
       'the classifier gate must not run on a producer that died by signal',
     );
 
+    // The tokens that make the tolerance *conditional*, which the match above
+    // stops short of: `&& RC=0` is the only thing keeping a refused verdict
+    // red, and `--log "$WORKSPACES_LOG"` is what binds that verdict to the
+    // capture the tee gate just validated. Three mutations survive a pin that
+    // ends at the script name — `&& RC=0` becoming `; RC=0`, an unconditional
+    // `RC=0`, and `--log /dev/null` — and two of them green the required Test
+    // check on every workspaces failure, real assertion failures included. The
+    // argument list is matched around, not literally, so adding a harmless flag
+    // does not red this.
+    assert.match(
+      tests,
+      /node \.github\/scripts\/ci\/classify-infra-flake\.mjs[^\n]*--log "\$WORKSPACES_LOG"[^\n]*&& RC=0\n/,
+    );
+    // Counted, not only matched: `RC=0` unconditional, or hoisted past the
+    // `fi`, leaves the line above intact while making the tolerance
+    // unconditional — which is the false green this whole `it` exists to
+    // prevent. One assignment, inside the guard, is the contract.
+    assert.equal(
+      tests.match(/\bRC=0\b/g)?.length,
+      1,
+      'RC=0 must be assigned only by the classifier line inside the gate',
+    );
+
+    // Executed, because the adjacency match above pins text and this pins what
+    // that text yields: bash resets PIPESTATUS on the next command, so both
+    // statuses have to be captured in ONE statement. The statement is taken
+    // from the workflow itself, so a rewrite that keeps its shape but loses a
+    // status (`RC=$?`, or the two-statement form) reds here rather than only
+    // in a lane. Mirrors the PIPESTATUS probe in
+    // scripts/tests/qwen-triage-workflow.test.js.
+    const capture = tests
+      .split('\n')
+      .find((line) => line.startsWith('RC=${PIPESTATUS[0]}'));
+    assert.ok(capture, 'the one-statement PIPESTATUS capture is gone');
+    const probe = spawnSync(
+      'bash',
+      [
+        '-c',
+        `(exit 3) | tee /dev/null\n${capture}\necho "RC=$RC TEE_RC=$TEE_RC"`,
+      ],
+      { encoding: 'utf8' },
+    );
+    assert.equal(probe.status, 0, probe.stderr);
+    assert.equal(probe.stdout.trim(), 'RC=3 TEE_RC=0');
+
     // The gate being false is a third outcome, and the only one that emits
     // nothing: a refusal writes its reason, a tolerance writes its warning, and
     // GitHub never echoes a step `env:` value. Without this branch a red step

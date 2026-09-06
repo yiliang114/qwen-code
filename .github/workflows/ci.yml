@@ -766,11 +766,13 @@ jobs:
             retry_arg=(--retry="${VITEST_RETRY}")
           fi
           # An all-green suite still exits 1 when a worker's onTaskUpdate RPC
-          # starves on host CPU pressure (#10438): five of the thirteen
+          # starves on host CPU pressure: five of the thirteen
           # consecutive red Test jobs on 2026-09-05 had zero failing tests, cli
           # among them printing "1014 passed (1014)". --retry cannot help (it is
           # per test, this is reported after the run) and neither can the step
-          # ceiling (no job was cancelled; the longest finished at 96m55s). So
+          # ceiling (no job was cancelled; the longest finished at 96m55s), and
+          # the RPC's own 60s budget is vitest's rather than a knob this lane
+          # owns — classify-infra-flake.mjs's header sources the figure. So
           # classify the exit against the junit totals instead of reporting a
           # failure no test caused. Fails closed: any real FAIL line, a missing
           # junit, or a second kind of unhandled error keeps the run red.
