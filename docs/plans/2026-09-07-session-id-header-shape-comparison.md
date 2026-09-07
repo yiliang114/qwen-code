@@ -155,24 +155,44 @@ untouched.
 
 ## Verification status
 
-Everything below is **unverified** — this sandbox cannot build or run the suite,
-and the box is memory-constrained.
+Run locally in a sandbox worktree (workspace `node_modules` and `dist` overlaid
+by symlink; four missing `exports` entries stubbed to satisfy the vitest global
+setup — none of them imported by these suites):
 
-- ESLint passes on every changed file.
-- `outbound-dynamic-headers.test.ts` (18 cases) has **not been executed**: the
-  vitest global setup requires `npm run build` first, which was not run.
-- `npm run generate:settings-schema` could not run for the same reason (it loads
-  the built core through `dist/`). The `settings.schema.json` entry was added by
-  hand, with the description string extracted programmatically from
-  `settingsSchema.ts` so the two cannot disagree. **CI's schema-drift check is
-  the authority** — if it reports a diff, re-run the generator and commit.
+```
+✓ src/core/outbound-dynamic-headers.test.ts                     (20 tests)
+✓ src/core/outbound-session-id.test.ts                          (14 tests)
+✓ src/core/openaiContentGenerator/provider/default.test.ts      (38 tests)
+✓ src/core/openaiContentGenerator/provider/dashscope.test.ts   (162 tests)
+✓ src/core/anthropicContentGenerator/anthropicContentGenerator.test.ts (165 tests)
+✓ src/core/llm-content-generator/llm-content-generator.test.ts  (22 tests)
 
-To verify on a build-capable machine:
+Test Files  6 passed (6)
+     Tests  421 passed (421)
+```
+
+The last four are the suites whose built-in `session_id` assertions #11282's
+first commit broke; they pass here unmodified, which is the regression this
+shape has to clear too. ESLint passes on every changed file.
+
+Still **not** verified here, and CI's to confirm:
+
+- `npm run typecheck` and a full build were not run.
+- `npm run generate:settings-schema` could not run (it loads the built core
+  through `dist/`, and this box cannot build it). The `settings.schema.json`
+  entry was added by hand, with the description string extracted
+  programmatically from `settingsSchema.ts` so the two cannot disagree.
+  **CI's schema-drift check is the authority** — if it reports a diff, re-run
+  the generator and commit the result.
+- No test covers the four provider call sites actually forwarding
+  `customHeaders` into `buildSessionAwareFetch`; that wiring is verified only by
+  reading.
+
+To reproduce on a build-capable machine:
 
 ```bash
 npm run build
 npm run test --workspace=@qwen-code/qwen-code-core -- src/core/outbound-dynamic-headers.test.ts
-npm run test --workspace=@qwen-code/qwen-code-core -- src/core/outbound-session-id.test.ts
 npm run generate:settings-schema && git diff --exit-code packages/vscode-ide-companion/schemas/settings.schema.json
 npm run typecheck && npm run lint
 ```
