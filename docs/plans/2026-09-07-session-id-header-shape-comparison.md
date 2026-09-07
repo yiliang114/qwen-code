@@ -62,35 +62,81 @@ extension, and provenance is lost once presets and user settings are merged. The
 gate is what separates "I typed this" from "something shipped this", so a preset
 cannot silently promote a static header into an identity header.
 
-## Provenance: the rejection on record answers a different argument
+## Where the `trustedHosts` allowlist actually comes from
 
-§12.2 of the same design doc says:
+It is not arbitrary, and it has a named origin. In his round-8 follow-up review
+of PR #4390 (2026-05-25T03:24), LaZzyMan listed what the outbound-correlation
+follow-up PR should cover, including:
+
+> - **Override semantics**: same `trustedHosts` allowlist mechanism you've built
+>   here **can carry over unchanged**
+
+Two things about the context matter:
+
+1. **It was said about the built-in, automatic header.** In R3 the mechanism
+   attached the session ID to every provider; the allowlist is what removed that
+   "dangerous default", narrowing it to three first-party hosts. For a header the
+   client attaches _by itself_, an allowlist is the only possible source of
+   scope, and it is plainly right.
+2. **"Can carry over", not "must".** For a header the _user_ writes into a
+   provider entry, the scope already exists — they chose the `baseUrl`. The
+   allowlist was permission to reuse working code, not a derivation that the
+   user-configured case needs one.
+
+So Shape B does not contradict LaZzyMan's position. What he asked for was scope
+discipline and a consent decision outside `telemetry.*`: "its own settings tree,
+its own threat model, and its own user consent flow", default off. Shape B keeps
+all of that in `outboundCorrelation.allowDynamicHeaderValues`. What it declines
+to carry over is the allowlist, for the case where it duplicates scope rather
+than creating it.
+
+## Provenance: one argument was never engaged with
+
+§12.2 of `docs/design/telemetry-outbound-propagation-design.md` says:
 
 > 经过几轮内部讨论（含 yiliang 提出的 customHeader 模板替代方案，最终判定 customHeader 不能携带 runtime-dynamic 值），决定走 **方案 C**
 
-Checking that against the record:
+Against the record of PR #4390 (all of it public — the discussion happened in
+that PR's review thread, not off-GitHub):
 
-- The proposal is real: PR #4390, 2026-05-22T10:59
-  (https://github.com/QwenLM/qwen-code/pull/4390#issuecomment-4518059628).
+| Time (UTC)      | Who        | What                                                                                                 |
+| --------------- | ---------- | ---------------------------------------------------------------------------------------------------- |
+| 05-22 08:52     | LaZzyMan   | CHANGES_REQUESTED, escalating from the earlier read                                                  |
+| 05-22 **10:59** | yiliang114 | [The `customHeaders` comment](https://github.com/QwenLM/qwen-code/pull/4390#issuecomment-4518059628) |
+| 05-22 15:11     | doudouOUC  | Replies **to @LaZzyMan**                                                                             |
+| 05-25 03:24     | LaZzyMan   | "Review (round 8 follow-up)" — the text §12.1 quotes                                                 |
+| 05-25 05:44     | doudouOUC  | "accepting the split" (方案 C)                                                                       |
+| 05-25 13:26     | LaZzyMan   | APPROVED                                                                                             |
+| 05-25           | jinye      | Commit `62ed44e1f` adds the design doc                                                               |
+
+Note that `doudouOUC`'s GitHub display name is _jinye_: the PR author and the
+design doc's author are the same person.
+
+Findings:
+
+- **The proposal is real**, at the timestamp above.
 - **It was not a "template" proposal.** The word does not appear in it. The
-  argument made was that `customHeaders` is _per-provider_ — "without leaking
+  argument was that `customHeaders` is _per-provider_ — "without leaking
   identifiers indiscriminately to all third-party providers" — at "zero
-  additional complexity".
-- The recorded rejection ("cannot carry runtime-dynamic values") answers the
-  template framing, not the scoping argument. It is also a statement about the
-  code as it stands rather than a design constraint: `buildHeaders()` runs once
-  inside `buildClient()`, but the per-request hook already exists in
-  `wrapFetchWithSessionId`, which sets headers _after_ the SDK's.
-- Across every issue comment and review comment on #4390, the string
-  `customHeader` appears exactly once — in that comment. **No reply to it exists
-  in the public record.** The design doc was added three days later, in the same
-  PR, by a different author.
+  additional complexity". The scoping point is the one that turns out to decide
+  the design, and it is the one the recorded rejection does not address.
+- **The recorded rejection describes the code, not a constraint.**
+  `buildHeaders()` does run once inside `buildClient()`, but the per-request hook
+  already exists in `wrapFetchWithSessionId`, which sets headers _after_ the
+  SDK's — which is what this branch uses.
+- **No reply to it exists anywhere in the public record.** Searching all three
+  surfaces of #4390 — issue comments, inline review comments, and formal review
+  bodies — the string `customHeader` appears exactly once, in that comment.
+  LaZzyMan never mentioned `customHeaders` in any of his three reviews, and his
+  round-8 closing line addresses `@wenshao @doudouOUC`, so the per-provider
+  argument was never in front of the reviewer whose objection shaped the outcome.
 
-So the chain #11282 → §12.7 → §12.2 rests at its root on a conclusion that was
-never publicly answered, about an argument that was never publicly addressed.
-That is worth reopening before more is built on Shape A, not because anyone acted
-in bad faith, but because the scoping point is the one that turns out to decide
-the design.
+The likeliest reconstruction is ordinary: the comment landed in the middle of a
+LaZzyMan↔doudouOUC argument, nobody picked it up, and three days later it was
+summarized into the design doc as discussed-and-rejected. Nothing here suggests
+bad faith. It matters only because #11282 → §12.7 → §12.2 is the chain that makes
+Shape A look pre-decided, and the root of that chain is a conclusion no one
+publicly answered.
 
 ## What this branch changes
 
