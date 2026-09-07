@@ -29,6 +29,7 @@ import {
 } from '../../telemetry/gen-ai-request.js';
 import type { Config } from '../../config/config.js';
 import { buildSessionIdHeaders } from '../outbound-session-id.js';
+import { expandDynamicHeaders } from '../outbound-dynamic-headers.js';
 
 const debugLogger = createDebugLogger('GEMINI');
 
@@ -108,13 +109,30 @@ export class LlmContentGenerator implements ContentGenerator {
     const destination = httpOptions?.baseUrl ?? this.clientBaseUrl;
     if (!this.cliConfig || !destination) return httpOptions;
 
+    // Gemini's `customHeaders` are baked into the SDK client options at
+    // construction, so a placeholder value would freeze at the session
+    // that built the client. Re-emitting just the placeholder-bearing
+    // subset at request level overrides that stale client-level copy;
+    // entries without a placeholder are left where they are.
+    const dynamicHeaders = expandDynamicHeaders(
+      this.contentGeneratorConfig?.customHeaders,
+      this.cliConfig,
+    );
     const sessionHeaders = buildSessionIdHeaders(this.cliConfig, destination);
-    if (Object.keys(sessionHeaders).length === 0) return httpOptions;
+    if (
+      Object.keys(sessionHeaders).length === 0 &&
+      Object.keys(dynamicHeaders).length === 0
+    ) {
+      return httpOptions;
+    }
     return {
       ...httpOptions,
       headers: {
         ...httpOptions?.headers,
+        // Existing merge order for this path is
+        // customHeaders > correlation; keep it.
         ...sessionHeaders,
+        ...dynamicHeaders,
       },
     };
   }

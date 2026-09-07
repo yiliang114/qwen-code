@@ -645,6 +645,22 @@ export interface OutboundCorrelationSettings {
    * Tracing + DashScope — for cross-process trace stitching.
    */
   propagateTraceContext?: boolean;
+  /**
+   * Allow `modelProviders[].generationConfig.customHeaders` values to
+   * carry runtime placeholders such as `${session_id}`, expanded per
+   * request. Default: disabled — a value with a placeholder is dropped
+   * rather than sent.
+   *
+   * This is the consent decision, and it is the only part of the feature
+   * that is global: *which* hosts may receive the value, and *what* the
+   * header is called, are already answered by the provider entry the
+   * header is attached to. The gate also means a preset or extension
+   * that ships a `customHeaders` entry cannot quietly turn it into an
+   * identity header — provenance is lost once presets and user settings
+   * are merged, so the switch is what separates "I typed this" from
+   * "something shipped this".
+   */
+  allowDynamicHeaderValues?: boolean;
 }
 
 export interface OutputSettings {
@@ -2617,6 +2633,8 @@ export class Config {
     this.outboundCorrelationSettings = {
       propagateTraceContext:
         params.outboundCorrelation?.propagateTraceContext ?? false,
+      allowDynamicHeaderValues:
+        params.outboundCorrelation?.allowDynamicHeaderValues ?? false,
     };
     this.gitCoAuthor = {
       ...normalizeGitCoAuthor(params.gitCoAuthor),
@@ -7508,6 +7526,15 @@ export class Config {
    */
   getOutboundCorrelationPropagateTraceContext(): boolean {
     return this.outboundCorrelationSettings.propagateTraceContext ?? false;
+  }
+
+  /**
+   * Whether `customHeaders` values may carry runtime placeholders. See
+   * {@link OutboundCorrelationSettings.allowDynamicHeaderValues}; consumed by
+   * `core/outbound-dynamic-headers.ts`.
+   */
+  getOutboundAllowDynamicHeaderValues(): boolean {
+    return this.outboundCorrelationSettings.allowDynamicHeaderValues ?? false;
   }
 
   getTelemetryOutfile(): string | undefined {
