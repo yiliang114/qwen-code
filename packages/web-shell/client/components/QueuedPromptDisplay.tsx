@@ -252,12 +252,9 @@ export function QueuedPromptDisplay({
           isRemoving ||
           isInserting;
         const isEditDisabled = isBusy || isSummaryOnly;
-        const isDeleteDisabled =
-          isRunning ||
-          isMidTurnLocked ||
-          prompt.isEditing === true ||
-          isRemoving ||
-          isInserting;
+        // Delete is the one busy lock a pending admission does not apply: the
+        // user must still be able to cancel the submission they just made.
+        const isDeleteDisabled = isBusy && !isSubmitting;
         let editTitle = t('queue.editTip');
         if (isEditDisabled) {
           editTitle = isSummaryOnly

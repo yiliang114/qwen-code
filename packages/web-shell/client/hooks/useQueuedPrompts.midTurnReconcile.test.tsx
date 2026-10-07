@@ -14398,6 +14398,73 @@ describe('useQueuedPrompts mid-turn reconciliation (session_mid_turn_message_que
     }
   });
 
+  it('cancels a returned-unbound submission the user deletes after its confirmation failed', async () => {
+    sdkMock.actions.enqueueMidTurnMessage.mockImplementationOnce(
+      (_message: string, opts?: { onAdmissionStarted?: () => void }) => {
+        opts?.onAdmissionStarted?.();
+        return Promise.resolve({ accepted: false, reason: 'session_idle' });
+      },
+    );
+    sdkMock.actions.submitPrompt.mockResolvedValueOnce({
+      promptId: 'prompt-1',
+    });
+    sdkMock.actions.removePendingPrompt.mockClear();
+    const harness = createHarness();
+    try {
+      await harness.render({
+        streamingState: 'responding',
+        sessionHasActivePrompt: true,
+      });
+      // The admission lands but the confirmation snapshot fails: the body
+      // returns with the row still unbound, holding the only record of the
+      // daemon id the row was admitted under.
+      await act(async () => {
+        sdkMock.actions.getPendingPrompts.mockRejectedValueOnce(
+          new Error('pending snapshot unavailable'),
+        );
+        harness.result().enqueuePrompt('doomed message');
+        for (let i = 0; i < 8; i++) await Promise.resolve();
+      });
+      const [doomed] = harness.result().queuedPrompts;
+      expect(doomed).toEqual(
+        expect.objectContaining({
+          text: 'doomed message',
+          serverState: 'submitting',
+        }),
+      );
+      // The daemon still lists the prompt queued, and nothing but the delete
+      // itself asks for that snapshot. The row has no serverPromptId, so the
+      // single-row delete alone would drop it locally and leave the daemon
+      // holding a message nobody will ever cancel.
+      sdkMock.actions.getPendingPrompts.mockResolvedValue({
+        pendingPrompts: [
+          {
+            promptId: 'prompt-1',
+            text: 'doomed message',
+            queuedAt: Date.now(),
+            state: 'queued' as const,
+            originatorClientId: CLIENT_ID,
+          },
+        ],
+      });
+      act(() => {
+        harness.result().removeQueuedPrompt(doomed!.id);
+      });
+      expect(harness.result().queuedPrompts).toEqual([]);
+      await act(async () => {
+        for (let i = 0; i < 8; i++) await Promise.resolve();
+      });
+      expect(sdkMock.actions.removePendingPrompt).toHaveBeenCalledWith(
+        'prompt-1',
+        { sessionId: 'session-a' },
+      );
+      // The snapshot the handoff asked for must not resurrect the deleted row.
+      expect(harness.result().queuedPrompts).toEqual([]);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
   it('echoes a cleared returned-unbound fallback whose settle a files submission shadows', async () => {
     sdkMock.actions.enqueueMidTurnMessage.mockImplementation(
       (_message: string, opts?: { onAdmissionStarted?: () => void }) => {

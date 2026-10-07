@@ -4000,6 +4000,10 @@ export function useQueuedPrompts({
       if (target.isInserting || target.isRemoving || target.isEditing) return;
       if (target.midTurnState === 'submitting') return;
       if (target.serverState === 'submitting') {
+        // The handoff protocol `clearQueuedPrompts` documents in full. Two
+        // invariants carry here: the anchor is read before the refresh below
+        // bumps `refreshRequestSeqRef`, or the consumer overrules the entry;
+        // and the returned-unbound record survives for the settle-time echo.
         let handedOffRemoval = false;
         for (const [promptId, rowId] of returnedUnboundPromptIdsRef.current) {
           if (rowId === id) {
