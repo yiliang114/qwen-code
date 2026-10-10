@@ -257,7 +257,7 @@ function fitText(
   if (text.length <= maxChars) return text;
   if (maxChars <= 0) return '';
 
-  const header =
+  const pointer =
     persistedOutputFiles && persistedOutputFiles.length > 0
       ? persistedOutputFiles.length === 1
         ? `Tool output truncated. Persisted tool-output artifact: ${persistedOutputFiles[0]}`
@@ -265,6 +265,10 @@ function fitText(
             .map((file) => `- ${file}`)
             .join('\n')}`
       : TOOL_OUTPUT_TRUNCATED_NOTICE;
+  // A pointer too long to deliver in full is dropped rather than sent as a
+  // partial path, so the preview is budgeted against the notice that is sent.
+  const header =
+    pointer.length <= maxChars ? pointer : TOOL_OUTPUT_TRUNCATED_NOTICE;
   if (header.length > maxChars) {
     return sliceStartWithoutBrokenSurrogate(
       TOOL_OUTPUT_TRUNCATED_NOTICE,

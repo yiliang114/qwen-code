@@ -808,11 +808,59 @@ describe('tool response finalization', () => {
       false,
     );
 
-    expect(
-      result[0].responseParts[0].functionResponse?.response?.['output'],
-    ).toBe('Tool output truncated.');
+    const output = result[0].responseParts[0].functionResponse?.response?.[
+      'output'
+    ] as string;
+    expect(output.startsWith('Tool output truncated.')).toBe(true);
+    expect(output).not.toContain('Persisted');
+    expect(output).not.toContain(artifact);
+    expect(output.length).toBeLessThanOrEqual(220);
     expect(result[0].persistedOutputFiles).toEqual([artifact]);
     expect(persist).not.toHaveBeenCalled();
+  });
+
+  it('keeps a real preview when the persisted pointer cannot fit the allocation', async () => {
+    const artifact = `/home/runner/.qwen/tmp/${'a'.repeat(64)}/tool-results/send-boundary-${'b'.repeat(36)}.txt`;
+    persist.mockImplementation(async (_callId, _toolName, content) => ({
+      content,
+      outputFile: artifact,
+      bytesWritten: Buffer.byteLength(content),
+    }));
+
+    const result = await finalizeToolResponses(
+      config(200_000),
+      [
+        entry('send', [
+          fnResponse(
+            'shell',
+            {
+              output: `HEAD${'x'.repeat(20_000)}TAIL`,
+              error: `${'e'.repeat(2_000)}FAILED_TOOL_EXIT_1`,
+            },
+            'send',
+          ),
+        ]),
+      ],
+      undefined,
+      false,
+      false,
+      200,
+      false,
+    );
+
+    expect(persist).toHaveBeenCalledOnce();
+    const response = result[0].responseParts[0].functionResponse?.response;
+    const output = response?.['output'] as string;
+    const error = response?.['error'] as string;
+    for (const slot of [output, error]) {
+      expect(slot.length).toBeGreaterThan('Tool output truncated.'.length);
+      expect(slot.length).toBeLessThanOrEqual(100);
+      expect(slot).not.toContain(artifact);
+    }
+    expect(output).toContain('HEAD');
+    expect(output).toContain('TAIL');
+    expect(error).toContain('FAILED_TOOL_EXIT_1');
+    expect(result[0].persistedOutputFiles).toEqual([artifact]);
   });
 
   it('the send guard preserves an enter_plan_mode lifecycle response', () => {
