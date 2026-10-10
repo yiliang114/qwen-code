@@ -12,6 +12,18 @@ import {
   ToolNames,
 } from '../tools/tool-names.js';
 
+// Read-only discovery tools registered outside the Read/Search/Fetch kinds.
+// `lsp` and `tool_search` are `Kind.Other` — retyping them would also enrol
+// them in CONCURRENCY_SAFE_KINDS, a scheduler behaviour change this feature
+// must not make — yet both are first-party read-only discovery surfaces the
+// model is explicitly steered toward (LSP's own description says to prefer it
+// over grep/glob), and classifying them as phase resets makes the reminder
+// structurally unreachable for `lsp → read_file → lsp` investigations.
+const READ_ONLY_DISCOVERY_TOOLS = new Set<string>([
+  ToolNames.LSP,
+  ToolNames.TOOL_SEARCH,
+]);
+
 export const TOOL_EXPLORATION_REMINDER =
   'System: this read-only exploration phase has reached the configured tool-call allowance. Review the information already gathered before continuing discovery. For an implementation request, proceed to the requested deliverable or explain the concrete blocker. For a read-only investigation, summarize the findings and identify any remaining question. Continue tools only to resolve a specific remaining gap or perform necessary verification. This reminder does not authorize writes or bypass plan approval or tool permissions.';
 
@@ -31,6 +43,7 @@ export function getToolExplorationKind(
     registry.getAllToolNames(),
   );
   if (Array.isArray(resolved)) return undefined;
+  if (READ_ONLY_DISCOVERY_TOOLS.has(resolved ?? canonical)) return Kind.Read;
   return registry.getTool(resolved ?? canonical)?.kind;
 }
 

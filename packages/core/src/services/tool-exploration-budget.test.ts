@@ -24,7 +24,7 @@ describe('ToolExplorationBudget', () => {
     expect(budget.takeReminder(100)).toBeUndefined();
   });
 
-  it('resets a phase on implementation, planning or unknown tools and new user turns', () => {
+  it('resets a phase on implementation, planning or unknown tools', () => {
     const budget = new ToolExplorationBudget();
     for (const kind of [Kind.Edit, Kind.Think, undefined]) {
       budget.record(Kind.Read);
@@ -35,6 +35,25 @@ describe('ToolExplorationBudget', () => {
       expect(budget.takeReminder(2)).toBe(TOOL_EXPLORATION_REMINDER);
       budget.reset();
     }
+  });
+
+  it('commits the zeroed floor on reset so a later rollback cannot resurrect a prior turn', () => {
+    const budget = new ToolExplorationBudget();
+    // Turn 1 reads past the allowance and commits its count.
+    budget.record(Kind.Read);
+    budget.record(Kind.Read);
+    budget.commit();
+    // Turn 2 resets (zeroing state AND committing the zero floor), streams
+    // one read, then the attempt fails with a retry: the rollback must land
+    // on turn 2's own floor of 0, not turn 1's committed count of 2.
+    budget.reset();
+    budget.record(Kind.Read);
+    budget.rollback();
+    expect(budget.takeReminder(2)).toBeUndefined();
+    // A fresh phase accumulates normally after the reset.
+    budget.record(Kind.Read);
+    budget.record(Kind.Read);
+    expect(budget.takeReminder(2)).toBe(TOOL_EXPLORATION_REMINDER);
   });
 
   it('rolls back a replayed attempt without repeating an already sent reminder', () => {
@@ -57,6 +76,44 @@ describe('ToolExplorationBudget', () => {
     budget.record(Kind.Read);
     expect(budget.takeReminder(Infinity)).toBeUndefined();
     expect(budget.takeReminder(0)).toBeUndefined();
+  });
+
+  it('counts read-only discovery tools registered outside the read kinds', () => {
+    // `lsp` and `tool_search` are registered Kind.Other, but interleaving
+    // them into a read-only investigation must not wipe the phase: LSP's
+    // own description steers the model into exactly that alternation.
+    const registry = {
+      getAllToolNames: () => [
+        'read_file',
+        'lsp',
+        'tool_search',
+        'tool_call',
+      ],
+      getTool: (name: string) =>
+        name === 'read_file'
+          ? { kind: Kind.Read }
+          : name === 'tool_call'
+            ? { kind: Kind.Other }
+            : undefined,
+    } as unknown as ToolRegistry;
+    expect(getToolExplorationKind(registry, 'lsp', {})).toBe(Kind.Read);
+    expect(getToolExplorationKind(registry, 'tool_search', {})).toBe(
+      Kind.Read,
+    );
+    // A bridged read-only MCP target still classifies as read (covered for
+    // the registry path below); the bridge tool itself still ends a phase.
+    expect(
+      getToolExplorationKind(registry, 'tool_call', {
+        name: 'lsp',
+        arguments: {},
+      }),
+    ).toBe(Kind.Read);
+    // The phase survives the interleaving.
+    const budget = new ToolExplorationBudget();
+    budget.record(getToolExplorationKind(registry, 'read_file', {}));
+    budget.record(getToolExplorationKind(registry, 'lsp', {}));
+    budget.record(getToolExplorationKind(registry, 'read_file', {}));
+    expect(budget.takeReminder(2)).toBe(TOOL_EXPLORATION_REMINDER);
   });
 
   it('leaves ambiguous case-insensitive registrations unclassified', () => {

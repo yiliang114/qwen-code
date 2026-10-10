@@ -91,7 +91,10 @@ import {
 } from './turn.js';
 
 // Services
-import { LoopDetectionService } from '../services/loopDetectionService.js';
+import {
+  isAttemptRestartEvent,
+  LoopDetectionService,
+} from '../services/loopDetectionService.js';
 import { CommitAttributionService } from '../services/commitAttribution.js';
 import type { UserPromptRecordPayload } from '../services/chatRecordingService.js';
 
@@ -3810,11 +3813,13 @@ export class LlmClient {
         : undefined;
     if (startsInteraction) {
       this.loopDetector.reset(prompt_id);
-      this.toolExplorationBudget.reset();
       this.lastPromptId = prompt_id;
       // A side question asked while a turn is running is not a new turn: it
-      // must not move the running turn's starting point or drop its target.
+      // must not move the running turn's starting point or drop its target —
+      // nor wipe the running turn's accumulated exploration phase, or a
+      // long read-only investigation would silently lose its reminder.
       if (!options?.isConcurrentSideQuery) {
+        this.toolExplorationBudget.reset();
         this.beginTurnBudget(messageType, request, prompt_id);
       }
       // New input starts this interaction, so its first Stop is not
@@ -4974,11 +4979,15 @@ export class LlmClient {
           // shell inspection stagnation, and per-turn tool-call cap). These fire
           // before the skipLoopDetection gate so they cannot be bypassed by
           // configuration.
-          // The budget records before those checks run: a halted batch's
-          // over-count is harmless only because every core halt is terminal
-          // (the halt branch below returns the turn, and the next interaction
-          // resets the budget). Keep any future non-terminal core halt from
-          // silently counting calls that never executed.
+          const alwaysOnLoop =
+            !duplicateLoopGuardRequest &&
+            this.loopDetector.checkAlwaysOnSafeties(event);
+          // Exploration-budget lifecycle, recorded before the halt handling
+          // below takes effect: a halted batch's over-count is harmless only
+          // because every core halt is terminal (the halt branch returns the
+          // turn, and the next interaction resets the budget). Keep any
+          // future non-terminal core halt from silently counting calls that
+          // never executed.
           if (
             event.type === LlmEventType.ToolCallRequest &&
             !duplicateLoopGuardRequest
@@ -4992,18 +5001,15 @@ export class LlmClient {
             );
           } else if (event.type === LlmEventType.Finished) {
             this.toolExplorationBudget.commit();
-          } else if (
-            event.type === LlmEventType.Retry ||
-            event.type === LlmEventType.ModelFallback
-          ) {
-            // A model fallback restarts the attempt from scratch exactly
-            // like a retry (Turn clears pendingToolCalls for both), so the
-            // failed attempt's reads must not stay counted.
+          } else if (isAttemptRestartEvent(event)) {
+            // A retry re-streams the failed attempt's calls, so its reads
+            // must not stay counted. A fallback attempt cannot have
+            // streamed calls (the chain only runs when the failed attempt
+            // yielded no candidate output), so its rollback is a no-op kept
+            // for symmetry — and harmless, because a rollback never goes
+            // below the committed floor.
             this.toolExplorationBudget.rollback();
           }
-          const alwaysOnLoop =
-            !duplicateLoopGuardRequest &&
-            this.loopDetector.checkAlwaysOnSafeties(event);
           if (alwaysOnLoop) {
             // Drop every tool call collected before the guard fired so the run
             // halts here instead of spawning a continuation that re-trips it.

@@ -199,6 +199,23 @@ export const DEFAULT_MAX_TOOL_CALLS_PER_TURN = 100;
 const ADAPTIVE_CAP_HARD_MULTIPLIER = 10;
 
 /**
+ * Whether a stream event restarts the current attempt from scratch (the
+ * failed attempt's partial output is discarded and re-streamed), so any
+ * attempt-scoped observations recorded after the last committed round-trip
+ * must be rolled back. Shared by every per-attempt counter — the loop
+ * detector's guards and the exploration budget — so a new restart-style
+ * event lands in all of them or none.
+ */
+export function isAttemptRestartEvent(
+  event: ServerLlmStreamEvent,
+): boolean {
+  return (
+    event.type === LlmEventType.Retry ||
+    event.type === LlmEventType.ModelFallback
+  );
+}
+
+/**
  * Halt predicate of the per-turn tool-call cap, shared with the daemon's
  * turn-loop guard (ACP Session's recordDaemonToolCalls) so both runtimes
  * decide identically and cannot drift. `cap` is the resolved effective cap
@@ -753,6 +770,19 @@ export class LoopDetectionService {
       return false;
     }
 
+    // The fallback chain only runs when the failed attempt yielded no
+    // candidate output (llm-chat gates it on !streamYieldedAnyChunk, and a
+    // streamed functionCall counts as candidate output), so a fallback
+    // attempt counted no tool call: there is nothing to roll back, and the
+    // streak/repeat evidence accumulated by earlier committed round-trips
+    // must survive the switch — the chain is per-request, so a
+    // capacity-limited primary can prefix every round-trip of one turn with
+    // ModelFallback, and clearing the evidence here would silence these
+    // guards for the rest of the turn.
+    if (event.type === LlmEventType.ModelFallback) {
+      return false;
+    }
+
     // A retry re-streams the failed attempt's tool calls, which would
     // double-count against both always-on guards. Roll the per-turn cap back
     // to the last committed round-trip (never below it — prior round-trips
@@ -760,14 +790,8 @@ export class LoopDetectionService {
     // cannot push it over the threshold. The adaptive cap's repeat tracker is
     // cleared (consistent with how the heuristic path clears
     // globalToolCallCounts on retry): the replayed calls re-populate it, and a
-    // stuck pattern simply re-accumulates toward the threshold. A model
-    // fallback restarts the attempt from scratch exactly like a retry (Turn
-    // clears pendingToolCalls for both), so the discarded attempt's calls
-    // must not stay counted here either.
-    if (
-      event.type === LlmEventType.Retry ||
-      event.type === LlmEventType.ModelFallback
-    ) {
+    // stuck pattern simply re-accumulates toward the threshold.
+    if (event.type === LlmEventType.Retry) {
       this.turnToolCallTotal = this.turnToolCallTotalCommitted;
       this.resetToolCallCount();
       this.capKeyCounts.clear();

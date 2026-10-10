@@ -8507,75 +8507,138 @@ Other open files:
       expect(explorationReminders(request)).toHaveLength(0);
     });
 
-    it.each(['retry', 'model_fallback'] as const)(
-      'rolls the exploration budget back on %s so a discarded attempt is not double-counted',
-      async (eventType) => {
-        const promptId = `prompt-exploration-${eventType}`;
-        // Allowance 4 with a committed floor of 1: the first round-trip's
-        // read commits; the failed attempt adds 2 more but the
-        // retry/fallback rolls back to the floor, and the restart's two
-        // reads land at 3 — below the allowance. Without the rollback the
-        // count would be 5 and the reminder would fire on a turn that only
-        // executed 3 reads; without the commit the floor would be 0 and the
-        // restart would land at 2.
-        vi.mocked(mockConfig.getMaxToolCallsPerTurn).mockReturnValue(4);
-        const reg = registryMock();
-        reg.getAllToolNames.mockReturnValue(['read_file']);
-        reg.getTool.mockImplementation((name: string) =>
-          name === 'read_file' ? ({ kind: Kind.Read } as never) : null,
-        );
-        const replayedAttempt = turnStream(
+    it('rolls the exploration budget back on a retry so a discarded attempt is not double-counted', async () => {
+      const promptId = 'prompt-exploration-retry';
+      // Allowance 4 with a committed floor of 1: the first round-trip's
+      // read commits; the failed attempt adds 2 more but the retry rolls
+      // back to the floor, and the restart's two reads land at 3 — below
+      // the allowance. Without the rollback the count would be 5 and the
+      // reminder would fire on a turn that only executed 3 reads; without
+      // the commit the floor would be 0 and the restart would land at 2.
+      vi.mocked(mockConfig.getMaxToolCallsPerTurn).mockReturnValue(4);
+      const reg = registryMock();
+      reg.getAllToolNames.mockReturnValue(['read_file']);
+      reg.getTool.mockImplementation((name: string) =>
+        name === 'read_file' ? ({ kind: Kind.Read } as never) : null,
+      );
+      // A retry is reachable mid-stream after counted calls: the provider
+      // can stream tool calls and still fail with a retryable error.
+      const replayedAttempt = turnStream(
+        toolCallRequest('call-a-0', 'read_file', { path: 'a0' }),
+        stopped(),
+        toolCallRequest('call-f-0', 'read_file', { path: 'f0' }),
+        toolCallRequest('call-f-1', 'read_file', { path: 'f1' }),
+        { type: LlmEventType.Retry, isContinuation: false },
+        toolCallRequest('call-b-0', 'read_file', { path: 'b0' }),
+        toolCallRequest('call-b-1', 'read_file', { path: 'b1' }),
+        stopped(),
+      );
+
+      installChat();
+      mockTurnRunFn.mockReturnValueOnce(replayedAttempt);
+      const firstEvents = await run([{ text: 'explore' }], promptId);
+
+      mockTurnRunFn.mockReturnValueOnce(
+        turnStream(
+          toolCallRequest('call-c-0', 'read_file', { path: 'c0' }),
+          stopped(),
+        ),
+      );
+      await run([fnResponse('read_file', { ok: true })], promptId, {
+        type: SendMessageType.ToolResult,
+      });
+
+      const request = mockTurnRunFn.mock.lastCall?.[1] as unknown[];
+      const reminders = explorationReminders(request);
+      // Rolled back to the committed floor of 1, the restart's two reads
+      // land at 3 — below the allowance of 4, so no reminder.
+      expect(reminders).toHaveLength(0);
+      // The surviving count is exactly the committed floor, the restart's
+      // reads, and this continuation's own read: dropping the rollback
+      // leaves the discarded attempt counted (6), dropping the commit
+      // loses the floor (3).
+      expect(client['toolExplorationBudget']['calls']).toBe(4);
+      // The retried attempt ran to completion without tripping the
+      // per-turn cap: the discarded attempt's calls were rolled back.
+      expect(
+        firstEvents.filter(
+          (event) => event.type === LlmEventType.LoopDetected,
+        ),
+      ).toHaveLength(0);
+    });
+
+    it('keeps the committed exploration floor across a per-request model fallback', async () => {
+      const promptId = 'prompt-exploration-fallback';
+      // Production can only emit ModelFallback before its own attempt's
+      // calls: the fallback chain is gated on the failed attempt having
+      // yielded no candidate output, and a streamed functionCall counts as
+      // candidate output (llm-chat). So the reachable shape spans two
+      // round-trips: the first commits its reads, the second opens with
+      // the fallback event and then streams its own reads on top of the
+      // surviving floor.
+      vi.mocked(mockConfig.getMaxToolCallsPerTurn).mockReturnValue(4);
+      const reg = registryMock();
+      reg.getAllToolNames.mockReturnValue(['read_file']);
+      reg.getTool.mockImplementation((name: string) =>
+        name === 'read_file' ? ({ kind: Kind.Read } as never) : null,
+      );
+
+      installChat();
+      // Round-trip 1: one read commits the floor of 1.
+      mockTurnRunFn.mockReturnValueOnce(
+        turnStream(
           toolCallRequest('call-a-0', 'read_file', { path: 'a0' }),
           stopped(),
-          toolCallRequest('call-f-0', 'read_file', { path: 'f0' }),
-          toolCallRequest('call-f-1', 'read_file', { path: 'f1' }),
-          eventType === 'retry'
-            ? { type: LlmEventType.Retry, isContinuation: false }
-            : {
-                type: LlmEventType.ModelFallback,
-                fromModel: 'test-model',
-                toModel: 'fallback-model',
-                fallbackIndex: 1,
-              },
+        ),
+      );
+      const firstEvents = await run([{ text: 'explore' }], promptId);
+
+      // Round-trip 2 (the ToolResult continuation): the fallback event
+      // arrives before this attempt's own reads, which then count on top
+      // of the surviving floor.
+      mockTurnRunFn.mockReturnValueOnce(
+        turnStream(
+          {
+            type: LlmEventType.ModelFallback,
+            fromModel: 'test-model',
+            toModel: 'fallback-model',
+            fallbackIndex: 1,
+          },
           toolCallRequest('call-b-0', 'read_file', { path: 'b0' }),
           toolCallRequest('call-b-1', 'read_file', { path: 'b1' }),
+          toolCallRequest('call-b-2', 'read_file', { path: 'b2' }),
           stopped(),
-        );
+        ),
+      );
+      await run([fnResponse('read_file', { ok: true })], promptId, {
+        type: SendMessageType.ToolResult,
+      });
 
-        installChat();
-        mockTurnRunFn.mockReturnValueOnce(replayedAttempt);
-        const firstEvents = await run([{ text: 'explore' }], promptId);
+      // Round-trip 3: the reminder rides this request — the surviving
+      // count (floor 1 + round-trip 2's three reads) reached the allowance.
+      mockTurnRunFn.mockReturnValueOnce(
+        turnStream(
+          toolCallRequest('call-c-0', 'read_file', { path: 'c0' }),
+          stopped(),
+        ),
+      );
+      await run([fnResponse('read_file', { ok: true })], promptId, {
+        type: SendMessageType.ToolResult,
+      });
 
-        mockTurnRunFn.mockReturnValueOnce(
-          turnStream(
-            toolCallRequest('call-c-0', 'read_file', { path: 'c0' }),
-            stopped(),
-          ),
-        );
-        await run([fnResponse('read_file', { ok: true })], promptId, {
-          type: SendMessageType.ToolResult,
-        });
-
-        const request = mockTurnRunFn.mock.lastCall?.[1] as unknown[];
-        const reminders = explorationReminders(request);
-        // Rolled back to the committed floor of 1, the restart's two reads
-        // land at 3 — below the allowance of 4, so no reminder.
-        expect(reminders).toHaveLength(0);
-        // The surviving count is exactly the committed floor, the restart's
-        // reads, and this continuation's own read: dropping the rollback
-        // leaves the discarded attempt counted (6), dropping the commit
-        // loses the floor (3).
-        expect(client['toolExplorationBudget']['calls']).toBe(4);
-        // The fallback attempt ran to completion: without the per-turn cap
-        // rollback beside it, the discarded attempt's calls would have
-        // tripped TURN_TOOL_CALL_CAP on the fallback's own reads.
-        expect(
-          firstEvents.filter(
-            (event) => event.type === LlmEventType.LoopDetected,
-          ),
-        ).toHaveLength(0);
-      },
-    );
+      const request = mockTurnRunFn.mock.lastCall?.[1] as unknown[];
+      expect(explorationReminders(request)).toHaveLength(1);
+      // Floor 1 + three fallback-attempt reads = 4 at the reminder, then
+      // this continuation's own read lands on top.
+      expect(client['toolExplorationBudget']['calls']).toBe(5);
+      // The fallback round-trip ran to completion: its committed evidence
+      // was not cleared, and the per-turn cap did not halt it.
+      expect(
+        firstEvents.filter(
+          (event) => event.type === LlmEventType.LoopDetected,
+        ),
+      ).toHaveLength(0);
+    });
 
     it('counts a provider-duplicate call id once toward the exploration budget', async () => {
       const promptId = 'prompt-exploration-duplicate';
@@ -8610,6 +8673,102 @@ Other open files:
       // 1 distinct call < allowance 2: no reminder yet.
       const request = mockTurnRunFn.mock.lastCall?.[1] as unknown[];
       expect(explorationReminders(request)).toHaveLength(0);
+    });
+
+    it('counts a bridged read-only MCP tool toward the exploration budget', async () => {
+      const promptId = 'prompt-exploration-bridged';
+      vi.mocked(mockConfig.getMaxToolCallsPerTurn).mockReturnValue(2);
+      // The bridge tool itself is Kind.Other; the deferred MCP target is
+      // Kind.Read. A bridged call arrives as `tool_call` with the target in
+      // `args.name` and must classify through the target, not the bridge.
+      const reg = registryMock();
+      reg.getAllToolNames.mockReturnValue([
+        'tool_call',
+        'mcp__srv__describe',
+      ]);
+      reg.getTool.mockImplementation((name: string) =>
+        name === 'tool_call'
+          ? ({ kind: Kind.Other } as never)
+          : name === 'mcp__srv__describe'
+            ? ({ kind: Kind.Read } as never)
+            : null,
+      );
+
+      installChat();
+      mockTurnRunFn.mockReturnValueOnce(
+        turnStream(
+          toolCallRequest('call-br-0', 'tool_call', {
+            name: 'mcp__srv__describe',
+            arguments: { dataset: 0 },
+          }),
+          toolCallRequest('call-br-1', 'tool_call', {
+            name: 'mcp__srv__describe',
+            arguments: { dataset: 1 },
+          }),
+          stopped(),
+        ),
+      );
+      await run([{ text: 'inspect the datasets' }], promptId);
+
+      mockTurnRunFn.mockReturnValueOnce(
+        turnStream(
+          toolCallRequest('call-br-2', 'tool_call', {
+            name: 'mcp__srv__describe',
+            arguments: { dataset: 2 },
+          }),
+          stopped(),
+        ),
+      );
+      await run([fnResponse('tool_call', { ok: true })], promptId, {
+        type: SendMessageType.ToolResult,
+      });
+
+      const request = mockTurnRunFn.mock.lastCall?.[1] as unknown[];
+      expect(explorationReminders(request)).toHaveLength(1);
+    });
+
+    it('does not reset the running exploration phase for a concurrent side query', async () => {
+      const promptId = 'prompt-exploration-side-query';
+      vi.mocked(mockConfig.getMaxToolCallsPerTurn).mockReturnValue(2);
+      const reg = registryMock();
+      reg.getAllToolNames.mockReturnValue(['read_file']);
+      reg.getTool.mockImplementation((name: string) =>
+        name === 'read_file' ? ({ kind: Kind.Read } as never) : null,
+      );
+
+      installChat();
+      // The running turn reaches the allowance of 2.
+      mockTurnRunFn.mockReturnValueOnce(
+        turnStream(
+          toolCallRequest('call-s-0', 'read_file', { path: 'a' }),
+          toolCallRequest('call-s-1', 'read_file', { path: 'b' }),
+          stopped(),
+        ),
+      );
+      await run([{ text: 'explore' }], promptId);
+
+      // A /btw side question arrives while the turn is running: it must not
+      // zero the accumulated phase.
+      mockTurnRunFn.mockReturnValueOnce(textTurn('side answer'));
+      await run([{ text: '/btw unrelated question' }], promptId, {
+        type: SendMessageType.UserQuery,
+        isConcurrentSideQuery: true,
+      });
+      expect(client['toolExplorationBudget']['calls']).toBe(2);
+
+      // The exploration's own continuation still carries the reminder: the
+      // side query did not consume or suppress it.
+      mockTurnRunFn.mockReturnValueOnce(
+        turnStream(
+          toolCallRequest('call-s-2', 'read_file', { path: 'c' }),
+          stopped(),
+        ),
+      );
+      await run([fnResponse('read_file', { ok: true })], promptId, {
+        type: SendMessageType.ToolResult,
+      });
+      const request = mockTurnRunFn.mock.lastCall?.[1] as unknown[];
+      expect(explorationReminders(request)).toHaveLength(1);
     });
 
     it('should PRESERVE the pending prefetch when next-speaker continueTurn returns', async () => {
