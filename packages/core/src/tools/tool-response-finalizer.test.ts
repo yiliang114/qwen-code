@@ -855,6 +855,7 @@ describe('tool response finalization', () => {
     for (const slot of [output, error]) {
       expect(slot.length).toBeGreaterThan('Tool output truncated.'.length);
       expect(slot.length).toBeLessThanOrEqual(100);
+      expect(slot).not.toContain('Persisted');
       expect(slot).not.toContain(artifact);
     }
     expect(output).toContain('HEAD');
