@@ -206,9 +206,7 @@ const ADAPTIVE_CAP_HARD_MULTIPLIER = 10;
  * detector's guards and the exploration budget — so a new restart-style
  * event lands in all of them or none.
  */
-export function isAttemptRestartEvent(
-  event: ServerLlmStreamEvent,
-): boolean {
+export function isAttemptRestartEvent(event: ServerLlmStreamEvent): boolean {
   return (
     event.type === LlmEventType.Retry ||
     event.type === LlmEventType.ModelFallback

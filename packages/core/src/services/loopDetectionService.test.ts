@@ -1130,9 +1130,7 @@ describe('LoopDetectionService', () => {
           description: 'Inspect repository changes',
         }),
       ).toBe(true);
-      expect(service.getLastLoopType()).toBe(
-        LoopType.SHELL_COMMAND_STAGNATION,
-      );
+      expect(service.getLastLoopType()).toBe(LoopType.SHELL_COMMAND_STAGNATION);
     });
 
     it('keeps capMaxKeyRepeat accumulating across per-round-trip ModelFallback', () => {

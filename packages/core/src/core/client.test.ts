@@ -8561,9 +8561,7 @@ Other open files:
       // The retried attempt ran to completion without tripping the
       // per-turn cap: the discarded attempt's calls were rolled back.
       expect(
-        firstEvents.filter(
-          (event) => event.type === LlmEventType.LoopDetected,
-        ),
+        firstEvents.filter((event) => event.type === LlmEventType.LoopDetected),
       ).toHaveLength(0);
     });
 
@@ -8634,9 +8632,7 @@ Other open files:
       // The fallback round-trip ran to completion: its committed evidence
       // was not cleared, and the per-turn cap did not halt it.
       expect(
-        firstEvents.filter(
-          (event) => event.type === LlmEventType.LoopDetected,
-        ),
+        firstEvents.filter((event) => event.type === LlmEventType.LoopDetected),
       ).toHaveLength(0);
     });
 
@@ -8682,10 +8678,7 @@ Other open files:
       // Kind.Read. A bridged call arrives as `tool_call` with the target in
       // `args.name` and must classify through the target, not the bridge.
       const reg = registryMock();
-      reg.getAllToolNames.mockReturnValue([
-        'tool_call',
-        'mcp__srv__describe',
-      ]);
+      reg.getAllToolNames.mockReturnValue(['tool_call', 'mcp__srv__describe']);
       reg.getTool.mockImplementation((name: string) =>
         name === 'tool_call'
           ? ({ kind: Kind.Other } as never)

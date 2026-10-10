@@ -83,12 +83,7 @@ describe('ToolExplorationBudget', () => {
     // them into a read-only investigation must not wipe the phase: LSP's
     // own description steers the model into exactly that alternation.
     const registry = {
-      getAllToolNames: () => [
-        'read_file',
-        'lsp',
-        'tool_search',
-        'tool_call',
-      ],
+      getAllToolNames: () => ['read_file', 'lsp', 'tool_search', 'tool_call'],
       getTool: (name: string) =>
         name === 'read_file'
           ? { kind: Kind.Read }
@@ -97,9 +92,7 @@ describe('ToolExplorationBudget', () => {
             : undefined,
     } as unknown as ToolRegistry;
     expect(getToolExplorationKind(registry, 'lsp', {})).toBe(Kind.Read);
-    expect(getToolExplorationKind(registry, 'tool_search', {})).toBe(
-      Kind.Read,
-    );
+    expect(getToolExplorationKind(registry, 'tool_search', {})).toBe(Kind.Read);
     // A bridged read-only MCP target still classifies as read (covered for
     // the registry path below); the bridge tool itself still ends a phase.
     expect(
