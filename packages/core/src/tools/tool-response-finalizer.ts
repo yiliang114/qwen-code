@@ -451,7 +451,10 @@ export async function finalizeToolResponses(
     slots.some(
       (slot, index) =>
         slot.text.length > allocations[index] &&
-        allocations[index] < TOOL_OUTPUT_TRUNCATED_NOTICE.length,
+        // `fitText` spends the allocation on the notice and its separator
+        // first, so anything below notice + '\n\n' + one character would
+        // persist an artifact and then send a contentless notice.
+        allocations[index] < TOOL_OUTPUT_TRUNCATED_NOTICE.length + 3,
     )
   ) {
     // Compaction owns headroom too small for a meaningful tool result.

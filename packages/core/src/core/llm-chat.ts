@@ -119,6 +119,7 @@ import {
 import {
   microcompactHistory,
   getFunctionCallIdentity,
+  FILE_PATH_TOOLS,
   type MicrocompactMeta,
 } from '../services/microcompaction/microcompact.js';
 import {
@@ -3243,7 +3244,9 @@ export class LlmChat {
               unresolvedRead = true;
               continue;
             }
-            if (identity.name !== ToolNames.READ_FILE) continue;
+            // Same set the microcompaction blanking site disarms: all three
+            // arm `readResidentInHistory` and take the target as `file_path`.
+            if (!FILE_PATH_TOOLS.has(identity.name)) continue;
             const filePath = identity.args['file_path'];
             if (typeof filePath !== 'string' || !filePath)
               unresolvedRead = true;

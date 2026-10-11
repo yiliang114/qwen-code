@@ -12198,6 +12198,38 @@ describe('LlmChat', async () => {
       expect(clear).not.toHaveBeenCalled();
     });
 
+    it('disarms a cut edit result, not just a cut read', async () => {
+      const stat = { dev: 1, ino: 100 } as Stats;
+      vi.mocked(fsPromises.stat).mockResolvedValue(stat);
+      const markReadEvictedFromHistory = vi.fn().mockReturnValue(true);
+      const markAllReadsEvictedFromHistory = vi.fn();
+      const clear = vi.fn();
+      vi.mocked(mockConfig.getFileReadCache).mockReturnValue({
+        clear,
+        markReadEvictedFromHistory,
+        markAllReadsEvictedFromHistory,
+      } as unknown as ReturnType<Config['getFileReadCache']>);
+      mockStreamsOnce(
+        streamOf(
+          modelChunk(
+            [fnCall('edit', { file_path: 'cut.txt' }, 'edit-cut')],
+            undefined,
+            { promptTokenCount: NEAR_AUTO, totalTokenCount: NEAR_AUTO + 10 },
+          ),
+        ),
+        textStream('done'),
+      );
+      await sendDrain('edit', 'first');
+      await sendDrain(
+        [fnResponse('edit', { output: 'x'.repeat(20_000) }, 'edit-cut')],
+        'second',
+      );
+      expect(resultChars(1)).toBeLessThan(12_000);
+      expect(markReadEvictedFromHistory).toHaveBeenCalledWith(stat);
+      expect(markAllReadsEvictedFromHistory).not.toHaveBeenCalled();
+      expect(clear).not.toHaveBeenCalled();
+    });
+
     it.each([
       ['pressure', 200_000],
       ['aggregate', 1_000],

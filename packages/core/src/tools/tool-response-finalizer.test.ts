@@ -755,18 +755,21 @@ describe('tool response finalization', () => {
     expect((output as string).length).toBeLessThanOrEqual(100);
   });
 
-  it.each([0, 12])(
+  // 44 and 48 are the rows that matter: `allocateTextBudget` splits evenly
+  // across these two slots, so they are the budgets that land a *per-slot
+  // allocation* inside 22..24 — the band where `fitText` can return nothing
+  // but the notice. 0/12/22/24 allocate below the band and were already
+  // vetoed, so they cannot catch a regression in the threshold.
+  it.each([0, 12, 22, 24, 44, 48])(
     'leaves tool diagnostics for compaction at a %s-character send budget',
     async (budget) => {
       const userText = 'Keep this instruction.';
+      const output = `original output ${'x'.repeat(200)}`;
+      const error = `FAILED_TOOL diagnostic ${'e'.repeat(200)}`;
       const entries = [
         entry('send', [
           { text: userText },
-          fnResponse(
-            'shell',
-            { output: 'original output', error: 'FAILED_TOOL diagnostic' },
-            'send',
-          ),
+          fnResponse('shell', { output, error }, 'send'),
         ]),
       ];
 
@@ -784,8 +787,8 @@ describe('tool response finalization', () => {
       expect(persist).not.toHaveBeenCalled();
       expect(result[0].responseParts[0].text).toBe(userText);
       expect(result[0].responseParts[1].functionResponse?.response).toEqual({
-        output: 'original output',
-        error: 'FAILED_TOOL diagnostic',
+        output,
+        error,
       });
     },
   );
