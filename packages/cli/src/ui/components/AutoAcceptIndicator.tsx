@@ -7,8 +7,9 @@
 import type React from 'react';
 import { Text } from 'ink';
 import { theme } from '../semantic-colors.js';
-import { ApprovalMode } from '@qwen-code/qwen-code-core';
+import { ApprovalMode } from '@qwen-code/qwen-code-core/config/approval-mode.js';
 import { t } from '../../i18n/index.js';
+import { getApprovalModeIndicatorColor } from './approvalModeVisuals.js';
 
 interface AutoAcceptIndicatorProps {
   approvalMode: ApprovalMode;
@@ -17,7 +18,7 @@ interface AutoAcceptIndicatorProps {
 export const AutoAcceptIndicator: React.FC<AutoAcceptIndicatorProps> = ({
   approvalMode,
 }) => {
-  let textColor = '';
+  const textColor = getApprovalModeIndicatorColor(approvalMode) ?? '';
   let textContent = '';
   let subText = '';
 
@@ -28,26 +29,25 @@ export const AutoAcceptIndicator: React.FC<AutoAcceptIndicatorProps> = ({
 
   switch (approvalMode) {
     case ApprovalMode.PLAN:
-      textColor = theme.status.success;
       textContent = t('plan mode');
       subText = cycleText;
       break;
     case ApprovalMode.AUTO_EDIT:
-      textColor = theme.status.warning;
       textContent = t('auto-accept edits');
       subText = cycleText;
       break;
     case ApprovalMode.AUTO:
-      textColor = theme.status.warning;
-      textContent = t('auto mode (classifier-evaluated)');
+      textContent = t('Auto mode');
       subText = cycleText;
       break;
     case ApprovalMode.YOLO:
-      textColor = theme.status.error;
       textContent = t('YOLO mode');
       subText = cycleText;
       break;
     case ApprovalMode.DEFAULT:
+      textContent = `⏸ ${t('Ask permissions')}`;
+      subText = cycleText;
+      break;
     default:
       break;
   }

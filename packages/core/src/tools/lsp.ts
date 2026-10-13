@@ -1081,7 +1081,8 @@ export class LspTool extends BaseDeclarativeTool<LspToolParams, ToolResult> {
             description: 'Optional LSP server name to target.',
           },
           limit: {
-            type: 'number',
+            type: 'integer',
+            minimum: 1,
             description: 'Optional maximum number of results to return.',
           },
           diagnostics: {
@@ -1120,6 +1121,11 @@ export class LspTool extends BaseDeclarativeTool<LspToolParams, ToolResult> {
               name: { type: 'string' },
               kind: { type: 'string' },
               rawKind: { type: 'number' },
+              documentRevision: {
+                type: 'string',
+                description:
+                  'Client freshness token. Echo unchanged; if absent or stale for a file URI, prepare call hierarchy again. Non-file items cannot be traversed; prepare at a file location instead.',
+              },
               detail: { type: 'string' },
               uri: { type: 'string' },
               range: { $ref: '#/definitions/LspRange' },
@@ -1148,7 +1154,7 @@ export class LspTool extends BaseDeclarativeTool<LspToolParams, ToolResult> {
       },
       false, // isOutputMarkdown
       false, // canUpdateOutput
-      true, // shouldDefer — loaded on demand via ToolSearch
+      true, // shouldDefer — reached on demand via ToolSearch + ToolCall
       false, // alwaysLoad
       'lsp language server definition references hover symbol diagnostics code actions',
     );
@@ -1212,10 +1218,6 @@ export class LspTool extends BaseDeclarativeTool<LspToolParams, ToolResult> {
     if (params.endCharacter !== undefined && params.endCharacter < 1) {
       return 'endCharacter must be a positive number.';
     }
-    if (params.limit !== undefined && params.limit <= 0) {
-      return 'limit must be a positive number.';
-    }
-
     return null;
   }
 

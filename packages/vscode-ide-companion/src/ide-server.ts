@@ -72,20 +72,31 @@ async function writePortAndWorkspace({
     workspaceFolders && workspaceFolders.length > 0
       ? workspaceFolders.map((folder) => folder.uri.fsPath).join(path.delimiter)
       : '';
+  const persistedWorkspacePath =
+    context.environmentVariableCollection.get(IDE_WORKSPACE_PATH_ENV_VAR)
+      ?.value ?? '';
+  const effectiveWorkspacePath = workspacePath || persistedWorkspacePath;
 
   context.environmentVariableCollection.replace(
     IDE_SERVER_PORT_ENV_VAR,
     port.toString(),
   );
-  context.environmentVariableCollection.replace(
-    IDE_WORKSPACE_PATH_ENV_VAR,
-    workspacePath,
-  );
+  // The collection persists across activations, so on Remote-SSH it can
+  // already hold a path before workspaceFolders resolves. Don't overwrite that
+  // with an empty string; syncEnvVars rewrites it once the folders appear. A
+  // window that never had folders has nothing to preserve, so the empty
+  // sentinel is still written there.
+  if (workspacePath || !persistedWorkspacePath) {
+    context.environmentVariableCollection.replace(
+      IDE_WORKSPACE_PATH_ENV_VAR,
+      workspacePath,
+    );
+  }
 
   const ideInfo = detectIdeFromEnv();
   const content = JSON.stringify({
     port,
-    workspacePath,
+    workspacePath: effectiveWorkspacePath,
     ppid: process.ppid,
     authToken,
     ideName: ideInfo.displayName,
@@ -204,8 +215,6 @@ export class IDEServer {
         next();
       });
 
-      const mcpServer = createMcpServer(this.diffManager);
-
       this.openFilesManager = new OpenFilesManager(context);
       const onDidChangeSubscription = this.openFilesManager.onDidChange(() => {
         this.broadcastIdeContextUpdate();
@@ -247,6 +256,8 @@ export class IDEServer {
             }
           }, 30000); // 30 sec
 
+          const mcpServer = createMcpServer(this.diffManager);
+
           transport.onclose = () => {
             clearInterval(keepAlive);
             if (transport.sessionId) {
@@ -255,7 +266,7 @@ export class IDEServer {
               delete this.transports[transport.sessionId];
             }
           };
-          mcpServer.connect(transport);
+          await mcpServer.connect(transport);
         } else {
           this.log(
             'Bad Request: No valid session ID provided for non-initialize request.',
@@ -437,7 +448,7 @@ const createMcpServer = (diffManager: DiffManager) => {
     'openDiff',
     {
       description:
-        '(IDE Tool) Open a diff view to create or modify a file. Returns a notification once the diff has been accepted or rejcted.',
+        '(IDE Tool) Open a diff view to create or modify a file. Returns a notification once the diff has been accepted or rejected.',
       inputSchema: OpenDiffRequestSchema.shape,
     },
     async ({ filePath, newContent }: z.infer<typeof OpenDiffRequestSchema>) => {

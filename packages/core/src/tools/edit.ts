@@ -6,8 +6,8 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import * as Diff from 'diff';
 import type {
+  FileDiff,
   ToolCallConfirmationDetails,
   ToolEditConfirmationDetails,
   ToolInvocation,
@@ -18,17 +18,23 @@ import type { PermissionDecision } from '../permissions/types.js';
 import { BaseDeclarativeTool, Kind, ToolConfirmationOutcome } from './tools.js';
 import { ToolErrorType } from './tool-error.js';
 import { makeRelative, shortenPath, unescapePath } from '../utils/paths.js';
-import { isNodeError } from '../utils/errors.js';
+import { getErrorMessage, isNodeError } from '../utils/errors.js';
 import type { Config } from '../config/config.js';
 import { ApprovalMode } from '../config/config.js';
-import { isAutoMemPath } from '../memory/paths.js';
+import {
+  captureRuntimeFileVersion,
+  writeRuntimeFile,
+} from '../sandbox/runtime-file.js';
+import type { SandboxFileVersion } from '../sandbox/file-version.js';
+import { isAnyAutoMemPath, isTeamAutoMemPath } from '../memory/paths.js';
+import { checkTeamMemorySecrets } from '../memory/team-memory-secret-guard.js';
 import {
   FileEncoding,
   needsUtf8Bom,
   detectLineEnding,
 } from '../services/fileSystemService.js';
 import type { LineEnding } from '../services/fileSystemService.js';
-import { DEFAULT_DIFF_OPTIONS, getDiffStat } from './diffOptions.js';
+import { createPatchSmart, getDiffStat } from './diffOptions.js';
 import { checkPriorRead, StructuredToolError } from './priorReadEnforcement.js';
 import { ReadFileTool } from './read-file.js';
 import { createDebugLogger } from '../utils/debugLogger.js';
@@ -114,6 +120,7 @@ export interface EditToolParams {
 }
 
 interface CalculatedEdit {
+  sandboxFileVersion?: SandboxFileVersion | null;
   currentContent: string | null;
   newContent: string;
   occurrences: number;
@@ -144,6 +151,10 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
    * @throws File system errors if reading the file fails unexpectedly (e.g., permissions)
    */
   private async calculateEdit(params: EditToolParams): Promise<CalculatedEdit> {
+    const sandboxFileVersion = captureRuntimeFileVersion(
+      this.config,
+      params.file_path,
+    );
     const replaceAll = params.replace_all ?? false;
     let currentContent: string | null = null;
     let fileExists = await isFilefileExists(params.file_path);
@@ -341,9 +352,39 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
       };
     }
 
+    // Scan the full resulting content, not just new_string, so a secret split
+    // across multiple edits (each fragment alone undetectable) is still caught.
+    if (!error) {
+      const teamMemoryError = checkTeamMemorySecrets(
+        params.file_path,
+        newContent,
+        this.config.getProjectRoot(),
+      );
+      if (teamMemoryError) {
+        // If the secret is already in the on-disk file, this edit can't clear it
+        // — tell the user to remove the committed secret, not just retry.
+        const preExisting =
+          currentContent !== null &&
+          checkTeamMemorySecrets(
+            params.file_path,
+            currentContent,
+            this.config.getProjectRoot(),
+          ) !== null;
+        const message = preExisting
+          ? `${teamMemoryError} Note: the secret already exists in the current file content, so removing it from your edit alone is not enough — delete the committed secret from the file.`
+          : teamMemoryError;
+        error = {
+          display: message,
+          raw: message,
+          type: ToolErrorType.INVALID_TOOL_PARAMS,
+        };
+      }
+    }
+
     return {
       currentContent,
       newContent,
+      sandboxFileVersion,
       occurrences,
       error,
       isNewFile,
@@ -354,12 +395,20 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
   }
 
   /**
-   * Edit operations always need user confirmation, except for managed
-   * auto-memory files which are written autonomously by the model.
+   * Edit operations always need user confirmation, except for the private
+   * managed auto-memory files (user/project) which are written autonomously.
+   * Team memory is shared and committed to the repo, so it is NOT auto-allowed
+   * like the private tiers — edits default to 'ask'. (In AUTO_EDIT/YOLO the user
+   * has globally opted into auto-approval; team writes still surface in the git
+   * diff for review before commit.)
    */
   async getDefaultPermission(): Promise<PermissionDecision> {
     const projectRoot = this.config.getProjectRoot();
-    if (isAutoMemPath(path.resolve(this.params.file_path), projectRoot)) {
+    const filePath = path.resolve(this.params.file_path);
+    if (isTeamAutoMemPath(filePath, projectRoot)) {
+      return 'ask';
+    }
+    if (isAnyAutoMemPath(filePath, projectRoot)) {
       return 'allow';
     }
     return 'ask';
@@ -378,7 +427,10 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
       if (abortSignal.aborted) {
         throw error;
       }
-      const errorMsg = error instanceof Error ? error.message : String(error);
+      const errorMsg =
+        isNodeError(error) && error.code === 'EISDIR'
+          ? `Target is a directory, not a file: ${this.params.file_path} (${error.code})`
+          : getErrorMessage(error);
       throw new Error(`Error preparing edit: ${errorMsg}`);
     }
 
@@ -393,13 +445,12 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
     }
 
     const fileName = path.basename(this.params.file_path);
-    const fileDiff = Diff.createPatch(
+    const fileDiff = createPatchSmart(
       fileName,
       editData.currentContent ?? '',
       editData.newContent,
       'Current',
       'Proposed',
-      DEFAULT_DIFF_OPTIONS,
     );
     const confirmationDetails: ToolEditConfirmationDetails = {
       type: 'edit',
@@ -427,17 +478,10 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
       return `Create ${shortenPath(relativePath)}`;
     }
 
-    const oldStringSnippet =
-      this.params.old_string.split('\n')[0].substring(0, 30) +
-      (this.params.old_string.length > 30 ? '...' : '');
-    const newStringSnippet =
-      this.params.new_string.split('\n')[0].substring(0, 30) +
-      (this.params.new_string.length > 30 ? '...' : '');
-
     if (this.params.old_string === this.params.new_string) {
       return `No file changes to ${shortenPath(relativePath)}`;
     }
-    return `${shortenPath(relativePath)}: ${oldStringSnippet} => ${newStringSnippet}`;
+    return shortenPath(relativePath);
   }
 
   /**
@@ -453,7 +497,7 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
       if (signal.aborted) {
         throw error;
       }
-      const errorMsg = error instanceof Error ? error.message : String(error);
+      const errorMsg = getErrorMessage(error);
       return {
         llmContent: `Error preparing edit: ${errorMsg}`,
         returnDisplay: `Error preparing edit: ${errorMsg}`,
@@ -516,14 +560,9 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
       //
       // It does NOT eliminate the race. A concurrent writer that
       // lands between this stat and the writeTextFile call below
-      // can still be clobbered — that residual is an OS-level
-      // limitation of the stat-then-write pattern, and the only
-      // way to close it is an atomic write (write to a temp file,
-      // then rename) or a content-hash post-check that re-reads
-      // the bytes after the write. Both are deferred to a follow-up
-      // PR; operators who care about strict overwrite-protection
-      // should set `fileReadCacheDisabled: true` and rely on
-      // application-level locking.
+      // can still be clobbered. Atomic replacement is not compare-and-swap;
+      // the sandbox worker rechecks the prepared version before commit,
+      // but strict protection against concurrent writers requires locking.
       //
       // Run unconditionally (not gated on `editData.isNewFile`):
       // `isNewFile` was decided back in calculateEdit, but a file
@@ -566,7 +605,9 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
       // directories on the failure path — a real (if minor) FS
       // litter that the previous order created on every rejected
       // edit.
-      this.ensureParentDirectoriesExist(this.params.file_path);
+      if (!this.config.getShellExecutionSandbox?.()) {
+        this.ensureParentDirectoriesExist(this.params.file_path);
+      }
 
       // For new files, apply default file encoding setting
       // For existing files, preserve the original encoding (BOM and charset)
@@ -579,23 +620,35 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
           // No explicit setting: auto-detect (e.g. .ps1 on non-UTF-8 Windows)
           useBOM = needsUtf8Bom(this.params.file_path);
         }
-        await this.config.getFileSystemService().writeTextFile({
-          path: this.params.file_path,
-          content: editData.newContent,
-          _meta: {
-            bom: useBOM,
+        await writeRuntimeFile(
+          this.config,
+          {
+            path: this.params.file_path,
+            content: editData.newContent,
+            toolWriteOrigin: 'edit',
+            _meta: {
+              bom: useBOM,
+            },
           },
-        });
+          editData.sandboxFileVersion,
+          signal,
+        );
       } else {
-        await this.config.getFileSystemService().writeTextFile({
-          path: this.params.file_path,
-          content: editData.newContent,
-          _meta: {
-            bom: editData.bom,
-            encoding: editData.encoding,
-            lineEnding: editData.lineEnding,
+        await writeRuntimeFile(
+          this.config,
+          {
+            path: this.params.file_path,
+            content: editData.newContent,
+            toolWriteOrigin: 'edit',
+            _meta: {
+              bom: editData.bom,
+              encoding: editData.encoding,
+              lineEnding: editData.lineEnding,
+            },
           },
-        });
+          editData.sandboxFileVersion,
+          signal,
+        );
       }
 
       // Track AI contribution for commit attribution
@@ -636,17 +689,17 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
         editData.newContent,
       );
 
-      const fileDiff = Diff.createPatch(
+      const fileDiff = createPatchSmart(
         fileName,
-        editData.currentContent ?? '', // Should not be null here if not isNewFile
+        editData.currentContent ?? '',
         editData.newContent,
         'Current',
         'Proposed',
-        DEFAULT_DIFF_OPTIONS,
       );
-      const displayResult = {
+      const displayResult: FileDiff = {
         fileDiff,
         fileName,
+        filePath: this.params.file_path,
         originalContent: editData.currentContent,
         newContent: editData.newContent,
         diffStat,
@@ -694,13 +747,20 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
         returnDisplay: displayResult,
       };
     } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
+      const errorMsg = getErrorMessage(error);
       return {
         llmContent: `Error executing edit: ${errorMsg}`,
         returnDisplay: `Error writing file: ${errorMsg}`,
         error: {
           message: errorMsg,
-          type: ToolErrorType.FILE_WRITE_FAILURE,
+          type:
+            isNodeError(error) &&
+            error.code === 'ESTALE' &&
+            this.config.getShellExecutionSandbox?.()
+              ? ToolErrorType.FILE_CHANGED_SINCE_READ
+              : isNodeError(error) && error.code === 'EISDIR'
+                ? ToolErrorType.TARGET_IS_DIRECTORY
+                : ToolErrorType.FILE_WRITE_FAILURE,
         },
       };
     }
@@ -788,6 +848,15 @@ Expectation for required parameters:
 
     if (!path.isAbsolute(params.file_path)) {
       return `File path must be absolute: ${params.file_path}`;
+    }
+
+    const teamMemoryError = checkTeamMemorySecrets(
+      params.file_path,
+      params.new_string ?? '',
+      this.config.getProjectRoot(),
+    );
+    if (teamMemoryError) {
+      return teamMemoryError;
     }
 
     return null;

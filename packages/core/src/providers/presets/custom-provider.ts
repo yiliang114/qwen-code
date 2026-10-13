@@ -24,13 +24,8 @@ export const CUSTOM_API_KEY_ENV_PREFIX = 'QWEN_CUSTOM_API_KEY_';
  * realistically collide an existing entry to redirect an API key write,
  * while still keeping the env var name pasteable into a dashboard.
  *
- * Migration note: this suffix changed from 6 → 12 chars in a recent commit.
- * Old 6-char keys persist in settings.json (and ~/.qwen/env-equivalent
- * stores) until either the user reconnects under the same URL (which writes
- * the new 12-char key but leaves the old one as orphan disk state — harmless,
- * never read) or runs the "clear auth" flow. The old key is never read by
- * applyProviderInstallPlan because the new model provider entries point at
- * the new key.
+ * Existing explicit envKey references are preserved on reconnect. This
+ * function chooses the credential reference for new model routes.
  */
 /**
  * Normalize a string to a `[A-Z0-9_]+` env-var-safe segment without using any
@@ -110,14 +105,13 @@ export const customProvider: ProviderConfig = {
   models: undefined,
   modelNamePrefix: '',
   showAdvancedConfig: true,
-  // Without this, applyModelProvidersPatch falls back to id+baseUrl identity
-  // matching, so reinstalling a custom provider under a different baseUrl
-  // leaves the old model entries behind — they accumulate over time.
-  // Every key we mint via generateCustomEnvKey starts with the well-known
-  // prefix, so a prefix match cleanly identifies "ours" without false
-  // positives against preset entries.
+  // Detect existing custom entries by our env-key namespace for UI/ACP flows,
+  // but merge installs by id+baseUrl so /auth can add another custom model
+  // without deleting models from other endpoints or different models on the
+  // same endpoint.
   ownsModel: (model) =>
     typeof model.envKey === 'string' &&
     model.envKey.startsWith(CUSTOM_API_KEY_ENV_PREFIX),
+  mergeModelsByIdentity: true,
   uiGroup: 'custom',
 };

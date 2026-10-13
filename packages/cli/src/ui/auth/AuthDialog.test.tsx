@@ -5,8 +5,10 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { setTimeout as settleInput } from 'node:timers/promises';
 import { AuthDialog } from './AuthDialog.js';
 import { LoadedSettings } from '../../config/settings.js';
+import type { Settings } from '../../config/settingsSchema.js';
 import type { Config } from '@qwen-code/qwen-code-core';
 import { AuthType } from '@qwen-code/qwen-code-core';
 import { renderWithProviders } from '../../test-utils/render.js';
@@ -14,6 +16,15 @@ import { UIStateContext } from '../contexts/UIStateContext.js';
 import { UIActionsContext } from '../contexts/UIActionsContext.js';
 import type { UIState } from '../contexts/UIStateContext.js';
 import type { UIActions } from '../contexts/UIActionsContext.js';
+
+const discoverProviderModelsMock = vi.hoisted(() =>
+  vi.fn().mockResolvedValue(null),
+);
+
+vi.mock('@qwen-code/qwen-code-core', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@qwen-code/qwen-code-core')>()),
+  discoverProviderModels: discoverProviderModelsMock,
+}));
 
 type UIStateOverrides = Partial<UIState> & Partial<UIState['auth']>;
 
@@ -113,6 +124,7 @@ const typeText = async (
   text: string,
 ) => {
   const delay = (ms = 5) => new Promise((resolve) => setTimeout(resolve, ms));
+  await settleInput(150);
   for (const char of text) {
     stdin.write(char);
     await delay(5);
@@ -141,14 +153,13 @@ const waitForSelectedOption = async (
     },
     { timeout: WAIT_FOR_TIMEOUT },
   );
+  await settleInput(150);
 };
 
-const pressEnterAndWaitFor = async (
-  stdin: { write: (s: string) => void },
+const waitForText = async (
   lastFrame: () => string | undefined,
   expectedText: string,
 ) => {
-  stdin.write('\r');
   await vi.waitFor(
     () => {
       expect(lastFrame()).toContain(expectedText);
@@ -157,11 +168,28 @@ const pressEnterAndWaitFor = async (
   );
 };
 
+const pressEnterAndWaitFor = async (
+  stdin: { write: (s: string) => void },
+  lastFrame: () => string | undefined,
+  expectedText: string,
+) => {
+  await settleInput(150);
+  stdin.write('\r');
+  await vi.waitFor(
+    () => {
+      expect(lastFrame()).toContain(expectedText);
+    },
+    { timeout: WAIT_FOR_TIMEOUT },
+  );
+  await settleInput(150);
+};
+
 const moveDownAndWaitForSelection = async (
   stdin: { write: (s: string) => void },
   lastFrame: () => string | undefined,
   label: string,
 ) => {
+  await settleInput(150);
   stdin.write('\u001b[B');
   await waitForSelectedOption(lastFrame, label);
 };
@@ -176,7 +204,7 @@ const navigateToCustomProtocolSelect = async (
   await pressEnterAndWaitFor(
     stdin,
     lastFrame,
-    'Custom Provider · Step 1/6 · Protocol',
+    'Custom Provider · Step 1/7 · Protocol',
   );
 };
 
@@ -188,7 +216,12 @@ const navigateToCustomBaseUrlInput = async (
   await pressEnterAndWaitFor(
     stdin,
     lastFrame,
-    'Custom Provider · Step 2/6 · Base URL',
+    'Custom Provider · Step 2/7 · API',
+  );
+  await pressEnterAndWaitFor(
+    stdin,
+    lastFrame,
+    'Custom Provider · Step 3/7 · Base URL',
   );
 };
 
@@ -200,7 +233,7 @@ const navigateToCustomApiKeyInput = async (
   await pressEnterAndWaitFor(
     stdin,
     lastFrame,
-    'Custom Provider · Step 3/6 · API Key',
+    'Custom Provider · Step 4/7 · API Key',
   );
 };
 
@@ -214,7 +247,7 @@ const navigateToCustomModelIdInput = async (
   await pressEnterAndWaitFor(
     stdin,
     lastFrame,
-    'Custom Provider · Step 4/6 · Model IDs',
+    'Custom Provider · Step 5/7 · Model IDs',
   );
 };
 
@@ -229,7 +262,7 @@ const navigateToCustomAdvancedConfig = async (
   await pressEnterAndWaitFor(
     stdin,
     lastFrame,
-    'Custom Provider · Step 5/6 · Advanced Config',
+    'Custom Provider · Step 6/7 · Advanced Config',
   );
 };
 
@@ -811,7 +844,7 @@ describe('AuthDialog', { timeout: 15000 }, () => {
         },
         {
           label: 'Custom Provider',
-          childTitle: 'Custom Provider · Step 1/6 · Protocol',
+          childTitle: 'Custom Provider · Step 1/7 · Protocol',
         },
       ];
 
@@ -1102,6 +1135,7 @@ describe('AuthDialog', { timeout: 15000 }, () => {
         },
         { timeout: WAIT_FOR_TIMEOUT },
       );
+      await moveDownAndWaitForSelection(stdin, lastFrame, 'Grok (xAI) API Key');
       await moveDownAndWaitForSelection(stdin, lastFrame, 'MiniMax API Key');
       await pressEnterAndWaitFor(
         stdin,
@@ -1233,7 +1267,12 @@ describe('AuthDialog', { timeout: 15000 }, () => {
       await pressEnterAndWaitFor(
         stdin,
         lastFrame,
-        'Alibaba ModelStudio · Step 1/2 · API Key',
+        'Alibaba ModelStudio · Step 1/3 · Region',
+      );
+      await pressEnterAndWaitFor(
+        stdin,
+        lastFrame,
+        'Alibaba ModelStudio · Step 2/3 · API Key',
       );
 
       await typeText(stdin, 'sk-token-plan');
@@ -1241,8 +1280,9 @@ describe('AuthDialog', { timeout: 15000 }, () => {
       await pressEnterAndWaitFor(
         stdin,
         lastFrame,
-        'Alibaba ModelStudio · Step 2/2 · Model IDs',
+        'Alibaba ModelStudio · Step 3/3 · Model IDs',
       );
+      await waitForText(lastFrame, 'Enter model IDs directly');
       stdin.write('\r');
       await vi.waitFor(
         () => {
@@ -1250,6 +1290,84 @@ describe('AuthDialog', { timeout: 15000 }, () => {
         },
         { timeout: WAIT_FOR_TIMEOUT },
       );
+
+      unmount();
+    },
+  );
+
+  itWhenTuiInputReliable(
+    'should pre-fill the Model IDs step with previously saved custom model IDs',
+    async () => {
+      // User previously saved a custom model ID for Token Plan in settings.
+      const savedSettings = {
+        security: { auth: { selectedType: undefined } },
+        ui: { customThemes: {} },
+        mcpServers: {},
+        modelProviders: {
+          openai: [
+            {
+              id: 'my-custom-token-model',
+              name: '[ModelStudio Token Plan] my-custom-token-model',
+              baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+              envKey: 'BAILIAN_TOKEN_PLAN_API_KEY',
+            },
+          ],
+        },
+      } as unknown as Settings;
+      const settings: LoadedSettings = new LoadedSettings(
+        {
+          settings: { ui: { customThemes: {} }, mcpServers: {} },
+          originalSettings: { ui: { customThemes: {} }, mcpServers: {} },
+          path: '',
+        },
+        {
+          settings: {},
+          originalSettings: {},
+          path: '',
+        },
+        {
+          settings: savedSettings,
+          originalSettings: savedSettings,
+          path: '',
+        },
+        {
+          settings: { ui: { customThemes: {} }, mcpServers: {} },
+          originalSettings: { ui: { customThemes: {} }, mcpServers: {} },
+          path: '',
+        },
+        true,
+        new Set(),
+      );
+
+      const { stdin, lastFrame, unmount } = renderAuthDialog(settings);
+
+      await waitForSelectedOption(lastFrame, 'Alibaba ModelStudio');
+      stdin.write('\r');
+      await waitForSelectedOption(lastFrame, 'Coding Plan');
+      await moveDownAndWaitForSelection(stdin, lastFrame, 'Token Plan');
+      await pressEnterAndWaitFor(
+        stdin,
+        lastFrame,
+        'Alibaba ModelStudio · Step 1/3 · Region',
+      );
+      await pressEnterAndWaitFor(
+        stdin,
+        lastFrame,
+        'Alibaba ModelStudio · Step 2/3 · API Key',
+      );
+
+      await typeText(stdin, 'sk-token-plan');
+
+      await pressEnterAndWaitFor(
+        stdin,
+        lastFrame,
+        'Alibaba ModelStudio · Step 3/3 · Model IDs',
+      );
+      await waitForText(lastFrame, 'Enter model IDs directly');
+
+      // The Model IDs input is pre-filled with the saved custom model id
+      // (which only exists in settings, never among the built-in defaults).
+      expect(lastFrame()).toContain('my-custom-token-model');
 
       unmount();
     },
@@ -1300,7 +1418,22 @@ describe('AuthDialog', { timeout: 15000 }, () => {
       await pressEnterAndWaitFor(
         stdin,
         lastFrame,
-        'Alibaba ModelStudio · Step 1/2 · API Key',
+        'Alibaba ModelStudio · Step 1/3 · Region',
+      );
+      await pressEnterAndWaitFor(
+        stdin,
+        lastFrame,
+        'Alibaba ModelStudio · Step 2/3 · API Key',
+      );
+      stdin.write('\u001b');
+
+      await vi.waitFor(
+        () => {
+          expect(lastFrame()).toContain(
+            'Alibaba ModelStudio · Step 1/3 · Region',
+          );
+        },
+        { timeout: WAIT_FOR_TIMEOUT },
       );
       stdin.write('\u001b');
 
@@ -1381,7 +1514,7 @@ describe('AuthDialog Custom API Key Wizard', { timeout: 15000 }, () => {
       await vi.waitFor(
         () => {
           const frame = lastFrame();
-          expect(frame).toContain('Custom Provider · Step 1/6 · Protocol');
+          expect(frame).toContain('Custom Provider · Step 1/7 · Protocol');
           expect(frame).toContain('OpenAI-compatible');
           expect(frame).toContain('Anthropic-compatible');
           expect(frame).toContain('Gemini-compatible');
@@ -1420,7 +1553,7 @@ describe('AuthDialog Custom API Key Wizard', { timeout: 15000 }, () => {
       await vi.waitFor(
         () => {
           const frame = lastFrame();
-          expect(frame).toContain('Custom Provider · Step 2/6 · Base URL');
+          expect(frame).toContain('Custom Provider · Step 3/7 · Base URL');
           expect(frame).toContain('Enter the API endpoint');
         },
         { timeout: WAIT_FOR_TIMEOUT },
@@ -1461,13 +1594,13 @@ describe('AuthDialog Custom API Key Wizard', { timeout: 15000 }, () => {
       await pressEnterAndWaitFor(
         stdin,
         lastFrame,
-        'Custom Provider · Step 6/6 · Review',
+        'Custom Provider · Step 7/7 · Review',
       );
 
       await vi.waitFor(
         () => {
           const frame = lastFrame();
-          expect(frame).toContain('Custom Provider · Step 6/6 · Review');
+          expect(frame).toContain('Custom Provider · Step 7/7 · Review');
           expect(frame).toContain('The following JSON will be saved');
           expect(frame).toContain('QWEN_CUSTOM_API_KEY_');
           expect(frame).toContain('qwen/qwen3-coder');
@@ -1513,7 +1646,7 @@ describe('AuthDialog Custom API Key Wizard', { timeout: 15000 }, () => {
       await pressEnterAndWaitFor(
         stdin,
         lastFrame,
-        'Custom Provider · Step 6/6 · Review',
+        'Custom Provider · Step 7/7 · Review',
       );
 
       await vi.waitFor(
@@ -1575,7 +1708,7 @@ describe('AuthDialog Custom API Key Wizard', { timeout: 15000 }, () => {
 
       await vi.waitFor(() => {
         const frame = lastFrame();
-        expect(frame).toContain('Custom Provider · Step 5/6 · Advanced Config');
+        expect(frame).toContain('Custom Provider · Step 6/7 · Advanced Config');
         expect(frame).toContain(
           'Optional: configure advanced generation settings',
         );
@@ -1620,7 +1753,7 @@ describe('AuthDialog Custom API Key Wizard', { timeout: 15000 }, () => {
 
       await vi.waitFor(() => {
         const frame = lastFrame();
-        expect(frame).toContain('Custom Provider · Step 5/6 · Advanced Config');
+        expect(frame).toContain('Custom Provider · Step 6/7 · Advanced Config');
       });
 
       // Toggle thinking (press Space — thinking is initially focused)
@@ -1666,6 +1799,138 @@ describe('AuthDialog Custom API Key Wizard', { timeout: 15000 }, () => {
           }),
         );
       });
+
+      unmount();
+    },
+  );
+
+  itWhenTuiInputReliable(
+    'previews the persisted reasoning shape for the OpenAI Responses protocol',
+    async () => {
+      // The review screen promises "the following JSON will be saved", but
+      // provider persistence normalizes enable_thinking to
+      // `generationConfig.reasoning.effort` on this protocol
+      // (provider-config.ts: buildAdvancedGenerationConfig), so the preview
+      // was showing a shape that never reaches settings.json.
+      const settings = createStandardSettings();
+
+      const mockUIState = createMockUIState();
+      const mockUIActions = createMockUIActions();
+
+      const mockConfig = {
+        getAuthType: vi.fn(() => undefined),
+        getContentGeneratorConfig: vi.fn(() => ({})),
+      } as unknown as Config;
+
+      const { stdin, lastFrame, unmount } = renderWithProviders(
+        <UIStateContext.Provider value={mockUIState}>
+          <UIActionsContext.Provider value={mockUIActions}>
+            <AuthDialog />
+          </UIActionsContext.Provider>
+        </UIStateContext.Provider>,
+        { settings, config: mockConfig },
+      );
+
+      await navigateToCustomProtocolSelect(stdin, lastFrame);
+      await pressEnterAndWaitFor(
+        stdin,
+        lastFrame,
+        'Custom Provider · Step 2/7 · API',
+      );
+      await moveDownAndWaitForSelection(stdin, lastFrame, 'Responses');
+      await pressEnterAndWaitFor(
+        stdin,
+        lastFrame,
+        'Custom Provider · Step 3/7 · Base URL',
+      );
+      // Submit the placeholder default endpoint for this protocol.
+      await wait();
+      await pressEnterAndWaitFor(
+        stdin,
+        lastFrame,
+        'Custom Provider · Step 4/7 · API Key',
+      );
+      await typeText(stdin, 'sk-test');
+      await pressEnterAndWaitFor(
+        stdin,
+        lastFrame,
+        'Custom Provider · Step 5/7 · Model IDs',
+      );
+      await typeText(stdin, 'model-1');
+      await pressEnterAndWaitFor(
+        stdin,
+        lastFrame,
+        'Custom Provider · Step 6/7 · Advanced Config',
+      );
+
+      // Toggle thinking (initially focused), then continue to review.
+      stdin.write(' ');
+      await wait();
+      stdin.write('\r');
+      await wait();
+
+      await vi.waitFor(
+        () => {
+          const frame = lastFrame();
+          expect(frame).toContain('"generationConfig"');
+          expect(frame).toContain('"reasoning"');
+          expect(frame).toContain('"effort": "medium"');
+          expect(frame).not.toContain('"enable_thinking"');
+        },
+        { timeout: WAIT_FOR_TIMEOUT },
+      );
+
+      unmount();
+    },
+  );
+
+  itWhenTuiInputReliable(
+    'reopens a saved Responses install with the API step on Responses',
+    async () => {
+      // The Custom Provider entry prefills the ids of the saved install, so
+      // the API step has to open on the same wire — otherwise Save restamps
+      // those ids onto Chat Completions and leaves a duplicate route behind.
+      const savedSettings = {
+        security: { auth: { selectedType: undefined } },
+        ui: { customThemes: {} },
+        mcpServers: {},
+        modelProviders: {
+          openai: [
+            {
+              id: 'm1',
+              baseUrl: 'https://gw.example/v1',
+              envKey: 'QWEN_CUSTOM_API_KEY_X',
+              wireApi: 'responses',
+            },
+          ],
+        },
+      } as unknown as Settings;
+      const settings: LoadedSettings = new LoadedSettings(
+        {
+          settings: { ui: { customThemes: {} }, mcpServers: {} },
+          originalSettings: { ui: { customThemes: {} }, mcpServers: {} },
+          path: '',
+        },
+        { settings: {}, originalSettings: {}, path: '' },
+        { settings: savedSettings, originalSettings: savedSettings, path: '' },
+        {
+          settings: { ui: { customThemes: {} }, mcpServers: {} },
+          originalSettings: { ui: { customThemes: {} }, mcpServers: {} },
+          path: '',
+        },
+        true,
+        new Set(),
+      );
+
+      const { stdin, lastFrame, unmount } = renderAuthDialog(settings);
+
+      await navigateToCustomProtocolSelect(stdin, lastFrame);
+      await pressEnterAndWaitFor(
+        stdin,
+        lastFrame,
+        'Custom Provider · Step 2/7 · API',
+      );
+      await waitForSelectedOption(lastFrame, 'Responses');
 
       unmount();
     },

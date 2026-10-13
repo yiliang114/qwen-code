@@ -6,13 +6,13 @@
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { simpleGit } from 'simple-git';
 import {
   AGENT_WORKTREE_SLUG_PATTERN,
   GitWorktreeService,
   worktreeBranchForSlug,
 } from './gitWorktreeService.js';
 import { createDebugLogger } from '../utils/debugLogger.js';
+import { loadSimpleGit } from '../utils/load-simple-git.js';
 
 const debugLogger = createDebugLogger('WORKTREE_CLEANUP');
 
@@ -155,6 +155,7 @@ export async function cleanupStaleAgentWorktrees(
 
 async function hasTrackedChanges(worktreePath: string): Promise<boolean> {
   try {
+    const { simpleGit } = await loadSimpleGit();
     const wtGit = simpleGit(worktreePath);
     // `git status --porcelain --untracked-files=no` lists every tracked
     // change (staged, unstaged, conflicted — `UU` lines) and skips the
@@ -168,6 +169,7 @@ async function hasTrackedChanges(worktreePath: string): Promise<boolean> {
     // simple-git), so a worktree mid-merge looked "clean" and would
     // be swept.
     const out = await wtGit.raw([
+      '--no-optional-locks',
       'status',
       '--porcelain',
       '--untracked-files=no',
@@ -184,4 +186,4 @@ async function hasTrackedChanges(worktreePath: string): Promise<boolean> {
   }
 }
 
-export const __test__ = { isEphemeralSlug };
+export const __test__ = { isEphemeralSlug, hasTrackedChanges };

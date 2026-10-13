@@ -28,6 +28,23 @@ describe('minimaxProvider', () => {
     expect(urls).toContain('https://api.minimaxi.com/v1');
   });
 
+  it('includes MiniMax-M3 with official model metadata', () => {
+    expect(minimaxProvider.models?.[0]).toMatchObject({
+      id: 'MiniMax-M3',
+      contextWindowSize: 1000000,
+      modalities: { image: true, video: true },
+    });
+  });
+
+  it('includes image generation models as image-only entries', () => {
+    expect(minimaxProvider.models).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 'image-01', imageOnly: true }),
+        expect.objectContaining({ id: 'image-01-live', imageOnly: true }),
+      ]),
+    );
+  });
+
   it('creates an install plan with per-model metadata for known IDs', () => {
     const plan = buildInstallPlan(minimaxProvider, {
       baseUrl: 'https://api.minimaxi.com/v1',

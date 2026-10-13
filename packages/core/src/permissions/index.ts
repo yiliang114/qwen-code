@@ -12,14 +12,26 @@ export { extractShellOperations } from './shell-semantics.js';
 export type { ShellOperation } from './shell-semantics.js';
 export {
   applyAutoModeDecision,
+  decorateAutoModeFallbackConfirmation,
+  decorateClassifierUnavailableConfirmation,
   evaluateAutoMode,
+  getAutoModeActionFingerprint,
+  prepareAutoModeFallback,
   formatClassifierBlockMessage,
+  formatClassifierUnavailableFallbackMessage,
+  type AutoModeUnavailableReason,
+  getAutoModePermissionDeniedReason,
   type AutoModeDecision,
+  type FallbackToAskReason,
   type AutoModeOutcome,
   type EvaluateAutoModeInput,
+  type PermissionDeniedReason,
   SAFE_TOOL_ALLOWLIST,
   isInSafeToolAllowlist,
   passesAcceptEditsFastPath,
+  shouldFirePermissionDeniedForAutoMode,
+  shouldClassifyAllShellForAutoMode,
+  shouldForceAutoModeReviewForAllow,
   shouldRunAutoModeForCall,
 } from './autoMode.js';
 export {
@@ -27,7 +39,9 @@ export {
   type DenialFallbackReason,
   AUTO_MODE_DENIAL_LIMITS,
   createDenialState,
+  formatDenialStateLog,
   isApproveOutcome,
+  isDenialFallbackReason,
   recordAllow,
   recordBlock,
   recordFallbackApprove,
@@ -36,3 +50,10 @@ export {
   shouldFallback,
 } from './denialTracking.js';
 export { MAX_TRANSCRIPT_MESSAGES } from './classifier-transcript.js';
+export {
+  isDestructiveCommand,
+  extractLastUserPrompt,
+  registerSessionCommit,
+  clearSessionCommits,
+  type DestructiveCommandResult,
+} from './destructive-commands.js';
