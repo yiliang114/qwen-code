@@ -6,6 +6,7 @@
 
 import { getErrorStatus } from './errors.js';
 import { isApiError, isStructuredError } from './quotaErrorDetection.js';
+import { getRetryDelayMs } from './retryPolicy.js';
 
 // Known rate-limit error codes across providers.
 // 429  - Standard HTTP "Too Many Requests" (DashScope TPM, OpenAI, etc.)
@@ -30,6 +31,15 @@ export interface RetryInfo {
 export interface RateLimitErrorDetails {
   statusCode?: number;
   providerCode?: string;
+  /**
+   * The provider body's `type`, kept separate from `providerCode` rather than
+   * folded into it. `providerCode` is compared by exact equality elsewhere
+   * (`isAllocatedQuotaExceeded`) and is what the collapsed `code ?? type`
+   * spelling has always produced, so it cannot carry both; a body with a
+   * specific `code` beside a class-naming `type` needs the second value on its
+   * own field to be readable at all.
+   */
+  providerType?: string;
   providerMessage?: string;
   requestId?: string;
   transport: 'http' | 'sse' | 'unknown';
@@ -53,10 +63,61 @@ export function isRateLimitError(
   extraCodes?: readonly number[],
 ): boolean {
   const code = getErrorCode(error);
-  if (code === null) return false;
+  if (code === null) return isStatuslessThrottle(error);
   if (RATE_LIMIT_ERROR_CODES.has(code)) return true;
   if (extraCodes && extraCodes.includes(code)) return true;
   return false;
+}
+
+function isStatuslessThrottle(error: unknown): boolean {
+  for (const payload of [error, ...getJsonPayloads(error)]) {
+    const selected = providerErrorSource(payload);
+    if (!selected) continue;
+    const { source } = selected;
+    const { type, message } = source as { type?: unknown; message?: unknown };
+    if (type === 'rate_limit_error' || type === 'overloaded_error') return true;
+    if (type !== 'invalid_request_error' || typeof message !== 'string')
+      continue;
+
+    // Some gateways put a temporary throttle inside invalid_request_error,
+    // with another JSON-encoded message instead of a numeric status.
+    const detail = decodeProviderMessage(message)?.['message'] ?? message;
+    if (
+      typeof detail === 'string' &&
+      /^too many requests\b/i.test(detail.trim()) &&
+      /\b(?:wait|try(?:ing)? again)\b/i.test(detail)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+type ProviderErrorSource = Record<string, unknown>;
+
+function providerErrorSource(
+  payload: unknown,
+): { source: ProviderErrorSource; direct: ProviderErrorSource } | null {
+  if (typeof payload !== 'object' || payload === null) return null;
+  const direct = payload as ProviderErrorSource;
+  const nested = direct['error'];
+  const source =
+    typeof nested === 'object' && nested !== null
+      ? (nested as ProviderErrorSource)
+      : direct;
+  return { source, direct };
+}
+
+function decodeProviderMessage(message: string): ProviderErrorSource | null {
+  try {
+    const selected = providerErrorSource(JSON.parse(message) as unknown);
+    if (!selected || typeof selected.source['message'] !== 'string') {
+      return null;
+    }
+    return { ...selected.direct, ...selected.source };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -78,9 +139,10 @@ export function getRateLimitErrorDetails(
 
   return {
     ...(statusCode !== undefined ? { statusCode } : {}),
-    ...(payload?.code !== undefined
-      ? { providerCode: String(payload.code) }
+    ...(payload?.code !== undefined || payload?.type !== undefined
+      ? { providerCode: String(payload.code ?? payload.type) }
       : {}),
+    ...(payload?.type !== undefined ? { providerType: payload.type } : {}),
     ...(payload?.message !== undefined
       ? { providerMessage: payload.message }
       : {}),
@@ -102,15 +164,14 @@ export function getRateLimitRetryDelayMs(
   attempt: number,
   options: RateLimitRetryDelayOptions,
 ): number {
-  const normalizedAttempt = Math.max(1, attempt);
-  const exponentialDelayMs =
-    options.initialDelayMs * Math.pow(2, normalizedAttempt - 1);
-  const retryAfterMs = getRetryAfterDelayMs(options.error);
-  const delayMs =
-    retryAfterMs === null
-      ? exponentialDelayMs
-      : Math.max(exponentialDelayMs, retryAfterMs);
-  return Math.min(delayMs, options.maxDelayMs);
+  return getRetryDelayMs({
+    attempt,
+    initialDelayMs: options.initialDelayMs,
+    maxDelayMs: options.maxDelayMs,
+    retryAfterMode: 'minimum',
+    retryAfterMaxDelayMs: options.maxDelayMs,
+    error: options.error,
+  });
 }
 
 /**
@@ -171,61 +232,75 @@ function getErrorCode(error: unknown): number | null {
 
 interface ProviderErrorPayload {
   code?: string | number;
+  type?: string;
   message?: string;
   requestId?: string;
 }
 
 function getProviderErrorPayload(error: unknown): ProviderErrorPayload | null {
   for (const payload of getJsonPayloads(error)) {
-    if (typeof payload !== 'object' || payload === null) continue;
-
-    const direct = payload as {
-      code?: unknown;
-      message?: unknown;
-      request_id?: unknown;
-      requestId?: unknown;
-    };
-    const nestedError = (payload as { error?: unknown }).error;
-    const nested =
-      typeof nestedError === 'object' && nestedError !== null
-        ? (nestedError as {
-            code?: unknown;
-            message?: unknown;
-            request_id?: unknown;
-            requestId?: unknown;
-          })
-        : undefined;
-    const source = nested ?? direct;
+    const selected = providerErrorSource(payload);
+    if (!selected) continue;
+    const { source, direct } = selected;
+    const decoded =
+      typeof source['message'] === 'string'
+        ? decodeProviderMessage(source['message'])
+        : null;
     const code =
-      typeof source.code === 'string' || typeof source.code === 'number'
-        ? source.code
-        : undefined;
+      typeof source['code'] === 'string' || typeof source['code'] === 'number'
+        ? source['code']
+        : typeof decoded?.['code'] === 'string' ||
+            typeof decoded?.['code'] === 'number'
+          ? decoded['code']
+          : undefined;
+    const type =
+      typeof source['type'] === 'string'
+        ? source['type']
+        : typeof decoded?.['type'] === 'string'
+          ? decoded['type']
+          : undefined;
     const message =
-      typeof source.message === 'string' ? source.message : undefined;
+      typeof decoded?.['message'] === 'string'
+        ? decoded['message']
+        : typeof source['message'] === 'string'
+          ? source['message']
+          : undefined;
     const requestId =
-      typeof source.request_id === 'string'
-        ? source.request_id
-        : typeof source.requestId === 'string'
-          ? source.requestId
-          : typeof direct.request_id === 'string'
-            ? direct.request_id
-            : typeof direct.requestId === 'string'
-              ? direct.requestId
-              : undefined;
+      typeof source['request_id'] === 'string'
+        ? source['request_id']
+        : typeof source['requestId'] === 'string'
+          ? source['requestId']
+          : typeof direct['request_id'] === 'string'
+            ? direct['request_id']
+            : typeof direct['requestId'] === 'string'
+              ? direct['requestId']
+              : typeof decoded?.['request_id'] === 'string'
+                ? decoded['request_id']
+                : typeof decoded?.['requestId'] === 'string'
+                  ? decoded['requestId']
+                  : undefined;
 
     if (
       code !== undefined ||
+      type !== undefined ||
       message !== undefined ||
       requestId !== undefined
     ) {
-      return { code, message, requestId };
+      return { code, type, message, requestId };
     }
   }
 
   if (isApiError(error)) {
+    const decoded = decodeProviderMessage(error.error.message);
     return {
       code: error.error.code,
-      message: error.error.message,
+      ...(typeof decoded?.['type'] === 'string'
+        ? { type: decoded['type'] }
+        : {}),
+      message:
+        typeof decoded?.['message'] === 'string'
+          ? decoded['message']
+          : error.error.message,
     };
   }
 
@@ -269,77 +344,4 @@ function getRawErrorMessage(error: unknown): string | null {
   if (error instanceof Error) return error.message;
   if (typeof error === 'string') return error;
   return null;
-}
-
-function getRetryAfterDelayMs(error: unknown): number | null {
-  const value =
-    getHeaderValue(error, 'retry-after') ??
-    getResponseHeaderValue(error, 'retry-after');
-  if (value === null) return null;
-
-  const seconds = Number(value);
-  if (Number.isFinite(seconds) && seconds >= 0) {
-    return seconds * 1000;
-  }
-
-  const retryAtMs = Date.parse(value);
-  if (!Number.isFinite(retryAtMs)) return null;
-
-  const delayMs = retryAtMs - Date.now();
-  return delayMs > 0 ? delayMs : 0;
-}
-
-function getHeaderValue(error: unknown, headerName: string): string | null {
-  if (!hasHeaders(error)) return null;
-
-  const { headers } = error;
-  if (typeof headers.get === 'function') {
-    const value = headers.get(headerName);
-    return typeof value === 'string' ? value : null;
-  }
-
-  if (typeof headers !== 'object' || headers === null) return null;
-
-  const lowerHeaderName = headerName.toLowerCase();
-  for (const [key, value] of Object.entries(headers)) {
-    if (key.toLowerCase() !== lowerHeaderName) continue;
-    return typeof value === 'string' ? value : null;
-  }
-
-  return null;
-}
-
-function getResponseHeaderValue(
-  error: unknown,
-  headerName: string,
-): string | null {
-  if (!hasResponseHeaders(error)) return null;
-  return getHeaderValue(error.response, headerName);
-}
-
-function hasHeaders(error: unknown): error is {
-  headers: { get?: (name: string) => unknown } | Record<string, unknown>;
-} {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'headers' in error &&
-    error.headers != null
-  );
-}
-
-function hasResponseHeaders(error: unknown): error is {
-  response: {
-    headers: { get?: (name: string) => unknown } | Record<string, unknown>;
-  };
-} {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'response' in error &&
-    typeof error.response === 'object' &&
-    error.response !== null &&
-    'headers' in error.response &&
-    error.response.headers != null
-  );
 }

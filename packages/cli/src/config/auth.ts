@@ -6,11 +6,16 @@
 
 import {
   AuthType,
+  hasVertexProjectConfigured,
+  resolveModelSelectionAuthType,
+  VERTEX_ADC_HINT,
   type Config,
   type ModelProvidersConfig,
   type ProviderModelConfig,
+  type ProviderProtocolConfig,
 } from '@qwen-code/qwen-code-core';
 import { loadEnvironment, loadSettings, type Settings } from './settings.js';
+import { collectProviderModelsForProtocol } from '../utils/modelConfigUtils.js';
 import { t } from '../i18n/index.js';
 
 /**
@@ -18,6 +23,7 @@ import { t } from '../i18n/index.js';
  */
 const DEFAULT_ENV_KEYS: Record<string, string> = {
   [AuthType.USE_OPENAI]: 'OPENAI_API_KEY',
+  [AuthType.USE_OPENAI_RESPONSES]: 'OPENAI_API_KEY',
   [AuthType.USE_ANTHROPIC]: 'ANTHROPIC_API_KEY',
   [AuthType.USE_GEMINI]: 'GEMINI_API_KEY',
   [AuthType.USE_VERTEX_AI]: 'GOOGLE_API_KEY',
@@ -25,11 +31,15 @@ const DEFAULT_ENV_KEYS: Record<string, string> = {
 
 /**
  * Find model configuration from modelProviders by authType and modelId.
- * When multiple models share the same id (different baseUrls), returns the
- * first match. Callers that need an exact match should also compare baseUrl.
+ * When a baseUrl is given, prefers the exact id+baseUrl match (disambiguating
+ * providers that share a model id) and falls back to the first id match if the
+ * paired provider was edited/removed. When no baseUrl is given, returns the
+ * first id match. Mirrors resolveCliGenerationConfig so pre-flight auth
+ * validation checks the same provider that startup resolution selects.
  */
 function findModelConfig(
   modelProviders: ModelProvidersConfig | undefined,
+  providerProtocol: ProviderProtocolConfig | undefined,
   authType: string,
   modelId: string | undefined,
   baseUrl?: string,
@@ -38,15 +48,66 @@ function findModelConfig(
     return undefined;
   }
 
-  const models = modelProviders[authType];
-  if (!Array.isArray(models)) {
+  // Merge across all provider ids routing to this protocol (built-in key or
+  // custom id via providerProtocol) so a custom provider's envKey is found.
+  const models = collectProviderModelsForProtocol(
+    modelProviders,
+    providerProtocol,
+    authType,
+  );
+  if (models.length === 0) {
     return undefined;
   }
 
   if (baseUrl) {
-    return models.find((m) => m.id === modelId && m.baseUrl === baseUrl);
+    return (
+      models.find((m) => m.id === modelId && m.baseUrl === baseUrl) ??
+      models.find((m) => m.id === modelId)
+    );
   }
   return models.find((m) => m.id === modelId);
+}
+
+/**
+ * Resolve the selected model id and its paired baseUrl for provider lookup.
+ * Prefers the runtime-resolved generation config (which folds in CLI args, env
+ * vars, settings, and the selected provider), falling back to the persisted
+ * settings.model.{name,baseUrl} when no Config is available yet (pre-flight).
+ */
+function resolveSelectedModel(
+  settings: Settings,
+  config?: Config,
+): { modelId: string | undefined; baseUrl: string | undefined } {
+  const modelsConfig = config?.getModelsConfig();
+  if (modelsConfig) {
+    // A live Config is the source of truth: pair its model with its own
+    // resolved baseUrl. Do NOT fall back to settings.model.baseUrl here — that
+    // could pair the runtime-selected model with a stale persisted baseUrl from
+    // a previous selection and validate a different duplicate-id provider.
+    return {
+      modelId: modelsConfig.getModel(),
+      baseUrl: modelsConfig.getGenerationConfig()?.baseUrl,
+    };
+  }
+  // Pre-flight (no Config yet): use the persisted selection as a paired unit.
+  return {
+    modelId: settings.model?.name,
+    baseUrl: settings.model?.baseUrl,
+  };
+}
+
+function hasEnvValue(settings: Settings, envKey: string | undefined): boolean {
+  if (!envKey) {
+    return false;
+  }
+  if (process.env[envKey]) {
+    return true;
+  }
+  const settingsEnv = settings.env as Record<string, unknown> | undefined;
+  const settingsEnvValue = settingsEnv?.[envKey];
+  return (
+    typeof settingsEnvValue === 'string' && settingsEnvValue.trim().length > 0
+  );
 }
 
 /**
@@ -66,12 +127,32 @@ function hasApiKeyForAuth(
     | ModelProvidersConfig
     | undefined;
 
-  // Use config.getModelsConfig().getModel() if available for accurate model ID resolution
-  // that accounts for CLI args, env vars, and settings. Fall back to settings.model.name.
-  const modelId = config?.getModelsConfig().getModel() ?? settings.model?.name;
+  // Use config.getModelsConfig() if available for accurate model resolution
+  // that accounts for CLI args, env vars, and settings. Fall back to the
+  // persisted settings.model.{name,baseUrl}.
+  const { modelId, baseUrl } = resolveSelectedModel(settings, config);
+  const modelAuthType =
+    !config &&
+    (authType === AuthType.USE_OPENAI ||
+      authType === AuthType.USE_OPENAI_RESPONSES)
+      ? resolveModelSelectionAuthType(
+          authType,
+          modelId,
+          modelProviders,
+          settings.providerProtocol,
+          baseUrl,
+        )
+      : authType;
 
-  // Try to find model-specific envKey from modelProviders
-  const modelConfig = findModelConfig(modelProviders, authType, modelId);
+  // Try to find model-specific envKey from modelProviders, disambiguating by
+  // baseUrl so duplicate-id providers resolve to the selected one.
+  const modelConfig = findModelConfig(
+    modelProviders,
+    settings.providerProtocol,
+    modelAuthType,
+    modelId,
+    baseUrl,
+  );
 
   // If a Config is available, prefer the API key already resolved into the
   // generation config. The unified resolver folds CLI flags (e.g.
@@ -94,7 +175,7 @@ function hasApiKeyForAuth(
 
   if (modelConfig?.envKey) {
     // Explicit envKey configured - only check this env var, no apiKey fallback
-    const hasKey = !!process.env[modelConfig.envKey];
+    const hasKey = hasEnvValue(settings, modelConfig.envKey);
     return {
       hasKey,
       checkedEnvKey: modelConfig.envKey,
@@ -105,7 +186,7 @@ function hasApiKeyForAuth(
   // Using default environment variable - apiKey fallback is allowed
   const defaultEnvKey = DEFAULT_ENV_KEYS[authType];
   if (defaultEnvKey) {
-    const hasKey = !!process.env[defaultEnvKey];
+    const hasKey = hasEnvValue(settings, defaultEnvKey);
     if (hasKey) {
       return { hasKey, checkedEnvKey: defaultEnvKey, isExplicitEnvKey: false };
     }
@@ -125,6 +206,37 @@ function hasApiKeyForAuth(
     checkedEnvKey: defaultEnvKey,
     isExplicitEnvKey: false,
   };
+}
+
+/**
+ * Whether the selected Vertex entry can take the Application Default
+ * Credentials path at all. An entry that declares its own key variable never
+ * does: falling back to ADC there would authenticate as a different principal,
+ * silently, whenever that variable failed to be injected.
+ */
+function isVertexAdcEligible(settings: Settings, config?: Config): boolean {
+  const { modelId, baseUrl } = resolveSelectedModel(settings, config);
+  const modelConfig = findModelConfig(
+    settings.modelProviders as ModelProvidersConfig | undefined,
+    settings.providerProtocol,
+    AuthType.USE_VERTEX_AI,
+    modelId,
+    baseUrl,
+  );
+  return !modelConfig?.envKey;
+}
+
+/** Reads the project through the shared predicate, settings.env included. */
+function hasVertexProject(settings: Settings): boolean {
+  const settingsEnv = settings.env as Record<string, unknown> | undefined;
+  return hasVertexProjectConfigured((key) => {
+    const fromProcess = process.env[key];
+    if (fromProcess !== undefined) {
+      return fromProcess;
+    }
+    const fromSettings = settingsEnv?.[key];
+    return typeof fromSettings === 'string' ? fromSettings : undefined;
+  });
 }
 
 /**
@@ -165,10 +277,13 @@ export function validateAuthMethod(
   authMethod: string,
   config?: Config,
 ): string | null {
-  const settings = loadSettings();
+  const settings = loadSettings(process.cwd(), false);
   loadEnvironment(settings.merged);
 
-  if (authMethod === AuthType.USE_OPENAI) {
+  if (
+    authMethod === AuthType.USE_OPENAI ||
+    authMethod === AuthType.USE_OPENAI_RESPONSES
+  ) {
     const { hasKey, checkedEnvKey, isExplicitEnvKey } = hasApiKeyForAuth(
       authMethod,
       settings.merged,
@@ -212,10 +327,16 @@ export function validateAuthMethod(
     const modelProviders = settings.merged.modelProviders as
       | ModelProvidersConfig
       | undefined;
-    // Use config.getModelsConfig().getModel() if available for accurate model ID
-    const modelId =
-      config?.getModelsConfig().getModel() ?? settings.merged.model?.name;
-    const modelConfig = findModelConfig(modelProviders, authMethod, modelId);
+    // Resolve the selected model + baseUrl so duplicate-id providers validate
+    // the Anthropic baseUrl of the selected provider, not the first id match.
+    const { modelId, baseUrl } = resolveSelectedModel(settings.merged, config);
+    const modelConfig = findModelConfig(
+      modelProviders,
+      settings.merged.providerProtocol,
+      authMethod,
+      modelId,
+      baseUrl,
+    );
 
     if (modelConfig && !modelConfig.baseUrl) {
       return t(
@@ -238,9 +359,12 @@ export function validateAuthMethod(
   }
 
   if (authMethod === AuthType.USE_VERTEX_AI) {
-    const apiKeyError = getApiKeyError(authMethod, settings.merged, config);
-    if (apiKeyError) {
-      return apiKeyError;
+    const adcEligible = isVertexAdcEligible(settings.merged, config);
+    if (!adcEligible || !hasVertexProject(settings.merged)) {
+      const apiKeyError = getApiKeyError(authMethod, settings.merged, config);
+      if (apiKeyError) {
+        return adcEligible ? apiKeyError + VERTEX_ADC_HINT : apiKeyError;
+      }
     }
 
     process.env['GOOGLE_GENAI_USE_VERTEXAI'] = 'true';

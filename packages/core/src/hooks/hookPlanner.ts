@@ -7,17 +7,35 @@
 import type { HookRegistry, HookRegistryEntry } from './hookRegistry.js';
 import type { HookExecutionPlan } from './types.js';
 import { getHookKey, HookEventName } from './types.js';
-import { createDebugLogger } from '../utils/debugLogger.js';
+import { getAliasSetForTool } from '../tools/tool-utils.js';
+import { getToolNameAliases } from '../permissions/rule-parser.js';
+import { matchesHookPattern } from './hook-matcher.js';
 
-const debugLogger = createDebugLogger('TRUSTED_HOOKS');
+/**
+ * Names a tool hook matcher may use for a tool: its runtime id, display name
+ * and legacy names, plus every name a permission rule accepts for the same
+ * tool (which includes Claude Code's `Bash`, `Read` and `Write`). Each name
+ * identifies this one tool; permission meta-categories are not applied, so
+ * `Read` matches `read_file` but not `grep_search`.
+ */
+export function getToolMatcherTargets(toolName: string): string[] {
+  return [
+    ...new Set([
+      ...getAliasSetForTool(toolName),
+      ...getToolNameAliases(toolName),
+    ]),
+  ];
+}
 
 type HookMatcherTargetKind =
   | 'toolName'
+  | 'commandName'
   | 'agentType'
   | 'trigger'
   | 'sessionTrigger'
   | 'error'
-  | 'notificationType';
+  | 'notificationType'
+  | 'filePath';
 
 interface HookMatcherTarget {
   kind: HookMatcherTargetKind;
@@ -33,6 +51,7 @@ export function getHookMatcherTarget(
     case HookEventName.PostToolUse:
     case HookEventName.PostToolUseFailure:
     case HookEventName.PermissionRequest:
+    case HookEventName.PermissionDenied:
       return { kind: 'toolName', target: context?.toolName ?? '' };
 
     case HookEventName.SubagentStart:
@@ -56,8 +75,19 @@ export function getHookMatcherTarget(
         target: context?.notificationType ?? '',
       };
 
+    case HookEventName.InstructionsLoaded:
+      return { kind: 'filePath', target: context?.filePath ?? '' };
+
+    case HookEventName.UserPromptExpansion:
+      // Unlike UserPromptSubmit, command expansions are matchable by the slash
+      // command name that produced the submitted prompt.
+      return { kind: 'commandName', target: context?.commandName ?? '' };
+
     case HookEventName.UserPromptSubmit:
     case HookEventName.Stop:
+    case HookEventName.MessageDisplay:
+    case HookEventName.PostToolBatch:
+    case HookEventName.SessionDelete:
     case HookEventName.TodoCreated:
     case HookEventName.TodoCompleted:
       return undefined;
@@ -67,6 +97,11 @@ export function getHookMatcherTarget(
       return exhaustive;
     }
   }
+}
+
+export function hookEventSupportsMatcher(eventName: HookEventName): boolean {
+  const target = getHookMatcherTarget(eventName);
+  return typeof target === 'object' && target !== null;
 }
 
 /**
@@ -122,10 +157,9 @@ export class HookPlanner {
   }
 
   /**
-   * Check if a hook entry matches the given context.
-   * Uses explicit event-based dispatch to avoid ambiguity between events
-   * that share similar context fields (e.g., SessionStart and SubagentStart
-   * both have agentType, but use different matcher semantics).
+   * Check if a hook entry matches the given context. Every event with a
+   * matcher target uses the shared matchesHookPattern rule; tool events also
+   * match display-name and legacy aliases exactly.
    */
   private matchesContext(
     entry: HookRegistryEntry,
@@ -136,106 +170,18 @@ export class HookPlanner {
       return true; // No matcher means match all
     }
 
-    const matcher = entry.matcher.trim();
-
-    if (matcher === '' || matcher === '*') {
-      return true; // Empty string or wildcard matches all
-    }
-
     const matcherTarget = getHookMatcherTarget(eventName, context);
     if (!matcherTarget || !matcherTarget.target) {
       return true;
     }
 
-    switch (matcherTarget.kind) {
-      case 'toolName':
-        return this.matchesToolName(matcher, matcherTarget.target);
-
-      case 'agentType':
-        return this.matchesAgentType(matcher, matcherTarget.target);
-
-      case 'trigger':
-      case 'error':
-        return this.matchesTrigger(matcher, matcherTarget.target);
-
-      case 'notificationType':
-        return this.matchesNotificationType(matcher, matcherTarget.target);
-
-      case 'sessionTrigger':
-        return this.matchesSessionTrigger(matcher, matcherTarget.target);
-
-      default: {
-        const exhaustive: never = matcherTarget.kind;
-        return exhaustive;
-      }
-    }
-  }
-
-  /**
-   * Match notification type against matcher pattern
-   */
-  private matchesNotificationType(
-    matcher: string,
-    notificationType: string,
-  ): boolean {
-    return matcher === notificationType;
-  }
-
-  /**
-   * Match session source or end reason against matcher pattern
-   */
-  private matchesSessionTrigger(matcher: string, trigger: string): boolean {
-    try {
-      // Attempt to treat the matcher as a regular expression.
-      const regex = new RegExp(matcher);
-      return regex.test(trigger);
-    } catch (error) {
-      // If it's not a valid regex, treat it as a literal string for an exact match.
-      debugLogger.warn(
-        `Invalid regex in hook matcher "${matcher}" for session trigger "${trigger}", falling back to exact match: ${error}`,
-      );
-      return matcher === trigger;
-    }
-  }
-
-  /**
-   * Match tool name against matcher pattern
-   */
-  private matchesToolName(matcher: string, toolName: string): boolean {
-    try {
-      // Attempt to treat the matcher as a regular expression.
-      const regex = new RegExp(matcher);
-      return regex.test(toolName);
-    } catch (error) {
-      // If it's not a valid regex, treat it as a literal string for an exact match.
-      debugLogger.warn(
-        `Invalid regex in hook matcher "${matcher}" for tool "${toolName}", falling back to exact match: ${error}`,
-      );
-      return matcher === toolName;
-    }
-  }
-
-  /**
-   * Match trigger/source against matcher pattern
-   */
-  private matchesTrigger(matcher: string, trigger: string): boolean {
-    return matcher === trigger;
-  }
-
-  /**
-   * Match agent type against matcher pattern.
-   * Supports regex matching, same as tool name matching.
-   */
-  private matchesAgentType(matcher: string, agentType: string): boolean {
-    try {
-      const regex = new RegExp(matcher);
-      return regex.test(agentType);
-    } catch (error) {
-      debugLogger.warn(
-        `Invalid regex in hook matcher "${matcher}" for agent type "${agentType}", falling back to exact match: ${error}`,
-      );
-      return matcher === agentType;
-    }
+    return matchesHookPattern(
+      entry.matcher,
+      matcherTarget.target,
+      matcherTarget.kind === 'toolName'
+        ? { aliases: getToolMatcherTargets(matcherTarget.target) }
+        : {},
+    );
   }
 
   /**
@@ -263,10 +209,14 @@ export class HookPlanner {
  */
 export interface HookEventContext {
   toolName?: string;
+  /** Command name for UserPromptExpansion matcher filtering */
+  commandName?: string;
   trigger?: string;
   notificationType?: string;
   /** Agent type for SubagentStart/SubagentStop matcher filtering */
   agentType?: string;
   /** Error type for StopFailure matcher filtering (fieldToMatch: 'error') */
   error?: string;
+  /** Loaded instruction/context file path for InstructionsLoaded matcher filtering */
+  filePath?: string;
 }

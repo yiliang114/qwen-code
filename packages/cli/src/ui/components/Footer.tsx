@@ -4,8 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { formatExecutionSandbox } from '../utils/execution-sandbox-display.js';
 import type React from 'react';
-import { Box, Text } from 'ink';
+import { type RefObject, useRef } from 'react';
+import { type DOMElement, Box, Text, useBoxMetrics } from 'ink';
 import { theme } from '../semantic-colors.js';
 import { ContextUsageDisplay } from './ContextUsageDisplay.js';
 import { useTerminalSize } from '../hooks/useTerminalSize.js';
@@ -15,23 +17,63 @@ import { BackgroundTasksPill } from './background-view/BackgroundTasksPill.js';
 import { MCPHealthPill } from './mcp/MCPHealthPill.js';
 import { isNarrowWidth } from '../utils/isNarrowWidth.js';
 
-import { useStatusLine } from '../hooks/useStatusLine.js';
+import { MAX_STATUS_LINES, useStatusLine } from '../hooks/useStatusLine.js';
 import { useConfigInitMessage } from '../hooks/useConfigInitMessage.js';
 import { useUIState } from '../contexts/UIStateContext.js';
 import { useConfig } from '../contexts/ConfigContext.js';
 import { useSettings } from '../contexts/SettingsContext.js';
-import { useVimMode } from '../contexts/VimModeContext.js';
-import { ApprovalMode } from '@qwen-code/qwen-code-core';
-import { GeminiSpinner } from './GeminiRespondingSpinner.js';
-import { GoalPill, useFooterGoalState } from './GoalPill.js';
+import { useVimModeState } from '../contexts/VimModeContext.js';
+import { Spinner } from './RespondingSpinner.js';
+import {
+  GoalPill,
+  isLiveGoalSnapshot,
+  useFooterGoalState,
+} from './GoalPill.js';
+import { CronPill, useFooterCronTaskCount } from './CronPill.js';
 import { t } from '../../i18n/index.js';
+import { useKeypressContext } from '../contexts/KeypressContext.js';
+import { StreamingState } from '../types.js';
 
-export const Footer: React.FC = () => {
+import type { PasteProgress } from '../contexts/KeypressContext.js';
+
+const PasteProgressBar: React.FC<{ progress: PasteProgress }> = ({
+  progress,
+}) => {
+  const { receivedBytes } = progress;
+  const kb = receivedBytes / 1024;
+  const label = kb >= 1 ? `${kb.toFixed(0)} KB` : `${receivedBytes} B`;
+
+  return (
+    <Text dimColor>
+      {t('Pasting…')} {label}
+    </Text>
+  );
+};
+
+interface FooterProps {
+  containerRef?: RefObject<DOMElement | null>;
+}
+
+export const Footer: React.FC<FooterProps> = ({ containerRef }) => {
   const uiState = useUIState();
   const config = useConfig();
   const settings = useSettings();
-  const { vimEnabled, vimMode } = useVimMode();
-  const { lines: statusLineLines, useThemeColors } = useStatusLine();
+  const { vimEnabled, vimMode } = useVimModeState();
+  const { columns: terminalWidth } = useTerminalSize();
+  const isNarrow = isNarrowWidth(terminalWidth);
+  const statusLineRef = useRef<DOMElement>(null);
+  const { width: statusLineWidth, hasMeasured: hasMeasuredStatusLine } =
+    useBoxMetrics(statusLineRef);
+  const { pasteProgress } = useKeypressContext();
+  const {
+    lines: statusLineLines,
+    useThemeColors,
+    respectUserColors,
+    hideContextIndicator,
+  } = useStatusLine(
+    isNarrow,
+    hasMeasuredStatusLine ? statusLineWidth : undefined,
+  );
   const configInitMessage = useConfigInitMessage(uiState.isConfigInitialized);
 
   const { promptTokenCount, showAutoAcceptIndicator } = {
@@ -39,18 +81,17 @@ export const Footer: React.FC = () => {
     showAutoAcceptIndicator: uiState.showAutoAcceptIndicator,
   };
 
-  const { columns: terminalWidth } = useTerminalSize();
-  const isNarrow = isNarrowWidth(terminalWidth);
-
-  // Determine sandbox info from environment
+  const executionSandbox = formatExecutionSandbox(config);
+  // Legacy whole-CLI backends still use their inherited marker.
   const sandboxEnv = process.env['SANDBOX'];
-  const sandboxInfo = sandboxEnv
-    ? sandboxEnv === 'sandbox-exec'
-      ? 'seatbelt'
-      : sandboxEnv.startsWith('qwen-code')
-        ? 'docker'
-        : sandboxEnv
-    : null;
+  const sandboxInfo =
+    !executionSandbox && sandboxEnv
+      ? sandboxEnv === 'sandbox-exec'
+        ? 'seatbelt'
+        : sandboxEnv.startsWith('qwen-code')
+          ? 'docker'
+          : sandboxEnv
+      : null;
 
   // Check if debug mode is enabled
   const debugMode = config.getDebugMode();
@@ -77,20 +118,43 @@ export const Footer: React.FC = () => {
     <Text color={theme.status.warning}>{t('Press Ctrl+D again to exit.')}</Text>
   ) : uiState.showEscapePrompt ? (
     <Text color={theme.text.secondary}>{t('Press Esc again to clear.')}</Text>
+  ) : pasteProgress.active ? (
+    <PasteProgressBar progress={pasteProgress} />
   ) : uiState.rewindEscPending ? (
     <Text color={theme.text.secondary}>
       {t('Press Esc again to rewind conversation.')}
     </Text>
   ) : vimEnabled && vimMode === 'INSERT' ? (
     <Text color={theme.text.secondary}>-- INSERT --</Text>
+  ) : vimEnabled && vimMode === 'NORMAL' ? (
+    <Text color={theme.text.secondary}>-- NORMAL --</Text>
   ) : uiState.shellModeActive ? (
     <ShellModeIndicator />
   ) : configInitMessage ? (
     <Text color={theme.text.secondary}>
-      <GeminiSpinner /> {configInitMessage}
+      <Spinner /> {configInitMessage}
     </Text>
-  ) : showAutoAcceptIndicator !== undefined &&
-    showAutoAcceptIndicator !== ApprovalMode.DEFAULT ? (
+  ) : uiState.startupIdeConnectionStatus.state === 'connecting' ? (
+    <Text color={theme.text.secondary}>
+      <Spinner /> {t('IDE connecting... context may be unavailable')}
+    </Text>
+  ) : uiState.startupIdeConnectionStatus.state === 'failed' ? (
+    <Text color={theme.status.warning}>
+      {t('IDE connection unavailable: {{message}}', {
+        message: uiState.startupIdeConnectionStatus.message,
+      })}
+    </Text>
+  ) : uiState.streamingState === StreamingState.Responding ? (
+    <Text color={theme.text.secondary}>
+      {t('Enter to steer · Ctrl+Q to queue')}
+      {showAutoAcceptIndicator !== undefined && (
+        <>
+          {' · '}
+          <AutoAcceptIndicator approvalMode={showAutoAcceptIndicator} />
+        </>
+      )}
+    </Text>
+  ) : showAutoAcceptIndicator !== undefined ? (
     <AutoAcceptIndicator approvalMode={showAutoAcceptIndicator} />
   ) : suppressHint ? null : (
     <Text color={theme.text.secondary}>{t('? for shortcuts')}</Text>
@@ -100,7 +164,13 @@ export const Footer: React.FC = () => {
   if (sandboxInfo) {
     rightItems.push({
       key: 'sandbox',
-      node: <Text color={theme.status.success}>🔒 {sandboxInfo}</Text>,
+      node: <Text color={theme.status.success}>{sandboxInfo}</Text>,
+    });
+  }
+  if (config.isSafeMode()) {
+    rightItems.push({
+      key: 'safe-mode',
+      node: <Text color={theme.status.warning}>⚠ Safe Mode</Text>,
     });
   }
   if (debugMode) {
@@ -110,10 +180,10 @@ export const Footer: React.FC = () => {
     });
   }
   // Dream tasks now surface via the BackgroundTasksPill (e.g. "1 dream")
-  // alongside the other background-task kinds. The previous `✦ dreaming`
+  // alongside the other background-task kinds. The previous `◆ dreaming`
   // right-column indicator was removed to avoid two simultaneous signals
   // for the same underlying state.
-  if (promptTokenCount > 0 && contextWindowSize) {
+  if (promptTokenCount > 0 && contextWindowSize && !hideContextIndicator) {
     rightItems.push({
       key: 'context',
       node: (
@@ -130,15 +200,23 @@ export const Footer: React.FC = () => {
   // Goal pill: only present in `rightItems` when a goal is active so the
   // divider chain stays tight; the pill itself does the live elapsed-time
   // refresh internally.
-  const goalActive = useFooterGoalState() !== undefined;
-  if (goalActive) {
-    rightItems.push({ key: 'goal', node: <GoalPill /> });
+  const goalState = useFooterGoalState();
+  if (isLiveGoalSnapshot(goalState)) {
+    rightItems.push({
+      key: 'goal',
+      node: <GoalPill snapshot={goalState} />,
+    });
+  }
+  const cronTaskCount = useFooterCronTaskCount();
+  if (cronTaskCount > 0) {
+    rightItems.push({ key: 'cron', node: <CronPill count={cronTaskCount} /> });
   }
 
   // Layout matches upstream: left column has status line (top) + hints/mode
   // (bottom), right section has indicators. Status line and hints coexist.
   return (
     <Box
+      ref={containerRef}
       flexDirection={isNarrow ? 'column' : 'row'}
       justifyContent={isNarrow ? 'flex-start' : 'space-between'}
       width="100%"
@@ -146,20 +224,42 @@ export const Footer: React.FC = () => {
       gap={isNarrow ? 0 : 1}
     >
       {/* Left column — status line on top, hints/mode on bottom */}
-      <Box flexDirection="column" flexShrink={isNarrow ? 0 : 1}>
+      <Box
+        ref={statusLineRef}
+        flexDirection="column"
+        flexGrow={1}
+        flexShrink={isNarrow ? 0 : 1}
+        minWidth={0}
+      >
+        {executionSandbox && (
+          <Text color={theme.text.secondary} wrap="wrap">
+            {executionSandbox}
+          </Text>
+        )}
         {statusLineLines.length > 0 &&
           !uiState.ctrlCPressedOnce &&
-          !uiState.ctrlDPressedOnce &&
-          statusLineLines.map((line, i) => (
-            <Text
-              key={`status-line-${i}`}
-              color={useThemeColors ? theme.text.accent : undefined}
-              dimColor={!useThemeColors}
-              wrap="truncate"
+          !uiState.ctrlDPressedOnce && (
+            <Box
+              flexDirection="column"
+              maxHeight={MAX_STATUS_LINES}
+              overflow="hidden"
+              width="100%"
             >
-              {line}
-            </Text>
-          ))}
+              <Text
+                color={
+                  respectUserColors
+                    ? undefined
+                    : useThemeColors
+                      ? theme.text.accent
+                      : undefined
+                }
+                dimColor={respectUserColors ? false : !useThemeColors}
+                wrap="wrap"
+              >
+                {statusLineLines.join('\n')}
+              </Text>
+            </Box>
+          )}
         {/* Built-in worktree indicator. Shown by default whenever a
             worktree is active so the user always has a UI affordance,
             even when a custom statusline is configured — their script
@@ -179,10 +279,37 @@ export const Footer: React.FC = () => {
               {`⎇ ${uiState.activeWorktree.branch} (${uiState.activeWorktree.slug})`}
             </Text>
           )}
+        {/* P7-trigger: the current turn was steered toward the Workflow tool
+            by the `workflow` keyword. Hidden during ctrl-quit warnings so they
+            take precedence (matches the worktree indicator above). */}
+        {uiState.workflowKeywordActive &&
+          !uiState.ctrlCPressedOnce &&
+          !uiState.ctrlDPressedOnce && (
+            <Text color={theme.text.accent} wrap="truncate">
+              {`▷ ${t('workflow active')}`}
+            </Text>
+          )}
         <Box flexDirection="row" flexShrink={1}>
+          {/* Every child of this shrinkable row must keep wrap="truncate", or
+              the footer grows mid-turn once the row overflows (#8667/#8666). */}
           <Text wrap="truncate">{leftBottomContent}</Text>
           <BackgroundTasksPill />
           <MCPHealthPill />
+          {uiState.messageQueue.length > 0 && (
+            <Text color={theme.text.secondary} wrap="truncate">
+              {` ⏳ ${t('{{count}} queued', {
+                count: String(uiState.messageQueue.length),
+              })}`}
+            </Text>
+          )}
+          {!uiState.isSkillReviewDialogOpen &&
+            (uiState.skillReviewPending?.skills.length ?? 0) > 0 && (
+              <Text color={theme.status.warning} wrap="truncate">
+                {` ⚠ ${t('{{count}} skill(s) pending review', {
+                  count: String(uiState.skillReviewPending!.skills.length),
+                })}`}
+              </Text>
+            )}
         </Box>
       </Box>
 

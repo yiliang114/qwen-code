@@ -15,6 +15,26 @@ import { createDebugLogger } from '../utils/debugLogger.js';
 const debugLogger = createDebugLogger('HOOK_REGISTRY');
 
 /**
+ * The identity the registry uses to spot a duplicate hook within one source,
+ * event, matcher and `sequential` setting: the hook's name when it has one,
+ * otherwise its full command, URL, function id or prompt. Exported so a
+ * listing read straight from settings collapses the same entries the registry
+ * would.
+ */
+export function hookRegistryIdentity(config: HookConfig): string {
+  if (config.name) return config.name;
+  if (config.type === 'command')
+    return (config as { command?: string }).command || 'unknown-command';
+  if (config.type === 'http')
+    return (config as { url?: string }).url || 'unknown-url';
+  if (config.type === 'function')
+    return (config as { id?: string }).id || 'unknown-function';
+  if (config.type === 'prompt')
+    return (config as { prompt?: string }).prompt || 'prompt-hook';
+  return 'unknown-hook';
+}
+
+/**
  * Extension with hooks support
  */
 export interface ExtensionWithHooks {
@@ -29,6 +49,7 @@ export interface ExtensionWithHooks {
 export interface HookRegistryConfig {
   getProjectRoot(): string;
   isTrustedFolder(): boolean;
+  getSystemHooks(): { [K in HookEventName]?: HookDefinition[] } | undefined;
   getUserHooks(): { [K in HookEventName]?: HookDefinition[] } | undefined;
   getProjectHooks(): { [K in HookEventName]?: HookDefinition[] } | undefined;
   getExtensions(): ExtensionWithHooks[];
@@ -51,6 +72,13 @@ export interface HookRegistryEntry {
   matcher?: string;
   sequential?: boolean;
   enabled: boolean;
+  /**
+   * Identifier for ephemeral entries attached at runtime by a specific
+   * subagent (via {@link HookRegistry.addAgentHooks}). Used by the matching
+   * unregister callback to remove the entries when the subagent ends. Plain
+   * (session/user/project/extension) entries leave this undefined.
+   */
+  agentScope?: string;
 }
 
 /**
@@ -78,6 +106,37 @@ export class HookRegistry {
     );
   }
 
+  async reloadConfiguredHooks(): Promise<void> {
+    const previousEntries = this.entries;
+    const enabledSnapshot = new Map(
+      previousEntries.map((entry) => [
+        this.getHookStateKey(entry),
+        entry.enabled,
+      ]),
+    );
+    const agentEntries = this.entries.filter(
+      (entry) => entry.agentScope !== undefined,
+    );
+
+    try {
+      this.entries = [...agentEntries];
+      this.processHooksFromConfig();
+      for (const entry of this.entries) {
+        const enabled = enabledSnapshot.get(this.getHookStateKey(entry));
+        if (enabled !== undefined) {
+          entry.enabled = enabled;
+        }
+      }
+    } catch (err) {
+      this.entries = previousEntries;
+      throw err;
+    }
+
+    debugLogger.debug(
+      `Hook registry reloaded with ${this.entries.length} hook entries`,
+    );
+  }
+
   /**
    * Get all hook entries for a specific event
    */
@@ -95,6 +154,51 @@ export class HookRegistry {
    */
   getAllHooks(): HookRegistryEntry[] {
     return [...this.entries];
+  }
+
+  /**
+   * Append ephemeral hook entries scoped to a specific subagent. Used by
+   * `SubagentManager` to wire the `hooks` field from a declarative agent
+   * frontmatter into the live registry when the subagent spawns.
+   *
+   * The hooks are validated through the same per-definition pipeline as
+   * session/user/project hooks (`processHookDefinition`), so a malformed
+   * entry is logged and dropped instead of breaking the spawn. Returns an
+   * unregister callback that removes exactly the entries added by this call;
+   * the caller is responsible for invoking it when the subagent finishes.
+   *
+   * v1 scope limitation: entries added here fire for every event of their
+   * declared type while they remain in the registry, regardless of which
+   * agent is currently active. If two subagents with different per-agent
+   * hook sets run concurrently, both sets fire for both agents. Proper
+   * per-agent scope filtering at firing time is left to a follow-up.
+   */
+  addAgentHooks(
+    hooks: { [K in HookEventName]?: HookDefinition[] },
+    agentScope: string,
+  ): () => void {
+    const before = this.entries.length;
+    this.processHooksConfiguration(
+      hooks,
+      HooksConfigSource.Session,
+      agentScope,
+    );
+    const addedCount = this.entries.length - before;
+    debugLogger.debug(
+      `Registered ${addedCount} ephemeral hook entries for agent scope "${agentScope}"`,
+    );
+    return () => {
+      const sizeBefore = this.entries.length;
+      this.entries = this.entries.filter(
+        (entry) => entry.agentScope !== agentScope,
+      );
+      const removed = sizeBefore - this.entries.length;
+      if (removed > 0) {
+        debugLogger.debug(
+          `Removed ${removed} ephemeral hook entries for agent scope "${agentScope}"`,
+        );
+      }
+    };
   }
 
   /**
@@ -126,17 +230,7 @@ export class HookRegistry {
   private getHookIdentity(
     entry: HookRegistryEntry | { config: HookConfig },
   ): string {
-    const config = entry.config;
-    if (config.name) return config.name;
-    if (config.type === 'command')
-      return (config as { command?: string }).command || 'unknown-command';
-    if (config.type === 'http')
-      return (config as { url?: string }).url || 'unknown-url';
-    if (config.type === 'function')
-      return (config as { id?: string }).id || 'unknown-function';
-    if (config.type === 'prompt')
-      return (config as { prompt?: string }).prompt || 'prompt-hook';
-    return 'unknown-hook';
+    return hookRegistryIdentity(entry.config);
   }
 
   /**
@@ -154,10 +248,30 @@ export class HookRegistry {
     return identity;
   }
 
+  private getHookStateKey(entry: HookRegistryEntry): string {
+    return JSON.stringify([
+      entry.eventName,
+      entry.source,
+      entry.agentScope ?? null,
+      this.getHookIdentity(entry),
+      entry.matcher ?? null,
+      entry.sequential ?? null,
+    ]);
+  }
+
   /**
    * Process hooks from the config that was already loaded by the CLI
    */
   private processHooksFromConfig(): void {
+    // System hooks, from the System and SystemDefaults settings files. Like
+    // user hooks they load regardless of folder trust. Registration order does
+    // not decide execution order: getHooksForEvent sorts by source priority
+    // (Project, User, System, Extensions).
+    const systemHooks = this.config.getSystemHooks();
+    if (systemHooks) {
+      this.processHooksConfiguration(systemHooks, HooksConfigSource.System);
+    }
+
     // Load user hooks (always available, regardless of folder trust)
     const userHooks = this.config.getUserHooks();
     if (userHooks) {
@@ -189,6 +303,7 @@ export class HookRegistry {
   private processHooksConfiguration(
     hooksConfig: { [K in HookEventName]?: HookDefinition[] },
     source: HooksConfigSource,
+    agentScope?: string,
   ): void {
     for (const [eventName, definitions] of Object.entries(hooksConfig)) {
       if (HOOKS_CONFIG_FIELDS.includes(eventName)) {
@@ -213,7 +328,12 @@ export class HookRegistry {
       }
 
       for (const definition of definitions) {
-        this.processHookDefinition(definition, typedEventName, source);
+        this.processHookDefinition(
+          definition,
+          typedEventName,
+          source,
+          agentScope,
+        );
       }
     }
   }
@@ -225,6 +345,7 @@ export class HookRegistry {
     definition: HookDefinition,
     eventName: HookEventName,
     source: HooksConfigSource,
+    agentScope?: string,
   ): void {
     if (
       !definition ||
@@ -247,11 +368,15 @@ export class HookRegistry {
         const hookIdentity = this.getHookIdentity({ config: hookConfig });
         const hookName = this.getHookName({ config: hookConfig });
 
-        // Check for duplicate hooks (same identity+source+eventName+matcher+sequential)
+        // Check for duplicate hooks. `agentScope` participates in the key so
+        // a per-agent hook does not get swallowed when an identical
+        // session/user/project hook already exists, and so two concurrent
+        // subagents declaring the same hook each keep their own copy.
         const isDuplicate = this.entries.some(
           (existing) =>
             existing.eventName === eventName &&
             existing.source === source &&
+            existing.agentScope === agentScope &&
             this.getHookIdentity(existing) === hookIdentity &&
             existing.matcher === definition.matcher &&
             existing.sequential === definition.sequential,
@@ -275,6 +400,7 @@ export class HookRegistry {
           matcher: definition.matcher,
           sequential: definition.sequential,
           enabled: true,
+          ...(agentScope !== undefined ? { agentScope } : {}),
         });
       } else {
         // Invalid hooks are logged and discarded here, they won't reach HookRunner

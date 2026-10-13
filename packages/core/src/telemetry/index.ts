@@ -14,8 +14,14 @@ const DEFAULT_OTLP_ENDPOINT = 'http://localhost:4317';
 
 export { DEFAULT_TELEMETRY_TARGET, DEFAULT_OTLP_ENDPOINT };
 export {
+  DEFAULT_SENSITIVE_SPAN_ATTRIBUTE_MAX_LENGTH,
+  SENSITIVE_SPAN_ATTRIBUTE_MAX_LENGTH_LIMIT,
+  isValidSensitiveSpanAttributeMaxLength,
+} from './constants.js';
+export {
   initializeTelemetry,
   shutdownTelemetry,
+  forceFlushMetrics,
   refreshSessionContext,
   isTelemetrySdkInitialized,
 } from './sdk.js';
@@ -26,14 +32,17 @@ export {
 } from './config.js';
 export {
   logStartSession,
+  logSessionEnd,
   logUserPrompt,
   logUserRetry,
   logToolCall,
+  logRepeatedToolFailureGuard,
   logApiRequest,
   logApiError,
   logApiCancel,
   logApiResponse,
   logFlashFallback,
+  logGoalState,
   logSlashCommand,
   logConversationFinishedEvent,
   logKittySequenceOverflow,
@@ -45,9 +54,11 @@ export {
   logExtensionDisable,
   logExtensionUpdateEvent,
   logRipgrepFallback,
+  logRipgrepRuntimeRecovery,
   logNextSpeakerCheck,
   logAuth,
   logSkillLaunch,
+  recordSkillInvocation,
   logUserFeedback,
   logArenaSessionStarted,
   logArenaAgentCompleted,
@@ -55,8 +66,14 @@ export {
   logMemoryExtract,
   logMemoryDream,
   logMemoryRecall,
+  logMemoryRecallDelivery,
 } from './loggers.js';
-export type { SlashCommandEvent, ChatCompressionEvent } from './types.js';
+export type {
+  SlashCommandEvent,
+  ChatCompressionEvent,
+  GoalStateEvent,
+  GoalStateEventCause,
+} from './types.js';
 export {
   SlashCommandStatus,
   EndSessionEvent,
@@ -73,6 +90,7 @@ export {
   KittySequenceOverflowEvent,
   ToolOutputTruncatedEvent,
   RipgrepFallbackEvent,
+  RipgrepRuntimeRecoveryEvent,
   NextSpeakerCheckEvent,
   AuthEvent,
   SkillLaunchEvent,
@@ -84,8 +102,19 @@ export {
   MemoryExtractEvent,
   MemoryDreamEvent,
   MemoryRecallEvent,
+  MemoryRecallDeliveryEvent,
+  RepeatedToolFailureGuardEvent,
 } from './types.js';
-export { makeSlashCommandEvent, makeChatCompressionEvent } from './types.js';
+export {
+  makeSlashCommandEvent,
+  makeChatCompressionEvent,
+  makeGoalStateEvent,
+  GOAL_STATE_EVENT_CAUSES,
+} from './types.js';
+export {
+  goalStateEventFromSnapshot,
+  isGoalStateEventCause,
+} from './goal-events.js';
 export type {
   ArenaSessionStartedEvent,
   ArenaAgentCompletedEvent,
@@ -97,9 +126,12 @@ export type { TelemetryEvent } from './types.js';
 export { SpanStatusCode, ValueType } from '@opentelemetry/api';
 export { SemanticAttributes } from '@opentelemetry/semantic-conventions';
 export * from './uiTelemetry.js';
+export * from './api-activity-tracker.js';
 export {
   // Core metrics functions
   recordToolCallMetrics,
+  recordToolExecutionMetrics,
+  recordRepeatedToolFailureGuardMetrics,
   recordTokenUsageMetrics,
   recordApiResponseMetrics,
   recordApiErrorMetrics,
@@ -107,6 +139,7 @@ export {
   recordInvalidChunk,
   recordContentRetry,
   recordContentRetryFailure,
+  recordApiRetry,
   // Performance monitoring functions
   recordStartupPerformance,
   recordMemoryUsage,
@@ -123,10 +156,13 @@ export {
   recordArenaSessionStartedMetrics,
   recordArenaAgentCompletedMetrics,
   recordArenaSessionEndedMetrics,
+  recordGoalStateMetrics,
   // Auto-Memory metrics functions
   recordMemoryExtractMetrics,
   recordMemoryDreamMetrics,
   recordMemoryRecallMetrics,
+  recordChannelMemoryRecallMetrics,
+  recordMemoryRecallDeliveryMetrics,
   // Performance monitoring types
   PerformanceMetricType,
   MemoryMetricType,
@@ -139,6 +175,7 @@ export { sanitizeHookName } from './sanitize.js';
 export {
   startInteractionSpan,
   endInteractionSpan,
+  withInteractionSpan,
   startLLMRequestSpan,
   endLLMRequestSpan,
   startToolSpan,
@@ -150,12 +187,18 @@ export {
   endToolBlockedOnUserSpan,
   startHookSpan,
   endHookSpan,
+  startSubagentSpan,
+  endSubagentSpan,
+  runInSubagentSpanContext,
   getActiveInteractionSpan,
+  recordInteractionActivity,
   truncateSpanError,
 } from './session-tracing.js';
 export type {
   StartInteractionOptions,
+  StartLLMRequestSpanOptions,
   EndInteractionOptions,
+  InteractionSpanResultStatus,
   LLMRequestMetadata,
   ToolSpanMetadata,
   ToolBlockedDecision,
@@ -163,13 +206,73 @@ export type {
   HookEvent,
   StartHookSpanOptions,
   HookSpanMetadata,
+  SubagentInvocationKind,
+  SubagentStatus,
+  StartSubagentSpanOptions,
+  SubagentSpanMetadata,
 } from './session-tracing.js';
+export type { TelemetryRuntimeConfig } from './runtime-config.js';
 export {
+  DAEMON_TRACEPARENT_META_KEY,
+  DAEMON_TRACESTATE_META_KEY,
+  addDaemonRequestAttribute,
+  captureDaemonTelemetryContext,
+  createDaemonBridgeTelemetry,
+  emitDaemonLog,
+  extractDaemonHttpTraceContext,
+  extractDaemonTraceContext,
+  extractInboundTraceId,
+  hashDaemonWorkspace,
+  injectDaemonTraceContext,
+  recordDaemonError,
+  recordDaemonHttpResponse,
+  runWithDaemonTelemetryContext,
+  withDaemonBridgeSpan,
+  withDaemonRequestSpan,
+  withDaemonSpan,
+  type DaemonBridgeTelemetryMetrics,
+  type DaemonRequestSpanOptions,
+} from './daemon-tracing.js';
+export {
+  initializeDaemonMetrics,
+  registerDaemonGaugeCallbacks,
+  recordDaemonHttpRequest,
+  recordDaemonSessionLifecycle,
+  recordDaemonChannelLifecycle,
+  recordDaemonPromptQueueWait,
+  recordDaemonPromptDuration,
+  recordDaemonBridgeError,
+  recordDaemonCancel,
+  recordDaemonPipeMessage,
+} from './daemon-metrics.js';
+export type {
+  DaemonGaugeCallbacks,
+  DaemonPipeDirection,
+} from './daemon-metrics.js';
+export {
+  startEventLoopLagMonitor,
+  type EventLoopLagMonitor,
+  type EventLoopLagMonitorOptions,
+  type EventLoopLagSnapshot,
+} from './event-loop-lag.js';
+export {
+  registerDaemonEventLoopLagGauge,
+  registerAcpEventLoopLagGauge,
+} from './event-loop-lag-metrics.js';
+export {
+  addAgentInputMessageAttributes,
+  addAgentOutputMessageAttributes,
+  AgentOutputMessageCapture,
   addUserPromptAttributes,
   addSystemPromptAttributes,
   addToolSchemaAttributes,
   addModelOutputAttributes,
   addToolInputAttributes,
   addToolResultAttributes,
+  addToolArgumentsAttributes,
+  addToolCallResultAttributes,
+  areSensitiveSpanAttributesEnabled,
   truncateContent,
 } from './detailed-span-attributes.js';
+export { getTraceContext, formatTraceparent } from './trace-context.js';
+export type { TraceContext } from './trace-context.js';

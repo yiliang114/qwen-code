@@ -19,7 +19,8 @@ import {
   useMemo,
   useState,
 } from 'react';
-import { type Config, createDebugLogger } from '@qwen-code/qwen-code-core';
+import type { Config } from '@qwen-code/qwen-code-core/config/config.js';
+import { createDebugLogger } from '@qwen-code/qwen-code-core/utils/debugLogger.js';
 import {
   type DialogEntry,
   useBackgroundTaskView,
@@ -29,7 +30,11 @@ const debugLogger = createDebugLogger('BG_TASK_VIEW');
 
 // ─── Types ──────────────────────────────────────────────────
 
-export type BackgroundDialogMode = 'closed' | 'list' | 'detail';
+export type BackgroundDialogMode =
+  | 'closed'
+  | 'list'
+  | 'detail'
+  | 'detail-from-panel';
 
 export interface BackgroundTaskViewState {
   /**
@@ -49,6 +54,11 @@ export interface BackgroundTaskViewState {
    * Enter to open the dialog). Mirrors the Arena tab-bar focus pattern.
    */
   pillFocused: boolean;
+  /**
+   * True when LiveAgentPanel owns keyboard focus for row navigation.
+   */
+  livePanelFocused: boolean;
+  livePanelSelectedIndex: number;
 }
 
 export interface BackgroundTaskViewActions {
@@ -62,7 +72,19 @@ export interface BackgroundTaskViewActions {
   cancelSelected(): void;
   /** Resume the currently selected paused entry. */
   resumeSelected(): Promise<void>;
+  /**
+   * Cooperatively pause or resume the selected workflow. Returns whether
+   * the registry accepted the transition, or `null` when the keypress does
+   * not apply to the selection (not a backgrounded workflow in a pausable
+   * state). A `false` verdict means the run's state changed mid-race.
+   */
+  toggleSelectedWorkflowPause(): boolean | null;
+  enterDetailFromPanel(): void;
   setPillFocused(focused: boolean): void;
+  setLivePanelFocused(focused: boolean): void;
+  setLivePanelSelectedIndex(index: number): void;
+  /** Pre-select a specific entry index before opening the dialog. */
+  setSelectedIndex(index: number): void;
 }
 
 // ─── Context ────────────────────────────────────────────────
@@ -80,6 +102,8 @@ const DEFAULT_STATE: BackgroundTaskViewState = {
   dialogMode: 'closed',
   dialogOpen: false,
   pillFocused: false,
+  livePanelFocused: false,
+  livePanelSelectedIndex: 0,
 };
 
 const noop = () => {};
@@ -92,9 +116,14 @@ const DEFAULT_ACTIONS: BackgroundTaskViewActions = {
   closeDialog: noop,
   enterDetail: noop,
   exitDetail: noop,
+  enterDetailFromPanel: noop,
   cancelSelected: noop,
   resumeSelected: async () => {},
+  toggleSelectedWorkflowPause: () => null,
   setPillFocused: noop,
+  setLivePanelFocused: noop,
+  setLivePanelSelectedIndex: noop,
+  setSelectedIndex: noop,
 };
 
 // ─── Hooks ──────────────────────────────────────────────────
@@ -123,6 +152,12 @@ export function BackgroundTaskViewProvider({
   const [rawSelectedIndex, setRawSelectedIndex] = useState(0);
   const [dialogMode, setDialogMode] = useState<BackgroundDialogMode>('closed');
   const [pillFocused, setPillFocused] = useState(false);
+  const [livePanelFocused, setLivePanelFocusedRaw] = useState(false);
+  const [livePanelSelectedIndex, setLivePanelSelectedIndex] = useState(0);
+  const setLivePanelFocused = useCallback((focused: boolean) => {
+    setLivePanelFocusedRaw(focused);
+    if (focused) setLivePanelSelectedIndex(0);
+  }, []);
   const dialogOpen = dialogMode !== 'closed';
   const hasEntries = entries.length > 0;
 
@@ -133,6 +168,11 @@ export function BackgroundTaskViewProvider({
   useEffect(() => {
     if (pillFocused && !hasEntries) setPillFocused(false);
   }, [pillFocused, hasEntries]);
+
+  const hasAgentEntries = entries.some((e) => e.kind === 'agent');
+  useEffect(() => {
+    if (livePanelFocused && !hasAgentEntries) setLivePanelFocusedRaw(false);
+  }, [livePanelFocused, hasAgentEntries]);
 
   // rawSelectedIndex can fall out of range when entries shrink; clamp on read.
   const selectedIndex =
@@ -167,9 +207,19 @@ export function BackgroundTaskViewProvider({
     setDialogMode('detail');
   }, [entries.length]);
 
+  const enterDetailFromPanel = useCallback(() => {
+    if (entries.length === 0) return;
+    setDialogMode('detail-from-panel');
+  }, [entries.length]);
+
   const exitDetail = useCallback(() => {
-    setDialogMode('list');
-  }, []);
+    if (dialogMode === 'detail-from-panel') {
+      setDialogMode('closed');
+      setLivePanelFocusedRaw(true);
+    } else {
+      setDialogMode('list');
+    }
+  }, [dialogMode]);
 
   const cancelSelected = useCallback(() => {
     if (!config) return;
@@ -179,8 +229,8 @@ export function BackgroundTaskViewProvider({
       config.abandonBackgroundAgent(target.agentId);
       return;
     }
-    // All three registries' cancel paths are no-ops on non-running
-    // entries, so no pre-check here. Shell cancel goes through
+    // Registry cancel paths are no-ops outside their actionable states,
+    // so no pre-check here. Shell cancel goes through
     // requestCancel — it triggers the AbortController only and lets the
     // spawn's settle path record the real terminal moment + outcome
     // (mirrors the task_stop tool path in #3687). Monitor cancel is
@@ -218,6 +268,16 @@ export function BackgroundTaskViewProvider({
         }
         break;
       }
+      case 'workflow':
+        // Aborts the orchestrator + in-flight dispatches via the
+        // registry's cancel — rejects queued work, flips status to
+        // 'cancelled', and signals
+        // the AbortController the WorkflowTool wired into the run.
+        // The tool's catch arm sees signal.aborted and records the
+        // terminal in the registry; the registry.cancel here is the
+        // first half of that race (idempotent on either ordering).
+        config.getWorkflowRunRegistry().cancel(target.runId, Date.now());
+        break;
       default: {
         const _exhaustive: never = target;
         throw new Error(
@@ -241,6 +301,23 @@ export function BackgroundTaskViewProvider({
     await config.resumeBackgroundAgent(target.agentId);
   }, [config, entries, selectedIndex]);
 
+  const toggleSelectedWorkflowPause = useCallback((): boolean | null => {
+    if (!config) return null;
+    const target = entries[selectedIndex];
+    if (!target || target.kind !== 'workflow' || !target.isBackgrounded) {
+      return null;
+    }
+    const registry = config.getWorkflowRunRegistry();
+    if (target.status === 'running') return registry.pause(target.runId);
+    if (target.status === 'paused') return registry.resume(target.runId);
+    // R12 (doudouOUC): `pausing` can last a full subagent dispatch, so a
+    // silent keypress reads as a stuck UI. The registry refuses the
+    // transition (returns false), which lights the existing rejection
+    // flash — same surface as any other refused pause/resume.
+    if (target.status === 'pausing') return registry.pause(target.runId);
+    return null;
+  }, [config, entries, selectedIndex]);
+
   const state: BackgroundTaskViewState = useMemo(
     () => ({
       entries,
@@ -248,8 +325,18 @@ export function BackgroundTaskViewProvider({
       dialogMode,
       dialogOpen,
       pillFocused,
+      livePanelFocused,
+      livePanelSelectedIndex,
     }),
-    [entries, selectedIndex, dialogMode, dialogOpen, pillFocused],
+    [
+      entries,
+      selectedIndex,
+      dialogMode,
+      dialogOpen,
+      pillFocused,
+      livePanelFocused,
+      livePanelSelectedIndex,
+    ],
   );
 
   const actions: BackgroundTaskViewActions = useMemo(
@@ -259,10 +346,15 @@ export function BackgroundTaskViewProvider({
       openDialog,
       closeDialog,
       enterDetail,
+      enterDetailFromPanel,
       exitDetail,
       cancelSelected,
       resumeSelected,
+      toggleSelectedWorkflowPause,
       setPillFocused,
+      setLivePanelFocused,
+      setLivePanelSelectedIndex,
+      setSelectedIndex: setRawSelectedIndex,
     }),
     [
       moveSelectionUp,
@@ -270,10 +362,15 @@ export function BackgroundTaskViewProvider({
       openDialog,
       closeDialog,
       enterDetail,
+      enterDetailFromPanel,
       exitDetail,
       cancelSelected,
       resumeSelected,
+      toggleSelectedWorkflowPause,
       setPillFocused,
+      setLivePanelFocused,
+      setLivePanelSelectedIndex,
+      setRawSelectedIndex,
     ],
   );
 

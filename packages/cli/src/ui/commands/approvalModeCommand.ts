@@ -17,7 +17,7 @@ import {
   APPROVAL_MODES,
   ApprovalMode as ApprovalModeEnum,
 } from '@qwen-code/qwen-code-core';
-import { emitAutoModeEntryNotices } from '../hooks/useAutoAcceptIndicator.js';
+import { formatApprovalModeName } from '../utils/approvalModeDisplay.js';
 
 /**
  * Parses the argument string and returns the corresponding ApprovalMode if valid.
@@ -73,6 +73,24 @@ export const approvalModeCommand: SlashCommand = {
     if (config) {
       try {
         priorMode = config.getApprovalMode();
+      } catch (e) {
+        return {
+          type: 'message',
+          messageType: 'error',
+          content: (e as Error).message,
+        };
+      }
+    }
+
+    const autoModeNotices =
+      mode === ApprovalModeEnum.AUTO &&
+      priorMode !== ApprovalModeEnum.AUTO &&
+      config
+        ? await import('../hooks/useAutoAcceptIndicator.js')
+        : undefined;
+
+    if (config) {
+      try {
         config.setApprovalMode(mode);
       } catch (e) {
         return {
@@ -86,12 +104,8 @@ export const approvalModeCommand: SlashCommand = {
     // When the user switches INTO AUTO via this command (not just via
     // Shift+Tab), emit the same first-time-acknowledgement + stripped-rules
     // notices as the keyboard handler.
-    if (
-      mode === ApprovalModeEnum.AUTO &&
-      priorMode !== ApprovalModeEnum.AUTO &&
-      config
-    ) {
-      emitAutoModeEntryNotices({
+    if (autoModeNotices && config) {
+      autoModeNotices.emitAutoModeEntryNotices({
         config,
         settings,
         addItem: context.ui.addItem,
@@ -101,7 +115,9 @@ export const approvalModeCommand: SlashCommand = {
     return {
       type: 'message',
       messageType: 'info',
-      content: t('Approval mode set to "{{mode}}"', { mode }),
+      content: t('Approval mode set to "{{mode}}"', {
+        mode: formatApprovalModeName(mode),
+      }),
     };
   },
 };
