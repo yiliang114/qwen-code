@@ -4,19 +4,20 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import {
-  FinishReason,
-  type Content,
-  type Part,
-  type PartListUnion,
-  type GenerateContentResponse,
-  type FunctionCall,
-  type FunctionDeclaration,
-  type GenerateContentResponseUsageMetadata,
+import type {
+  Content,
+  Part,
+  PartListUnion,
+  GenerateContentResponse,
+  FunctionCall,
+  FunctionDeclaration,
+  GenerateContentResponseUsageMetadata,
 } from '@google/genai';
+import { FinishReason } from './genai-compat.js';
 import type {
   ToolCallConfirmationDetails,
   ToolArtifact,
+  ToolResultBoundaryArtifact,
   ToolResult,
   ToolResultDisplay,
 } from '../tools/tools.js';
@@ -25,17 +26,23 @@ import { getResponseText } from '../utils/partUtils.js';
 import { reportError } from '../utils/errorReporting.js';
 import {
   getErrorMessage,
+  getErrorStatus,
   UnauthorizedError,
   toFriendlyError,
 } from '../utils/errors.js';
-import type { GeminiChat } from './geminiChat.js';
+import type { LlmChat } from './llm-chat.js';
 import type { RetryInfo } from '../utils/rateLimit.js';
 import {
   getThoughtSummary,
   type ThoughtSummary,
 } from '../utils/thoughtUtils.js';
 import type { LoopType } from '../telemetry/types.js';
-import type { ActiveGoal } from '../goals/activeGoalStore.js';
+import type { ActiveGoal } from '../goals/goal-legacy-projection.js';
+import type {
+  GoalSnapshotV2,
+  GoalStateCause,
+  GoalTurnPermit,
+} from '../goals/goal-protocol.js';
 import { getProviderToolCallId } from './toolCallIdUtils.js';
 
 const ERROR_REPORT_HISTORY_TAIL_COUNT = 8;
@@ -52,7 +59,7 @@ export interface ServerTool {
   ): Promise<ToolResult>;
 }
 
-export enum GeminiEventType {
+export enum LlmEventType {
   Content = 'content',
   ToolCallRequest = 'tool_call_request',
   ToolCallResponse = 'tool_call_response',
@@ -68,24 +75,29 @@ export enum GeminiEventType {
   Citation = 'citation',
   Retry = 'retry',
   HookSystemMessage = 'hook_system_message',
+  GoalSettlementFailed = 'goal_settlement_failed',
   UserPromptSubmitBlocked = 'user_prompt_submit_blocked',
   StopHookLoop = 'stop_hook_loop',
+  GoalState = 'goal_state',
   ActiveGoal = 'active_goal',
   /** The system switched to a fallback model after the primary (or prior
    *  fallback) exhausted retries on a capacity/availability error. */
   ModelFallback = 'model_fallback',
 }
 
-export type ServerGeminiRetryEvent = {
-  type: GeminiEventType.Retry;
+/** @deprecated Use `LlmEventType`; retained until a future major release. */
+export { LlmEventType as GeminiEventType };
+
+export type ServerLlmRetryEvent = {
+  type: LlmEventType.Retry;
   retryInfo?: RetryInfo;
   /** When true, the retry is a continuation (recovery) rather than a fresh
    *  restart. The UI should keep accumulated text so the continuation appends. */
   isContinuation?: boolean;
 };
 
-export type ServerGeminiModelFallbackEvent = {
-  type: GeminiEventType.ModelFallback;
+export type ServerLlmModelFallbackEvent = {
+  type: LlmEventType.ModelFallback;
   /** The model that exhausted its retry budget. */
   fromModel: string;
   /** The model the system is switching to. */
@@ -101,7 +113,7 @@ export interface StructuredError {
   status?: number;
 }
 
-export interface GeminiErrorEventValue {
+export interface LlmErrorEventValue {
   error: StructuredError;
 }
 
@@ -111,10 +123,58 @@ export interface SessionTokenLimitExceededValue {
   message: string;
 }
 
-export interface GeminiFinishedEventValue {
+export interface LlmFinishedEventValue {
   reason: FinishReason | undefined;
   usageMetadata: GenerateContentResponseUsageMetadata | undefined;
 }
+
+/**
+ * Provenance of a tool-call request. Set exclusively by in-process callers
+ * when they construct the {@link ToolCallRequestInfo} — it is NEVER parsed
+ * from tool parameters, wire protocols, or model output, and it is NEVER
+ * inferred from `isClientInitiated`. A missing origin fails closed as
+ * `{ kind: 'model' }` (the least-privileged origin).
+ *
+ * `fixed_policy` marks calls issued by the omni fixed-policy orchestrator:
+ * they bypass the interactive permission flow (no confirmation dialog, no
+ * plan/auto classification) but still honor PreToolUse hooks and the
+ * PermissionManager tool-enablement check.
+ */
+export type ToolExecutionOrigin =
+  | { kind: 'model' }
+  | { kind: 'client' }
+  | {
+      kind: 'fixed_policy';
+      /** ID of the fixed policy that issued this call. */
+      policyId: string;
+      /** Pipeline stage the policy ran in. */
+      stage: 'preprocessing' | 'transport_guard';
+    };
+
+/**
+ * Raw, successful media-policy tool artifacts captured by the scheduler
+ * BEFORE PostToolUse hook artifacts are merged in — hook-produced artifacts
+ * must never impersonate policy outputs. Carried on
+ * {@link ToolCallResponseInfo.policyArtifacts} for the fixed-policy
+ * orchestrator (and the model-call artifact bridge) to consume.
+ */
+export interface PolicyArtifactBatch {
+  /** Canonical tool name that produced the artifacts. */
+  toolName: string;
+  /** The call id of the invocation (the orchestrator uses its staging
+   * invocation id as the call id, so this keys the staging directory). */
+  invocationId: string;
+  /** Origin the call executed under (missing origins fail closed to model
+   * before this batch is built, so this is always concrete). */
+  executionOrigin: ToolExecutionOrigin;
+  /** The tool's own `ToolResult.artifacts`, unmerged and in order. */
+  artifacts: ToolArtifact[];
+}
+/** @deprecated Use `LlmErrorEventValue`; retained until a future major release. */
+export type GeminiErrorEventValue = LlmErrorEventValue;
+
+/** @deprecated Use `LlmFinishedEventValue`; retained until a future major release. */
+export type GeminiFinishedEventValue = LlmFinishedEventValue;
 
 export interface ToolCallRequestInfo {
   callId: string;
@@ -130,7 +190,25 @@ export interface ToolCallRequestInfo {
   response_id?: string;
   /** Set to true when the LLM response was truncated due to max_tokens. */
   wasOutputTruncated?: boolean;
+  goalContext?: GoalTurnPermit;
+  /**
+   * Provenance of this request. Only set by in-process callers; absent on
+   * every request materialized from model output or a wire protocol.
+   * Consumers treat a missing value as `{ kind: 'model' }` (fail closed).
+   */
+  executionOrigin?: ToolExecutionOrigin;
+  /** Parent model tool call for a programmatically dispatched child call. */
+  parentCallId?: string;
+  source?: 'model' | 'code_mode';
+  /** Exact tools an exec call may dispatch for a restricted agent. */
+  codeModeAllowedToolNames?: readonly string[];
 }
+
+export type ToolExecutionStatus =
+  | 'not_started'
+  | 'success'
+  | 'error'
+  | 'cancelled';
 
 export interface ToolCallResponseInfo {
   callId: string;
@@ -138,9 +216,27 @@ export interface ToolCallResponseInfo {
   resultDisplay: ToolResultDisplay | undefined;
   error: Error | undefined;
   errorType: ToolErrorType | undefined;
+  executionStatus?: ToolExecutionStatus;
   contentLength?: number;
+  persistedOutputFiles?: string[];
   modelOverride?: string;
+  terminateTurn?: boolean;
+  /**
+   * Set only when the call was denied because it needed user approval and the
+   * session had no way to ask for it (non-interactive mode). Headless front
+   * ends use it to suggest an approval mode; every other denial, such as a
+   * hook block or a deny rule, reports its own reason instead.
+   */
+  approvalRequired?: true;
+  visionBridgeNotice?: string;
   artifacts?: ToolArtifact[];
+  /**
+   * Raw successful artifacts of a media-policy tool, captured before
+   * PostToolUse hook artifact merging. Absent for non-media-policy tools,
+   * failed calls, and calls that produced no artifacts.
+   */
+  policyArtifacts?: PolicyArtifactBatch;
+  boundaryArtifact?: ToolResultBoundaryArtifact;
 }
 
 function normalizeRequestParts(req: PartListUnion): Part[] {
@@ -184,7 +280,7 @@ function summarizeHistoryEntry(content: Content) {
   };
 }
 
-function buildApiErrorReportContext(chat: GeminiChat, req: PartListUnion) {
+function buildApiErrorReportContext(chat: LlmChat, req: PartListUnion) {
   const requestParts = normalizeRequestParts(req);
   return {
     history: {
@@ -201,7 +297,12 @@ function buildApiErrorReportContext(chat: GeminiChat, req: PartListUnion) {
 }
 
 function duplicateProviderToolCallMessage(providerCallId: string): string {
-  return `Duplicate provider tool call id "${providerCallId}" was already handled. The duplicate tool call was ignored and not executed again.`;
+  return (
+    `Duplicate provider tool call id "${providerCallId}" was already handled. ` +
+    `The duplicate tool call was ignored and not executed again. If you ` +
+    `intended to run this tool again, re-issue the call with a new unique ` +
+    `tool-call id (or explicitly different arguments).`
+  );
 }
 
 export function createDuplicateProviderToolCallResponse(
@@ -209,6 +310,14 @@ export function createDuplicateProviderToolCallResponse(
 ): ToolCallResponseInfo {
   const providerCallId = request.providerCallId ?? request.callId;
   const message = duplicateProviderToolCallMessage(providerCallId);
+  return createNotStartedToolErrorResponse(request, message);
+}
+
+export function createNotStartedToolErrorResponse(
+  request: ToolCallRequestInfo,
+  message: string,
+  errorType: ToolErrorType = ToolErrorType.EXECUTION_FAILED,
+): ToolCallResponseInfo {
   return {
     callId: request.callId,
     responseParts: [
@@ -222,7 +331,8 @@ export function createDuplicateProviderToolCallResponse(
     ],
     resultDisplay: message,
     error: new Error(message),
-    errorType: ToolErrorType.EXECUTION_FAILED,
+    errorType,
+    executionStatus: 'not_started',
   };
 }
 
@@ -233,16 +343,25 @@ export function markDuplicateProviderToolCallResponseSent(
   duplicateProviderToolCallResponseIds.add(providerCallId);
 }
 
+/**
+ * Finds the first tool call in `items` that must trip the repeated-duplicate
+ * circuit breaker. `isReplayOfHandled` decides whether an item replays an
+ * already-handled call (same provider id AND same (name, args) fingerprint
+ * — see `isReplayOfHandledToolCall`); an id collision with different args is
+ * not a replay and never trips the breaker. A replay trips it once a
+ * synthetic duplicate response was already sent for its provider id, or when
+ * the same handled id replays more than once within one batch.
+ */
 export function findRepeatedDuplicateProviderToolCall<T>(
   items: readonly T[],
   getProviderCallId: (item: T) => string | undefined,
-  handledProviderToolCallIds: ReadonlySet<string>,
+  isReplayOfHandled: (item: T) => boolean,
   duplicateProviderToolCallResponseIds: ReadonlySet<string>,
 ): T | undefined {
   const repeatedProviderIds = new Map<string, number>();
   for (const item of items) {
     const providerCallId = getProviderCallId(item);
-    if (!providerCallId || !handledProviderToolCallIds.has(providerCallId)) {
+    if (!providerCallId || !isReplayOfHandled(item)) {
       continue;
     }
     repeatedProviderIds.set(
@@ -255,7 +374,7 @@ export function findRepeatedDuplicateProviderToolCall<T>(
     const providerCallId = getProviderCallId(item);
     return (
       providerCallId !== undefined &&
-      handledProviderToolCallIds.has(providerCallId) &&
+      isReplayOfHandled(item) &&
       (duplicateProviderToolCallResponseIds.has(providerCallId) ||
         (repeatedProviderIds.get(providerCallId) ?? 0) > 1)
     );
@@ -267,38 +386,50 @@ export interface ServerToolCallConfirmationDetails {
   details: ToolCallConfirmationDetails;
 }
 
-export type ServerGeminiContentEvent = {
-  type: GeminiEventType.Content;
+export type ServerLlmContentPart =
+  | { text: string }
+  | {
+      inlineData: {
+        data: string;
+        mimeType: string;
+        displayName?: string;
+      };
+    };
+
+export type ServerLlmContentEvent = {
+  type: LlmEventType.Content;
   value: string;
+  /** Ordered display parts, present only when the chunk contains an image. */
+  parts?: ServerLlmContentPart[];
 };
 
-export type ServerGeminiThoughtEvent = {
-  type: GeminiEventType.Thought;
+export type ServerLlmThoughtEvent = {
+  type: LlmEventType.Thought;
   value: ThoughtSummary;
 };
 
-export type ServerGeminiToolCallRequestEvent = {
-  type: GeminiEventType.ToolCallRequest;
+export type ServerLlmToolCallRequestEvent = {
+  type: LlmEventType.ToolCallRequest;
   value: ToolCallRequestInfo;
 };
 
-export type ServerGeminiToolCallResponseEvent = {
-  type: GeminiEventType.ToolCallResponse;
+export type ServerLlmToolCallResponseEvent = {
+  type: LlmEventType.ToolCallResponse;
   value: ToolCallResponseInfo;
 };
 
-export type ServerGeminiToolCallConfirmationEvent = {
-  type: GeminiEventType.ToolCallConfirmation;
+export type ServerLlmToolCallConfirmationEvent = {
+  type: LlmEventType.ToolCallConfirmation;
   value: ServerToolCallConfirmationDetails;
 };
 
-export type ServerGeminiUserCancelledEvent = {
-  type: GeminiEventType.UserCancelled;
+export type ServerLlmUserCancelledEvent = {
+  type: LlmEventType.UserCancelled;
 };
 
-export type ServerGeminiErrorEvent = {
-  type: GeminiEventType.Error;
-  value: GeminiErrorEventValue;
+export type ServerLlmErrorEvent = {
+  type: LlmEventType.Error;
+  value: LlmErrorEventValue;
 };
 
 export enum CompressionStatus {
@@ -318,8 +449,10 @@ export enum CompressionStatus {
   NOOP,
 
   /**
-   * The compression call produced a summary, but the output hit
-   * COMPACT_MAX_OUTPUT_TOKENS, indicating likely truncation. The summary
+   * The compression call produced a summary, but the output reached the
+   * requested output budget — the fixed COMPACT_MAX_OUTPUT_TOKENS ceiling
+   * or the window-clamped budget below it (issue #7960) — indicating
+   * likely truncation. The summary
    * is dropped (newHistory=null) and the attempt is treated as a failure:
    * `isCompressionFailureStatus` returns true so it counts toward the
    * per-chat circuit breaker. Kept distinct from
@@ -329,46 +462,81 @@ export enum CompressionStatus {
    * splitter). (R5.2)
    */
   COMPRESSION_FAILED_OUTPUT_TRUNCATED,
+
+  /**
+   * The compression side-query failed before producing a summary. Kept
+   * distinct from empty summaries so callers can tell API/provider failures
+   * apart from model output quality failures.
+   */
+  COMPRESSION_FAILED_API_ERROR,
+}
+
+export function isCompressionFailureStatus(
+  status: CompressionStatus | null | undefined,
+): boolean {
+  return (
+    status === CompressionStatus.COMPRESSION_FAILED_INFLATED_TOKEN_COUNT ||
+    status === CompressionStatus.COMPRESSION_FAILED_TOKEN_COUNT_ERROR ||
+    status === CompressionStatus.COMPRESSION_FAILED_EMPTY_SUMMARY ||
+    status === CompressionStatus.COMPRESSION_FAILED_OUTPUT_TRUNCATED ||
+    status === CompressionStatus.COMPRESSION_FAILED_API_ERROR
+  );
 }
 
 /**
  * Why an auto-compaction fired. Drives the user-facing notice so a
  * screenshot-overflow trigger isn't mislabeled as "approached the token
- * limit". Undefined on NOOP / failure paths and for callers that don't set it.
+ * limit" and a 413-driven compaction isn't mislabeled as a token overflow
+ * (#10380). Undefined on NOOP / failure paths and for callers that don't
+ * set it.
  */
 export type CompactionTriggerReason =
   | 'token_limit'
   | 'image_overflow'
+  | 'payload_overflow'
   | 'manual';
 
 export interface ChatCompressionInfo {
   originalTokenCount: number;
   newTokenCount: number;
+  /**
+   * Whether originalTokenCount came from a local estimate rather than an
+   * API-reported prompt count. The two compression paths measure on
+   * different scales (see #9309): /compress-fast anchors on the last
+   * API-reported prompt count (system prompt + tools + history) while a
+   * later /compress re-estimates history-only once the stored count is
+   * estimate-derived, so UIs must not present the numbers as one chain.
+   */
+  originalTokenCountIsEstimated?: boolean;
+  /** Whether newTokenCount ultimately came from a local estimate. */
+  newTokenCountIsEstimated?: boolean;
   compressionStatus: CompressionStatus;
   triggerReason?: CompactionTriggerReason;
+  /** Set when the compaction model was swapped for the main model at runtime. */
+  warning?: string;
 }
 
-export type ServerGeminiChatCompressedEvent = {
-  type: GeminiEventType.ChatCompressed;
+export type ServerLlmChatCompressedEvent = {
+  type: LlmEventType.ChatCompressed;
   value: ChatCompressionInfo | null;
 };
 
-export type ServerGeminiMaxSessionTurnsEvent = {
-  type: GeminiEventType.MaxSessionTurns;
+export type ServerLlmMaxSessionTurnsEvent = {
+  type: LlmEventType.MaxSessionTurns;
 };
 
-export type ServerGeminiSessionTokenLimitExceededEvent = {
-  type: GeminiEventType.SessionTokenLimitExceeded;
+export type ServerLlmSessionTokenLimitExceededEvent = {
+  type: LlmEventType.SessionTokenLimitExceeded;
   value: SessionTokenLimitExceededValue;
 };
 
-export type ServerGeminiFinishedEvent = {
-  type: GeminiEventType.Finished;
-  value: GeminiFinishedEventValue;
+export type ServerLlmFinishedEvent = {
+  type: LlmEventType.Finished;
+  value: LlmFinishedEventValue;
 };
 
-export type ServerGeminiLoopDetectedEvent = {
-  type: GeminiEventType.LoopDetected;
+export type ServerLlmLoopDetectedEvent = {
+  type: LlmEventType.LoopDetected;
   // The loop type is optional so historical call sites that don't produce one
   // (tests, fixtures) stay valid. Real emissions in client.ts always populate
   // it so downstream consumers can surface a concrete reason to the user.
@@ -377,26 +545,31 @@ export type ServerGeminiLoopDetectedEvent = {
   };
 };
 
-export type ServerGeminiCitationEvent = {
-  type: GeminiEventType.Citation;
+export type ServerLlmCitationEvent = {
+  type: LlmEventType.Citation;
   value: string;
 };
 
-export type ServerGeminiHookSystemMessageEvent = {
-  type: GeminiEventType.HookSystemMessage;
+export type ServerLlmHookSystemMessageEvent = {
+  type: LlmEventType.HookSystemMessage;
   value: string;
 };
 
-export type ServerGeminiUserPromptSubmitBlockedEvent = {
-  type: GeminiEventType.UserPromptSubmitBlocked;
+export type ServerLlmGoalSettlementFailedEvent = {
+  type: LlmEventType.GoalSettlementFailed;
+  value: string;
+};
+
+export type ServerLlmUserPromptSubmitBlockedEvent = {
+  type: LlmEventType.UserPromptSubmitBlocked;
   value: {
     reason: string;
     originalPrompt: string;
   };
 };
 
-export type ServerGeminiStopHookLoopEvent = {
-  type: GeminiEventType.StopHookLoop;
+export type ServerLlmStopHookLoopEvent = {
+  type: LlmEventType.StopHookLoop;
   value: {
     iterationCount: number;
     reasons: string[];
@@ -404,32 +577,123 @@ export type ServerGeminiStopHookLoopEvent = {
   };
 };
 
-export type ServerGeminiActiveGoalEvent = {
-  type: GeminiEventType.ActiveGoal;
+export type ServerLlmActiveGoalEvent = {
+  type: LlmEventType.ActiveGoal;
   value: ActiveGoal | null;
 };
 
+export type ServerLlmGoalStateEvent = {
+  type: LlmEventType.GoalState;
+  value: GoalSnapshotV2;
+  cause?: GoalStateCause;
+};
+
 // The original union type, now composed of the individual types
-export type ServerGeminiStreamEvent =
-  | ServerGeminiActiveGoalEvent
-  | ServerGeminiChatCompressedEvent
-  | ServerGeminiCitationEvent
-  | ServerGeminiContentEvent
-  | ServerGeminiErrorEvent
-  | ServerGeminiFinishedEvent
-  | ServerGeminiHookSystemMessageEvent
-  | ServerGeminiUserPromptSubmitBlockedEvent
-  | ServerGeminiStopHookLoopEvent
-  | ServerGeminiLoopDetectedEvent
-  | ServerGeminiMaxSessionTurnsEvent
-  | ServerGeminiModelFallbackEvent
-  | ServerGeminiThoughtEvent
-  | ServerGeminiToolCallConfirmationEvent
-  | ServerGeminiToolCallRequestEvent
-  | ServerGeminiToolCallResponseEvent
-  | ServerGeminiUserCancelledEvent
-  | ServerGeminiSessionTokenLimitExceededEvent
-  | ServerGeminiRetryEvent;
+export type ServerLlmStreamEvent =
+  | ServerLlmGoalStateEvent
+  | ServerLlmActiveGoalEvent
+  | ServerLlmChatCompressedEvent
+  | ServerLlmCitationEvent
+  | ServerLlmContentEvent
+  | ServerLlmErrorEvent
+  | ServerLlmFinishedEvent
+  | ServerLlmGoalSettlementFailedEvent
+  | ServerLlmHookSystemMessageEvent
+  | ServerLlmUserPromptSubmitBlockedEvent
+  | ServerLlmStopHookLoopEvent
+  | ServerLlmLoopDetectedEvent
+  | ServerLlmMaxSessionTurnsEvent
+  | ServerLlmModelFallbackEvent
+  | ServerLlmThoughtEvent
+  | ServerLlmToolCallConfirmationEvent
+  | ServerLlmToolCallRequestEvent
+  | ServerLlmToolCallResponseEvent
+  | ServerLlmUserCancelledEvent
+  | ServerLlmSessionTokenLimitExceededEvent
+  | ServerLlmRetryEvent;
+
+/** @deprecated Use `ServerLlmRetryEvent`; retained until a future major release. */
+export type ServerGeminiRetryEvent = ServerLlmRetryEvent;
+/** @deprecated Use `ServerLlmModelFallbackEvent`; retained until a future major release. */
+export type ServerGeminiModelFallbackEvent = ServerLlmModelFallbackEvent;
+/** @deprecated Use `ServerLlmContentPart`; retained until a future major release. */
+export type ServerGeminiContentPart = ServerLlmContentPart;
+/** @deprecated Use `ServerLlmContentEvent`; retained until a future major release. */
+export type ServerGeminiContentEvent = ServerLlmContentEvent;
+/** @deprecated Use `ServerLlmThoughtEvent`; retained until a future major release. */
+export type ServerGeminiThoughtEvent = ServerLlmThoughtEvent;
+/** @deprecated Use `ServerLlmToolCallRequestEvent`; retained until a future major release. */
+export type ServerGeminiToolCallRequestEvent = ServerLlmToolCallRequestEvent;
+/** @deprecated Use `ServerLlmToolCallResponseEvent`; retained until a future major release. */
+export type ServerGeminiToolCallResponseEvent = ServerLlmToolCallResponseEvent;
+/** @deprecated Use `ServerLlmToolCallConfirmationEvent`; retained until a future major release. */
+export type ServerGeminiToolCallConfirmationEvent =
+  ServerLlmToolCallConfirmationEvent;
+/** @deprecated Use `ServerLlmUserCancelledEvent`; retained until a future major release. */
+export type ServerGeminiUserCancelledEvent = ServerLlmUserCancelledEvent;
+/** @deprecated Use `ServerLlmErrorEvent`; retained until a future major release. */
+export type ServerGeminiErrorEvent = ServerLlmErrorEvent;
+/** @deprecated Use `ServerLlmChatCompressedEvent`; retained until a future major release. */
+export type ServerGeminiChatCompressedEvent = ServerLlmChatCompressedEvent;
+/** @deprecated Use `ServerLlmMaxSessionTurnsEvent`; retained until a future major release. */
+export type ServerGeminiMaxSessionTurnsEvent = ServerLlmMaxSessionTurnsEvent;
+/** @deprecated Use `ServerLlmSessionTokenLimitExceededEvent`; retained until a future major release. */
+export type ServerGeminiSessionTokenLimitExceededEvent =
+  ServerLlmSessionTokenLimitExceededEvent;
+/** @deprecated Use `ServerLlmFinishedEvent`; retained until a future major release. */
+export type ServerGeminiFinishedEvent = ServerLlmFinishedEvent;
+/** @deprecated Use `ServerLlmLoopDetectedEvent`; retained until a future major release. */
+export type ServerGeminiLoopDetectedEvent = ServerLlmLoopDetectedEvent;
+/** @deprecated Use `ServerLlmCitationEvent`; retained until a future major release. */
+export type ServerGeminiCitationEvent = ServerLlmCitationEvent;
+/** @deprecated Use `ServerLlmHookSystemMessageEvent`; retained until a future major release. */
+export type ServerGeminiHookSystemMessageEvent =
+  ServerLlmHookSystemMessageEvent;
+/** @deprecated Use `ServerLlmUserPromptSubmitBlockedEvent`; retained until a future major release. */
+export type ServerGeminiUserPromptSubmitBlockedEvent =
+  ServerLlmUserPromptSubmitBlockedEvent;
+/** @deprecated Use `ServerLlmStopHookLoopEvent`; retained until a future major release. */
+export type ServerGeminiStopHookLoopEvent = ServerLlmStopHookLoopEvent;
+/** @deprecated Use `ServerLlmActiveGoalEvent`; retained until a future major release. */
+export type ServerGeminiActiveGoalEvent = ServerLlmActiveGoalEvent;
+/** @deprecated Use `ServerLlmGoalStateEvent`; retained until a future major release. */
+export type ServerGeminiGoalStateEvent = ServerLlmGoalStateEvent;
+/** @deprecated Use `ServerLlmStreamEvent`; retained until a future major release. */
+export type ServerGeminiStreamEvent = ServerLlmStreamEvent;
+
+function getDisplayContentParts(
+  response: GenerateContentResponse,
+): ServerLlmContentPart[] {
+  const parts = response.candidates?.[0]?.content?.parts ?? [];
+  const displayParts: ServerLlmContentPart[] = [];
+
+  for (const part of parts) {
+    if (part.thought) {
+      continue;
+    }
+    if (typeof part.text === 'string' && part.text.length > 0) {
+      displayParts.push({ text: part.text });
+    }
+    const inlineData = part.inlineData;
+    if (
+      inlineData?.mimeType?.trim().toLowerCase().startsWith('image/') &&
+      typeof inlineData.data === 'string' &&
+      inlineData.data.length > 0
+    ) {
+      displayParts.push({
+        inlineData: {
+          data: inlineData.data,
+          mimeType: inlineData.mimeType,
+          ...(typeof inlineData.displayName === 'string'
+            ? { displayName: inlineData.displayName }
+            : {}),
+        },
+      });
+    }
+  }
+
+  return displayParts;
+}
 
 // A turn manages the agentic loop turn within the server context.
 export class Turn {
@@ -437,17 +701,21 @@ export class Turn {
   private pendingCitations = new Set<string>();
   finishReason: FinishReason | undefined = undefined;
   private currentResponseId?: string;
+  private readonly goalContext?: GoalTurnPermit;
 
   constructor(
-    private readonly chat: GeminiChat,
+    private readonly chat: LlmChat,
     private readonly prompt_id: string,
-  ) {}
+    goalContext?: GoalTurnPermit,
+  ) {
+    this.goalContext = goalContext ? { ...goalContext } : undefined;
+  }
   // The run method yields simpler events suitable for server logic
   async *run(
     model: string,
     req: PartListUnion,
     signal: AbortSignal,
-  ): AsyncGenerator<ServerGeminiStreamEvent> {
+  ): AsyncGenerator<ServerLlmStreamEvent> {
     try {
       // Note: This assumes `sendMessageStream` yields events like
       // { type: StreamEventType.RETRY } or { type: StreamEventType.CHUNK, value: GenerateContentResponse }
@@ -460,11 +728,12 @@ export class Turn {
           },
         },
         this.prompt_id,
+        this.goalContext,
       );
 
       for await (const streamEvent of responseStream) {
         if (signal?.aborted) {
-          yield { type: GeminiEventType.UserCancelled };
+          yield { type: LlmEventType.UserCancelled };
           return;
         }
 
@@ -475,7 +744,7 @@ export class Turn {
           this.pendingCitations.clear();
           this.finishReason = undefined;
           yield {
-            type: GeminiEventType.Retry,
+            type: LlmEventType.Retry,
             retryInfo: streamEvent.retryInfo,
             isContinuation: streamEvent.isContinuation,
           };
@@ -492,7 +761,7 @@ export class Turn {
           this.finishReason = undefined;
           this.currentResponseId = undefined;
           yield {
-            type: GeminiEventType.ModelFallback,
+            type: LlmEventType.ModelFallback,
             fromModel: streamEvent.info.fromModel,
             toModel: streamEvent.info.toModel,
             statusCode: streamEvent.info.statusCode,
@@ -505,10 +774,10 @@ export class Turn {
         // as the top-level ChatCompressed event so existing UI handlers stay
         // connected. This bridge is the primary path for auto-compaction
         // events; manual /compress emits its own ChatCompressed in
-        // GeminiClient.tryCompressChat.
+        // LlmClient.tryCompressChat.
         if (streamEvent.type === 'compressed') {
           yield {
-            type: GeminiEventType.ChatCompressed,
+            type: LlmEventType.ChatCompressed,
             value: streamEvent.info,
           };
           continue;
@@ -526,14 +795,20 @@ export class Turn {
         const thoughtSummary = getThoughtSummary(resp);
         if (thoughtSummary) {
           yield {
-            type: GeminiEventType.Thought,
+            type: LlmEventType.Thought,
             value: thoughtSummary,
           };
         }
 
-        const text = getResponseText(resp);
-        if (text) {
-          yield { type: GeminiEventType.Content, value: text };
+        const text = getResponseText(resp) ?? '';
+        const displayParts = getDisplayContentParts(resp);
+        const hasImage = displayParts.some((part) => 'inlineData' in part);
+        if (text || hasImage) {
+          yield {
+            type: LlmEventType.Content,
+            value: text,
+            ...(hasImage ? { parts: displayParts } : {}),
+          };
         }
 
         // Handle function calls (requesting tool execution)
@@ -564,7 +839,7 @@ export class Turn {
 
           if (this.pendingCitations.size > 0) {
             yield {
-              type: GeminiEventType.Citation,
+              type: LlmEventType.Citation,
               value: `Citations:\n${[...this.pendingCitations].sort().join('\n')}`,
             };
             this.pendingCitations.clear();
@@ -572,7 +847,7 @@ export class Turn {
 
           this.finishReason = finishReason;
           yield {
-            type: GeminiEventType.Finished,
+            type: LlmEventType.Finished,
             value: {
               reason: finishReason,
               usageMetadata: resp.usageMetadata,
@@ -582,11 +857,12 @@ export class Turn {
       }
     } catch (e) {
       if (signal.aborted) {
-        yield { type: GeminiEventType.UserCancelled };
+        yield { type: LlmEventType.UserCancelled };
         // Regular cancellation error, fail gracefully.
         return;
       }
 
+      const originalStatus = getErrorStatus(e);
       const error = toFriendlyError(e);
       if (error instanceof UnauthorizedError) {
         throw error;
@@ -614,26 +890,19 @@ export class Turn {
         'Turn.run-sendMessageStream',
         { contextAlreadySummarized: true },
       );
-      const status =
-        typeof error === 'object' &&
-        error !== null &&
-        'status' in error &&
-        typeof (error as { status: unknown }).status === 'number'
-          ? (error as { status: number }).status
-          : undefined;
       const structuredError: StructuredError = {
         message: getErrorMessage(error),
-        status,
+        status: getErrorStatus(error) ?? originalStatus,
       };
       await this.chat.maybeIncludeSchemaDepthContext(structuredError);
-      yield { type: GeminiEventType.Error, value: { error: structuredError } };
+      yield { type: LlmEventType.Error, value: { error: structuredError } };
       return;
     }
   }
 
   private handlePendingFunctionCall(
     fnCall: FunctionCall,
-  ): ServerGeminiStreamEvent | null {
+  ): ServerLlmStreamEvent | null {
     const callId =
       fnCall.id ??
       `${fnCall.name}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -649,12 +918,13 @@ export class Turn {
       isClientInitiated: false,
       prompt_id: this.prompt_id,
       response_id: this.currentResponseId,
+      ...(this.goalContext ? { goalContext: { ...this.goalContext } } : {}),
     };
 
     this.pendingToolCalls.push(toolCallRequest);
 
     // Yield a request for the tool call, not the pending/confirming status
-    return { type: GeminiEventType.ToolCallRequest, value: toolCallRequest };
+    return { type: LlmEventType.ToolCallRequest, value: toolCallRequest };
   }
 }
 

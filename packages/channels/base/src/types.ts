@@ -1,13 +1,15 @@
+import type { RequestPermissionResponse } from '@agentclientprotocol/sdk';
 import type { ChannelAgentBridge } from './ChannelAgentBridge.js';
 import type { ChannelBase, ChannelBaseOptions } from './ChannelBase.js';
 import type { ChannelWebhookConfig } from './ChannelWebhookTask.js';
 
 export type SenderPolicy = 'allowlist' | 'pairing' | 'open';
-export type SessionScope = 'user' | 'thread' | 'single';
+export type SessionScope = 'user' | 'thread' | 'chat_thread' | 'single';
 export type ChannelType = string;
-export type GroupPolicy = 'disabled' | 'allowlist' | 'open';
+export type GroupPolicy = 'disabled' | 'allowlist' | 'pairing' | 'open';
 export type DmPolicy = 'disabled' | 'open';
 export type DispatchMode = 'collect' | 'steer' | 'followup';
+export type ChannelOutputMode = 'per_task' | 'per_response' | 'per_turn';
 
 export interface ChannelIdentityConfig {
   id?: string;
@@ -39,18 +41,6 @@ export interface GroupConfig {
   groupHistoryLimit?: number;
 }
 
-export interface BlockStreamingChunkConfig {
-  /** Minimum characters before emitting a block. Default: 400. */
-  minChars?: number;
-  /** Force-emit when buffer exceeds this size. Default: 1000. */
-  maxChars?: number;
-}
-
-export interface BlockStreamingCoalesceConfig {
-  /** Emit buffered text after this many ms of inactivity. Default: 1500. */
-  idleMs?: number;
-}
-
 export interface ChannelConfig {
   type: ChannelType;
   token: string;
@@ -58,7 +48,10 @@ export interface ChannelConfig {
   clientSecret?: string;
   senderPolicy: SenderPolicy;
   allowedUsers: string[];
+  /** Channel routing scope. `thread` is retained for existing configurations only. */
   sessionScope: SessionScope;
+  /** Retain an owner-scoped catalog of named sessions in daemon-managed mode. */
+  multiSession?: boolean;
   cwd: string;
   approvalMode?: string;
   instructions?: string;
@@ -66,6 +59,8 @@ export interface ChannelConfig {
   memoryScope?: ChannelMemoryScopeConfig;
   webhooks?: ChannelWebhookConfig;
   model?: string;
+  /** Output grouping for opted-in adapters. Defaults to `per_turn`. */
+  outputMode?: ChannelOutputMode;
   groupPolicy: GroupPolicy; // default: "disabled"
   dmPolicy: DmPolicy; // default: "open"
   groupHistoryLimit?: number;
@@ -74,12 +69,8 @@ export interface ChannelConfig {
   /** Dispatch mode for concurrent messages. Default: 'steer' (resolved in ChannelBase.handleInbound). */
   dispatchMode?: DispatchMode;
 
-  /** Enable block streaming — emit completed blocks as separate messages. */
-  blockStreaming?: 'on' | 'off';
-  /** Chunk size bounds for block streaming. */
-  blockStreamingChunk?: BlockStreamingChunkConfig;
-  /** Idle coalescing for block streaming. */
-  blockStreamingCoalesce?: BlockStreamingCoalesceConfig;
+  /** Poll interval in ms for polling adapters. Default: 60000. */
+  pollInterval?: number;
 }
 
 export interface Attachment {
@@ -100,7 +91,16 @@ export interface Envelope {
   senderId: string;
   senderName: string;
   chatId: string;
+  chatName?: string;
   text: string;
+  /**
+   * `text` is an adapter-synthesized placeholder (`(image)`, `(voice
+   * message)`, `(file: …)`) rather than something the user typed.
+   *
+   * It is never recorded as quoted group history, where it would reach
+   * the next prompt as if a member had typed it.
+   */
+  syntheticText?: true;
   threadId?: string;
   /** Platform-specific message ID for response correlation. */
   messageId?: string;
@@ -109,12 +109,31 @@ export interface Envelope {
   isReplyToBot: boolean;
   /** Text of the message being replied to (quoted/referenced message). */
   referencedText?: string;
+  /**
+   * Stable identifiers (staffId preferred, platform ID fallback) of non-bot
+   * members mentioned alongside the bot in a group message, deduplicated and
+   * excluding the bot itself. Kept separate from `text` (like `metadata`) so
+   * slash-command parsing sees the message body alone; ChannelBase renders it
+   * as a `[Mentioned …]` wrapper AFTER prompt sanitization so the delivered
+   * format stays uniform regardless of the identifier list length.
+   * Rendered only when sender attribution is rendered (group/single-scope,
+   * not `alreadyPrefixed`, not a recognized slash command) — self-prefixing
+   * adapters must render it themselves. Group history backfill records the
+   * message body only; mention IDs are intentionally not persisted.
+   */
+  mentionedMemberIds?: string[];
   /** Base64-encoded image data (e.g. from WeChat CDN download). */
   imageBase64?: string;
   /** MIME type for the image (e.g. "image/jpeg", "image/png"). */
   imageMimeType?: string;
   /** Structured attachments (images, files, audio, video). */
   attachments?: Attachment[];
+  /**
+   * Contextual metadata (e.g. issue type, title, URL) kept separate from `text`
+   * so slash-command parsing operates on the comment body alone. Appended to
+   * the prompt after command parsing, sanitized via sanitizePromptText.
+   */
+  metadata?: string;
   /**
    * Marks an envelope whose `text` ALREADY carries its `[sender]` attribution, so
    * handleInbound must NOT re-prefix it. Set in two places: on a synthetic
@@ -135,11 +154,134 @@ export interface SessionTarget {
   isGroup?: boolean;
 }
 
+export interface ObservedChannelIdentity {
+  id: string;
+  label: string;
+}
+
+export interface ObservedChannelContactObservation {
+  user: ObservedChannelIdentity;
+  group?: ObservedChannelIdentity;
+  topic?: ObservedChannelIdentity;
+}
+
+export interface ObservedChannelContact extends ObservedChannelIdentity {
+  channelName: string;
+  lastObservedAt: string;
+}
+
+export interface ObservedChannelRelatedContact extends ObservedChannelIdentity {
+  lastObservedAt: string;
+}
+
+export interface ObservedChannelTopic extends ObservedChannelRelatedContact {
+  users: ObservedChannelRelatedContact[];
+}
+
+export interface ObservedChannelGroup extends ObservedChannelContact {
+  users: ObservedChannelRelatedContact[];
+  topics: ObservedChannelTopic[];
+}
+
+export interface ObservedChannelContactGraph {
+  users: ObservedChannelContact[];
+  groups: ObservedChannelGroup[];
+}
+
+export interface ChannelPromptOwner {
+  kind: 'channel_user';
+  id: string;
+}
+
+export type UserInputPresentationResult =
+  | { kind: 'presented' }
+  | { kind: 'handled' }
+  | { kind: 'unsupported' };
+
+export type UserInputSettlementReason =
+  | 'resolved_outside_presenter'
+  | 'cancelled'
+  | 'run_cancelled';
+
+export type ChannelUserInputResponse = RequestPermissionResponse & {
+  answers?: Record<string, string>;
+};
+
+export interface ChannelUserQuestion {
+  answerKey: string;
+  header: string;
+  question: string;
+  options: Array<{
+    label: string;
+    description: string;
+  }>;
+  multiSelect: boolean;
+}
+
+export interface ChannelUserInputRequestContext {
+  requestId: string;
+  sessionId: string;
+  runId: string;
+  owner: ChannelPromptOwner;
+  target: SessionTarget;
+  sourceLabel?: string;
+  precedingSegmentId?: string;
+  questions: ChannelUserQuestion[];
+  submitOptionId: string;
+  onSettled(listener: (reason: UserInputSettlementReason) => void): () => void;
+  respond(response: ChannelUserInputResponse): Promise<boolean>;
+}
+
+export type ChannelPermissionDecision = 'allow_once' | 'allow_always' | 'deny';
+
+export interface ChannelPermissionRequestContext {
+  requestId: string;
+  sessionId: string;
+  runId: string;
+  owner: ChannelPromptOwner;
+  target: SessionTarget;
+  precedingSegmentId?: string;
+  title: string;
+  decisions: Array<{
+    kind: ChannelPermissionDecision;
+    label: string;
+  }>;
+  onSettled(listener: (reason: UserInputSettlementReason) => void): () => void;
+  respond(decision: ChannelPermissionDecision): Promise<boolean>;
+}
+
+export interface ChannelOutputSegmentContext {
+  channelName: string;
+  sessionId: string;
+  runId: string;
+  segmentId: string;
+  owner: ChannelPromptOwner;
+  target: SessionTarget;
+  sourceLabel?: string;
+  messageId?: string;
+  partial?: boolean;
+}
+
+export type ChannelOutputSegmentEndReason =
+  | 'response_boundary'
+  | 'input_requested'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export interface ChannelProactiveTarget {
+  channelName: string;
+  type: 'user' | 'chat';
+  id: string;
+}
+
 export interface ChannelTaskLifecycleBase {
   channelName: string;
   chatId: string;
   sessionId: string;
   messageId?: string;
+  runId?: string;
+  owner?: ChannelPromptOwner;
   identity: ChannelRuntimeIdentity;
   memoryScope: ChannelRuntimeMemoryScope;
 }
@@ -159,6 +301,7 @@ export interface SanitizedToolCallEvent {
 /** 'dropped' = loop was disabled/deleted mid-run (not user-cancelled). */
 export type ChannelTaskCancellationReason =
   | 'cancel_command'
+  | 'runtime_cancelled'
   | 'clear'
   | 'steer'
   | 'timeout'
@@ -207,6 +350,7 @@ export interface ChannelMemoryEntry {
 
 export interface ChannelMemoryCallbacks {
   readChannelMemory(target: ChannelMemoryTarget): Promise<string>;
+  getChannelMemoryRevision?(target: ChannelMemoryTarget): Promise<string>;
   listChannelMemoryEntries(
     target: ChannelMemoryTarget,
   ): Promise<ChannelMemoryEntry[]>;
@@ -236,7 +380,18 @@ export interface ChannelMemoryCallbacks {
 }
 
 export type ChannelMemoryIntentClassifierResult =
-  | { intent: 'remember'; memory: string; confidence: number }
+  | {
+      intent: 'remember';
+      memory: string;
+      memories?: never;
+      confidence: number;
+    }
+  | {
+      intent: 'remember';
+      memory?: never;
+      memories: string[];
+      confidence: number;
+    }
   | { intent: 'list'; targetIds?: string[]; confidence: number }
   | { intent: 'inspect' | 'remove'; targetIds: string[]; confidence: number }
   | {
@@ -252,6 +407,114 @@ export interface ChannelMemoryIntentClassifier {
     text: string,
     entries?: readonly ChannelMemoryEntry[],
   ): Promise<ChannelMemoryIntentClassifierResult>;
+}
+
+export type ChannelConfigFieldKind =
+  | 'string'
+  | 'secret'
+  | 'boolean'
+  | 'number'
+  | 'enum'
+  | 'string-list'
+  | 'record'
+  | 'object';
+
+interface ChannelConfigFieldDescriptorBase {
+  key: string;
+  label: string;
+  options?: ReadonlyArray<{ value: string; label: string }>;
+  default?: string;
+  description?: string;
+}
+
+export interface ChannelConfigValueFieldDescriptor
+  extends ChannelConfigFieldDescriptorBase {
+  kind: 'string' | 'secret';
+  required?: boolean;
+  envResolvable?: boolean;
+  /** Render the field as a multi-line text area in management UIs. */
+  multiline?: boolean;
+  properties?: never;
+}
+
+export interface ChannelConfigPlainValueFieldDescriptor
+  extends ChannelConfigFieldDescriptorBase {
+  kind: 'boolean' | 'string-list' | 'record';
+  required?: boolean;
+  envResolvable?: never;
+  multiline?: never;
+  properties?: never;
+}
+
+export interface ChannelConfigEnumFieldDescriptor
+  extends ChannelConfigFieldDescriptorBase {
+  kind: 'enum';
+  required?: boolean;
+  envResolvable?: never;
+  multiline?: never;
+  options: ReadonlyArray<{ value: string; label: string }>;
+  properties?: never;
+}
+
+export interface ChannelConfigNumberFieldDescriptor
+  extends ChannelConfigFieldDescriptorBase {
+  kind: 'number';
+  required?: boolean;
+  envResolvable?: never;
+  multiline?: never;
+  exclusiveMinimum?: number;
+  properties?: never;
+}
+
+export interface ChannelConfigObjectFieldDescriptor
+  extends ChannelConfigFieldDescriptorBase {
+  kind: 'object';
+  required?: false;
+  envResolvable?: never;
+  multiline?: never;
+  properties: readonly ChannelConfigNestedFieldDescriptor[];
+}
+
+export type ChannelConfigNestedFieldDescriptor =
+  | (Omit<
+      ChannelConfigValueFieldDescriptor,
+      'kind' | 'envResolvable' | 'multiline'
+    > & {
+      kind: Exclude<
+        ChannelConfigFieldKind,
+        'secret' | 'enum' | 'number' | 'object'
+      >;
+      envResolvable?: never;
+      multiline?: never;
+    })
+  | (Omit<ChannelConfigEnumFieldDescriptor, 'kind' | 'envResolvable'> & {
+      kind: 'enum';
+      envResolvable?: never;
+    })
+  | (Omit<ChannelConfigNumberFieldDescriptor, 'kind' | 'envResolvable'> & {
+      kind: 'number';
+      envResolvable?: never;
+    })
+  | ChannelConfigObjectFieldDescriptor;
+
+export type ChannelConfigFieldDescriptor =
+  | ChannelConfigValueFieldDescriptor
+  | ChannelConfigPlainValueFieldDescriptor
+  | ChannelConfigEnumFieldDescriptor
+  | ChannelConfigNumberFieldDescriptor
+  | ChannelConfigObjectFieldDescriptor;
+
+export interface ChannelManagementDescriptor {
+  fields: readonly ChannelConfigFieldDescriptor[];
+
+  /**
+   * Cross-field validation applied to the resolved config during managed
+   * upserts, after secret updates. Return an error message to reject the
+   * update, or undefined to accept it.
+   */
+  validateConfig?: (
+    config: Readonly<Record<string, unknown>>,
+  ) => string | undefined;
 }
 
 /**
@@ -274,6 +537,18 @@ export interface ChannelPlugin {
 
   /** Optional config fields whose string values may reference environment vars. */
   envResolvableConfigFields?: string[];
+
+  /** Opt in to shared task, response, and turn output grouping. */
+  supportsOutputMode?: boolean;
+
+  /** Serializable metadata for safe configuration management. */
+  management?: ChannelManagementDescriptor;
+
+  /**
+   * Default Channel routing scope (applied when config omits sessionScope).
+   * `thread` is retained for existing configurations only.
+   */
+  defaultSessionScope?: SessionScope;
 
   /** Create a channel adapter instance. */
   createChannel(

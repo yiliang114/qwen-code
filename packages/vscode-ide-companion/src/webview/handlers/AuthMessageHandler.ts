@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { logger } from '../../utils/logger.js';
 import * as vscode from 'vscode';
 import { BaseMessageHandler } from './BaseMessageHandler.js';
 import { getErrorMessage } from '../../utils/errorMessage.js';
@@ -48,10 +49,7 @@ export class AuthMessageHandler extends BaseMessageHandler {
         break;
 
       default:
-        console.warn(
-          '[AuthMessageHandler] Unknown message type:',
-          message.type,
-        );
+        logger.warn('[AuthMessageHandler] Unknown message type:', message.type);
         break;
     }
   }
@@ -85,7 +83,7 @@ export class AuthMessageHandler extends BaseMessageHandler {
       });
     } catch (error) {
       const errorMsg = getErrorMessage(error);
-      console.error('[AuthMessageHandler] getAccountInfo failed:', error);
+      logger.error('[AuthMessageHandler] getAccountInfo failed:', error);
       this.sendToWebView({
         type: 'accountInfo',
         data: { error: errorMsg },
@@ -217,7 +215,7 @@ export class AuthMessageHandler extends BaseMessageHandler {
 
       const provider = ALL_PROVIDERS.find((p) => p.id === selectedId);
       if (!provider) {
-        console.error('[AuthMessageHandler] Provider not found:', selectedId);
+        logger.error('[AuthMessageHandler] Provider not found:', selectedId);
         return;
       }
 
@@ -225,7 +223,7 @@ export class AuthMessageHandler extends BaseMessageHandler {
       await this.runProviderSetupFlow(provider);
     } catch (error) {
       const errorMsg = getErrorMessage(error);
-      console.error('[AuthMessageHandler] auth failed:', error);
+      logger.error('[AuthMessageHandler] auth failed:', error);
       this.sendToWebView({
         type: 'authError',
         data: { message: `Auth failed: ${errorMsg}` },
@@ -252,6 +250,7 @@ export class AuthMessageHandler extends BaseMessageHandler {
       // implementation detail; QuickPick should show human-readable labels.
       const protocolLabels: Record<string, string> = {
         [AuthType.USE_OPENAI]: 'OpenAI Compatible',
+        [AuthType.USE_OPENAI_RESPONSES]: 'OpenAI Responses',
         [AuthType.USE_ANTHROPIC]: 'Anthropic',
         [AuthType.USE_GEMINI]: 'Gemini',
       };
@@ -409,7 +408,7 @@ export class AuthMessageHandler extends BaseMessageHandler {
 
     // Submit
     if (!this.authInteractiveHandler) {
-      console.error(
+      logger.error(
         '[AuthMessageHandler] authInteractiveHandler not set; cannot apply provider config.',
       );
       // No authCancelled — see the base-URL validation note above.

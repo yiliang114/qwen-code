@@ -15,6 +15,9 @@ import {
   readJson,
   validateVersion,
 } from './lib/release-helpers.js';
+import { PUBLISHED_PACKAGES } from './assert-release-version.mjs';
+
+export { PUBLISHED_PACKAGES };
 
 function getVersionFromNPM(distTag) {
   const command = `npm view @qwen-code/qwen-code version --tag=${distTag}`;
@@ -177,19 +180,21 @@ function detectRollbackAndGetBaseline(npmDistTag) {
 }
 
 function doesVersionExist(version) {
-  // Check NPM
-  try {
-    const command = `npm view @qwen-code/qwen-code@${version} version 2>/dev/null`;
-    const output = execSync(command).toString().trim();
-    if (output === version) {
-      console.error(`Version ${version} already exists on NPM.`);
-      return true;
+  // Check NPM across all published packages
+  for (const pkg of PUBLISHED_PACKAGES) {
+    try {
+      const command = `npm view ${pkg}@${version} version 2>/dev/null`;
+      const output = execSync(command).toString().trim();
+      if (output === version) {
+        console.error(`Version ${version} already exists on NPM (${pkg}).`);
+        return true;
+      }
+    } catch {
+      // Missing packages and transient registry failures are best effort here.
     }
-  } catch (_error) {
-    // This is expected if the version doesn't exist.
   }
 
-  // Check Git tags
+  // Check local Git tags.
   try {
     const command = `git tag -l 'v${version}'`;
     const tagOutput = execSync(command).toString().trim();
@@ -247,10 +252,41 @@ function getAndVerifyTags(npmDistTag, _gitTagPattern) {
   };
 }
 
+function listExistingStableTags() {
+  const output = execSync(`git tag -l 'v*'`).toString();
+  return output
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((tag) => /^v\d+\.\d+\.\d+$/.test(tag) && semver.valid(tag))
+    .sort(semver.rcompare);
+}
+
 function getLatestStableReleaseTag() {
   try {
     const result = getAndVerifyTags('latest', 'v[0-9].[0-9].[0-9]');
-    return result ? result.latestTag : '';
+    if (!result) return '';
+    const npmDerivedTag = result.latestTag;
+    let existingTags;
+    try {
+      existingTags = listExistingStableTags();
+    } catch (gitError) {
+      // Without a tag listing we cannot verify; keep the npm-derived tag as
+      // before rather than dropping the release-notes anchor entirely.
+      console.error(
+        `Could not list git tags to verify ${npmDerivedTag} (${gitError.message}); using the npm-derived tag as-is.`,
+      );
+      return npmDerivedTag;
+    }
+    if (existingTags.includes(npmDerivedTag)) return npmDerivedTag;
+    // A half-shipped release can leave the npm baseline ahead of any git tag
+    // (npm publish succeeded, tag creation failed). Anchoring the release
+    // notes at a tag that does not exist makes GitHub fall back to the entire
+    // branch history, so anchor at the latest stable tag that does exist.
+    const fallbackTag = existingTags[0] ?? '';
+    console.error(
+      `npm-derived previous tag ${npmDerivedTag} does not exist in git; falling back to ${fallbackTag || '<none>'}.`,
+    );
+    return fallbackTag;
   } catch (error) {
     console.error(
       `Failed to determine latest stable release tag: ${error.message}`,
@@ -335,8 +371,28 @@ function getPreviewVersion(args) {
     );
     releaseVersion = overrideVersion;
   } else if (tagResult) {
-    releaseVersion =
-      tagResult.latestVersion.replace(/-nightly.*/, '') + '-preview.0';
+    let baseVersion = tagResult.latestVersion.replace(/-nightly.*/, '');
+    // When the nightly base is already published as stable, the preview must
+    // target the next patch — otherwise the scheduled Tuesday release derives
+    // a version whose channel packages already exist on npm (E403).
+    // Use the rollback-aware lookup so a rolled-back dist-tag doesn't produce
+    // a retrograde preview base.
+    const latestTagResult = getAndVerifyTags('latest', 'v[0-9].[0-9].[0-9]');
+    const latestStable = latestTagResult?.latestVersion ?? '';
+    if (
+      latestStable &&
+      semver.valid(latestStable) &&
+      semver.valid(baseVersion)
+    ) {
+      if (semver.gte(latestStable, baseVersion)) {
+        const bumped = semver.inc(latestStable, 'patch');
+        console.error(
+          `Nightly base ${baseVersion} is at or below published latest ${latestStable}; bumping preview base to ${bumped}.`,
+        );
+        baseVersion = bumped;
+      }
+    }
+    releaseVersion = baseVersion + '-preview.0';
     validateVersion(
       releaseVersion,
       'X.Y.Z-preview.N',
@@ -469,6 +525,27 @@ export function getVersion(options = {}) {
   return result;
 }
 
+/**
+ * CLI dispatch, exported for tests: prints the version JSON and returns the
+ * exit code.
+ *
+ * The push-time guard is deliberately *not* reachable from here. This file is
+ * supplied by the operator-selected release ref, while the guard must run from
+ * the workflow-pinned SHA — `release.yml` invokes
+ * `.release-workflow/scripts/assert-release-version.mjs` directly, and
+ * `scripts/tests/release-workflow.test.js` forbids the
+ * `node scripts/get-release-version.js --assert-unreleased=` spelling. Adding a
+ * dispatch back here would let a ref that has already shipped supply its own
+ * relaxed guard and force-push over a published version.
+ */
+export function runCli(args) {
+  console.log(JSON.stringify(getVersion(args), null, 2));
+  return 0;
+}
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  console.log(JSON.stringify(getVersion(getArgs()), null, 2));
+  const exitCode = runCli(getArgs());
+  if (exitCode !== 0) {
+    process.exit(exitCode);
+  }
 }

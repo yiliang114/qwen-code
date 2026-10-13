@@ -117,4 +117,142 @@ describe('DialogShell', () => {
 
     expect(onClose).not.toHaveBeenCalled();
   });
+
+  it('ignores backdrop clicks and Escape when not dismissible', () => {
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    const onClose = vi.fn();
+
+    act(() => {
+      root!.render(
+        <I18nProvider language="en">
+          <ThemeProvider value="dark">
+            <DialogShell title="Locked" onClose={onClose} dismissible={false}>
+              <button type="button" data-testid="locked-focus">
+                locked
+              </button>
+            </DialogShell>
+          </ThemeProvider>
+        </I18nProvider>,
+      );
+    });
+
+    const backdrop = document.querySelector<HTMLElement>(
+      '[data-slot="dialog-overlay"]',
+    )!;
+    act(() => {
+      backdrop.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      backdrop.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+      backdrop.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    expect(onClose).not.toHaveBeenCalled();
+
+    const target = document.querySelector<HTMLElement>(
+      '[data-testid="locked-focus"]',
+    )!;
+    act(() =>
+      target.dispatchEvent(
+        new KeyboardEvent('keydown', {
+          bubbles: true,
+          cancelable: true,
+          key: 'Escape',
+        }),
+      ),
+    );
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it('sizes the auto dialog to its content instead of a fixed step', () => {
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+
+    act(() => {
+      root!.render(
+        <I18nProvider language="en">
+          <ThemeProvider value="dark">
+            <DialogShell title="Auto" size="auto" onClose={vi.fn()}>
+              <button type="button">body</button>
+            </DialogShell>
+          </ThemeProvider>
+        </I18nProvider>,
+      );
+    });
+
+    const panel = document.querySelector<HTMLElement>(
+      '[data-web-shell-dialog]',
+    )!;
+    // tailwind-merge has to drop DialogContent's base `w-full`, or the panel
+    // stays full-width and never tracks the content.
+    expect(panel.className).toContain('w-max');
+    expect(panel.className).not.toContain('w-full');
+    // The floor has to subtract the same gutter the surviving base ceiling
+    // (`max-w-[calc(100%-2rem)]`) reserves. twMerge keeps both classes, and
+    // below `sm:` a bare `min(100%,560px)` floor outranks that ceiling, so the
+    // panel would render flush to both screen edges on a phone.
+    expect(panel.className).toContain('min-w-[min(calc(100%-2rem),560px)]');
+    expect(panel.className).not.toContain('min-w-[min(100%,560px)]');
+    expect(panel.className).toContain('max-w-[calc(100%-2rem)]');
+    expect(panel.className).toContain(
+      'sm:max-w-[min(calc(100vw-2rem),1120px)]',
+    );
+    expect(panel.className).not.toContain('sm:max-w-sm');
+  });
+
+  it('keeps fixed sizes full-width up to their cap', () => {
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+
+    act(() => {
+      root!.render(
+        <I18nProvider language="en">
+          <ThemeProvider value="dark">
+            <DialogShell title="Large" size="lg" onClose={vi.fn()}>
+              <button type="button">body</button>
+            </DialogShell>
+          </ThemeProvider>
+        </I18nProvider>,
+      );
+    });
+
+    const panel = document.querySelector<HTMLElement>(
+      '[data-web-shell-dialog]',
+    )!;
+    expect(panel.className).toContain('w-full');
+    expect(panel.className).toContain('sm:max-w-[720px]');
+    expect(panel.className).not.toContain('w-max');
+  });
+
+  it('uses expand and shrink icons for fullscreen', () => {
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+
+    act(() => {
+      root!.render(
+        <I18nProvider language="en">
+          <ThemeProvider value="dark">
+            <DialogShell title="Fullscreen" allowFullscreen onClose={vi.fn()}>
+              body
+            </DialogShell>
+          </ThemeProvider>
+        </I18nProvider>,
+      );
+    });
+
+    const toggle = document.querySelector<HTMLButtonElement>(
+      '[aria-label="Fullscreen"]',
+    )!;
+    expect(toggle.querySelector('.lucide-expand')).not.toBeNull();
+
+    act(() => toggle.click());
+
+    expect(
+      document
+        .querySelector('[aria-label="Exit fullscreen"]')
+        ?.querySelector('.lucide-shrink'),
+    ).not.toBeNull();
+  });
 });

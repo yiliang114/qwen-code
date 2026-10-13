@@ -1,28 +1,43 @@
 import type { CommandModule } from 'yargs';
 import { canonicalizeWorkspace } from '@qwen-code/acp-bridge/workspacePaths';
 import {
+  CHANNEL_WORKER_KILL_GRACE_MS,
+  CHANNEL_WORKER_STOP_GRACE_MS,
+} from '@qwen-code/acp-bridge/channelControlTimeouts';
+import {
   addChannelMemoryEntries,
   clearChannelMemory,
+  getChannelMemoryRevision,
   listChannelMemoryEntries,
+  nextFireTime,
   readChannelMemory,
+  recordChannelMemoryRecallMetrics,
   removeChannelMemoryEntries,
   updateChannelMemoryEntry,
 } from '@qwen-code/qwen-code-core';
 import { loadSettings } from '../../config/settings.js';
+import { resolveLanguage, resolveLanguageSetting } from '../../i18n/index.js';
+import { scrubAndReportInheritedLoaderEnv } from '../../config/shared-env-keys.js';
 import {
+  ChannelLoopScheduler,
+  ChannelLoopStore,
   DaemonChannelBridge,
+  isChannelProactiveDeliveryError,
   sanitizeLogText,
   SessionRouter,
 } from '@qwen-code/channel-base';
 import type {
   ChannelAgentBridge,
   ChannelBase,
+  ChannelLoopRunner,
   ChannelWebhookRunOptions,
   ChannelWebhookTask,
+  DaemonChannelLoopMcpHost,
   DaemonChannelSessionClient,
   DaemonChannelSessionFactory,
   DaemonChannelSessionFactoryRequest,
 } from '@qwen-code/channel-base';
+import type { ServeFeature } from '../../serve/capabilities.js';
 import type { ServeChannelSelection } from '../../serve/types.js';
 import { normalizeServeChannelSelection } from '../../serve/channel-selection.js';
 import {
@@ -33,10 +48,19 @@ import {
   QWEN_DAEMON_WORKSPACE_ENV,
   QWEN_SERVER_TOKEN_ENV,
 } from '../../serve/channel-worker-env.js';
+import { EXTERNAL_TOOL_GUARD_TOKEN_ENV } from '@qwen-code/acp-bridge/externalToolGuard';
 import {
   isChannelWebhookTaskMessage,
   type ChannelWebhookEnqueueErrorCode,
 } from '../../serve/channel-webhook-ipc.js';
+import {
+  ChannelDeliveryError,
+  isChannelDeliveryError,
+  isChannelDeliveryMessage,
+  MAX_CHANNEL_DELIVERIES_IN_FLIGHT,
+  type ChannelDeliveryErrorCode,
+  type ChannelDeliveryRequest,
+} from '../../runtime/channel-delivery-ipc.js';
 import { sanitizeWorkerDiagnostic } from '../../serve/channel-worker-diagnostics.js';
 import {
   isChannelStartupReportAckMessage,
@@ -47,25 +71,70 @@ import {
   type ChannelStartupReportMessage,
 } from '../../serve/channel-worker-startup-ipc.js';
 import { isLoopbackBind } from '../../serve/loopback-binds.js';
-import { writeStderrLine, writeStdoutLine } from '../../utils/stdioHelpers.js';
+import { isOwnInterfaceAddress } from '../../serve/local-bind-addresses.js';
+import { ChannelLoopMcpWorkerHost } from '../../serve/channel-loop-mcp-ipc.js';
+import {
+  writeStderrLine,
+  writeStderrLineSafe,
+  writeStdoutLine,
+} from '../../utils/stdioHelpers.js';
 import { resolveProxyUrl } from './proxy.js';
 import {
   createChannel,
+  daemonChannelLoopPath,
+  daemonChannelStateDir,
+  daemonObservedContactsPath,
   daemonSessionRoutesPath,
   loadChannelsConfig,
   loadChannelsFromExtensions,
   parseConfiguredChannels,
+  registerBackgroundResponseRelay,
   registerPermissionRelay,
   registerSessionCleanup,
   registerToolCallDispatch,
+  resolveChannelLocale,
   selectFirstModel,
   type ParsedChannel,
 } from './runtime.js';
 import { BridgeChannelMemoryIntentClassifier } from './memory-intent-classifier.js';
+import {
+  OBSERVED_CONTACT_MAX_FRESH_WITHIN_SECONDS,
+  ObservedChannelContactStore,
+} from './observed-contact-store.js';
+import {
+  createChannelLoopController,
+  isChannelCronEnabled,
+} from './loop-runtime.js';
+import { disconnectChannels } from './disconnect-channels.js';
 
-const SESSION_SHELL_COMMAND_FEATURE = 'session_shell_command';
+// Typed against the registry so renaming a capability key fails the build here
+// instead of silently degrading the worker to the pre-capability behavior.
+const SESSION_SHELL_COMMAND_FEATURE: ServeFeature = 'session_shell_command';
+const SESSION_ATTACHMENTS_FEATURE: ServeFeature = 'session_attachments';
+const SESSION_BTW_FEATURE: ServeFeature = 'session_btw';
+const SESSION_PERMISSION_VOTE_FEATURE: ServeFeature = 'session_permission_vote';
+const SESSION_WORKTREE_PERSISTENCE_FEATURE: ServeFeature =
+  'session_worktree_persistence_v1';
+const SESSION_WORKTREE_RESET_FEATURE: ServeFeature =
+  'session_worktree_reset_v1';
 const MAX_ACTIVE_WEBHOOK_TASKS = 16;
-const WEBHOOK_TASK_SHUTDOWN_DRAIN_MS = 10_000;
+const WORKER_CHANNEL_DISCONNECT_DRAIN_MS =
+  CHANNEL_WORKER_STOP_GRACE_MS - CHANNEL_WORKER_KILL_GRACE_MS;
+const WORKER_STARTUP_ROLLBACK_DRAIN_MS = 1_500;
+
+async function disconnectWorkerChannels(
+  channels: Iterable<ChannelBase>,
+  timeoutMs = WORKER_CHANNEL_DISCONNECT_DRAIN_MS,
+): Promise<void> {
+  await disconnectChannels(channels, {
+    timeoutMs,
+    onTimeout: () => {
+      writeStderrLineSafe(
+        `[Channel] disconnect drain exceeded ${timeoutMs}ms; continuing worker shutdown.`,
+      );
+    },
+  });
+}
 
 interface DaemonCapabilitiesLike {
   features: string[];
@@ -84,6 +153,13 @@ interface DaemonCapabilitiesLike {
 
 interface DaemonClientLike {
   capabilities(): Promise<DaemonCapabilitiesLike>;
+  workspaceByCwd?(cwd: string): {
+    deleteSessionsData(sessionIds: string[]): Promise<{
+      removed: string[];
+      notFound: string[];
+      errors: Array<{ sessionId: string; error: string }>;
+    }>;
+  };
 }
 
 interface DaemonSessionClientStaticLike {
@@ -95,10 +171,12 @@ interface DaemonSessionClientStaticLike {
       sessionScope: 'thread';
       approvalMode?: string;
       sourceType?: string;
+      sourceId?: string;
+      worktree?: Record<string, never>;
     },
     clientId?: string,
   ): Promise<DaemonChannelSessionClient>;
-  load(
+  resume(
     client: DaemonClientLike,
     sessionId: string,
     req: {
@@ -106,8 +184,24 @@ interface DaemonSessionClientStaticLike {
       modelServiceId?: string;
       sessionScope: 'thread';
       approvalMode?: string;
+      sourceType?: string;
+      sourceId?: string;
     },
     clientId?: string,
+  ): Promise<DaemonChannelSessionClient>;
+  // The reset route registers no client for the caller, so unlike `create`
+  // and `resume` this takes no client id.
+  resetWorktree(
+    client: DaemonClientLike,
+    sessionId: string,
+    req: {
+      workspaceCwd: string;
+      modelServiceId?: string;
+      sessionScope: 'thread';
+      approvalMode?: string;
+      sourceType?: string;
+      sourceId?: string;
+    },
   ): Promise<DaemonChannelSessionClient>;
 }
 
@@ -127,12 +221,13 @@ interface ChannelDaemonWorkerReady {
 
 export interface ChannelDaemonWorkerHandle {
   readonly channels: string[];
+  deliverChannelMessage(request: ChannelDeliveryRequest): Promise<void>;
   validateWebhookTask(task: ChannelWebhookTask): void;
   runWebhookTask(
     task: ChannelWebhookTask,
     options?: ChannelWebhookRunOptions,
   ): Promise<void>;
-  close(): Promise<void>;
+  close(disconnectDrainMs?: number): Promise<void>;
 }
 
 export interface RunChannelDaemonWorkerOptions {
@@ -144,6 +239,8 @@ export interface RunChannelDaemonWorkerOptions {
   sendReady?: (ready: ChannelDaemonWorkerReady) => void;
   reportStartup?: (message: ChannelStartupReportMessage) => Promise<void>;
   startupSignal?: AbortSignal;
+  channelLoopMcpHost?: DaemonChannelLoopMcpHost;
+  promptAuthorization?: string;
 }
 
 export function createDaemonSessionFactory({
@@ -166,9 +263,21 @@ export function createDaemonSessionFactory({
       // sessions remain thread-scoped so different channels never share the
       // daemon's default single session.
       sessionScope: 'thread' as const,
+      sourceType: 'channel',
+      // sourceId = channel instance name (e.g. feishu-main): distinguishes
+      // channel instances on the daemon data plane; the channel kind
+      // (dingtalk/feishu) is derivable from the name via the channel config.
+      ...(req.sourceId ? { sourceId: req.sourceId } : {}),
     };
+    if (req.worktreeReset) {
+      return await DaemonSessionClient.resetWorktree(
+        client,
+        req.worktreeReset.sessionId,
+        daemonReq,
+      );
+    }
     if (req.sessionId) {
-      return await DaemonSessionClient.load(
+      return await DaemonSessionClient.resume(
         client,
         req.sessionId,
         daemonReq,
@@ -177,7 +286,10 @@ export function createDaemonSessionFactory({
     }
     return await DaemonSessionClient.createOrAttach(
       client,
-      { ...daemonReq, sourceType: 'channel' },
+      {
+        ...daemonReq,
+        ...(req.worktree ? { worktree: req.worktree } : {}),
+      },
       clientId,
     );
   };
@@ -185,7 +297,7 @@ export function createDaemonSessionFactory({
 
 export function createDaemonChannelBridgeFacade(
   bridge: ChannelAgentBridge,
-  opts: { exposeShellCommand: boolean },
+  opts: { exposeBtw: boolean; exposeShellCommand: boolean },
 ): ChannelAgentBridge {
   const facade: ChannelAgentBridge = {
     get availableCommands() {
@@ -199,12 +311,20 @@ export function createDaemonChannelBridgeFacade(
     cancelSession: bridge.cancelSession.bind(bridge),
   };
 
+  if (opts.exposeBtw && bridge.btw) {
+    facade.btw = bridge.btw.bind(bridge);
+  }
+
   if (bridge.respondToPermission) {
     facade.respondToPermission = bridge.respondToPermission.bind(bridge);
   }
 
   if (bridge.discardSession) {
     facade.discardSession = bridge.discardSession.bind(bridge);
+  }
+
+  if (bridge.deleteSessionData) {
+    facade.deleteSessionData = bridge.deleteSessionData.bind(bridge);
   }
 
   if (bridge.getAvailableCommands) {
@@ -217,6 +337,15 @@ export function createDaemonChannelBridgeFacade(
 
   if (bridge.listSessions) {
     facade.listSessions = bridge.listSessions.bind(bridge);
+  }
+
+  if (bridge.resetWorktreeSession) {
+    facade.resetWorktreeSession = bridge.resetWorktreeSession.bind(bridge);
+  }
+
+  if (bridge.registerChannelLoopToolHandler) {
+    facade.registerChannelLoopToolHandler =
+      bridge.registerChannelLoopToolHandler.bind(bridge);
   }
 
   return facade;
@@ -264,8 +393,25 @@ function validateDaemonWorkerUrl(daemonUrl: string): void {
   } catch {
     throw new Error(`${QWEN_DAEMON_URL_ENV} must be a valid URL.`);
   }
-  if (parsed.protocol !== 'http:' || !isLoopbackBind(parsed.hostname)) {
-    throw new Error(`${QWEN_DAEMON_URL_ENV} must use an http loopback URL.`);
+  // A daemon bound to a concrete interface (`--hostname 192.168.1.100`)
+  // listens on that socket ONLY — loopback is not bound, so rewriting the
+  // URL to `127.0.0.1` would trade this rejection for `ECONNREFUSED`. The
+  // worker dials the bound address itself, and an own-interface address
+  // keeps the daemon token on this host exactly as loopback does, which is
+  // the property this rule protects; anything else (a routable third-party
+  // host, a DNS name we would have to resolve to find out) stays refused.
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(
+      `${QWEN_DAEMON_URL_ENV} must use an http(s) loopback URL or a ` +
+        `literal address of one of this machine's interfaces.`,
+    );
+  }
+  if (isLoopbackBind(parsed.hostname)) return;
+  if (!isOwnInterfaceAddress(parsed.hostname)) {
+    throw new Error(
+      `${QWEN_DAEMON_URL_ENV} must use an http(s) loopback URL or a ` +
+        `literal address of one of this machine's interfaces.`,
+    );
   }
 }
 
@@ -400,6 +546,12 @@ export async function runChannelDaemonWorker(
     undefined,
     settings.merged.proxy as string | undefined,
   );
+  const locale = resolveChannelLocale(settings.merged.general?.language);
+  const displayLanguage = resolveLanguage(
+    resolveLanguageSetting(
+      settings.merged.general?.language as string | undefined,
+    ),
+  );
   const channelsConfig = loadChannelsConfig(daemonWorkspace, settings);
   const names = selectedChannelNames(channelsConfig, opts.selection);
   const parsed = await abortableStartup(
@@ -410,6 +562,35 @@ export async function runChannelDaemonWorker(
   );
   validateChannelWorkspaces(parsed, daemonWorkspace);
   const modelServiceId = selectFirstModel(parsed, 'Daemon worker');
+  const observedContacts = new ObservedChannelContactStore(
+    daemonObservedContactsPath(daemonWorkspace),
+  );
+  const loopStore = isChannelCronEnabled(settings)
+    ? new ChannelLoopStore({
+        filePath: daemonChannelLoopPath(daemonWorkspace),
+      })
+    : undefined;
+  const loopController = loopStore
+    ? createChannelLoopController(loopStore)
+    : undefined;
+  if (loopStore) {
+    const multiSessionChannels = new Set(
+      parsed
+        .filter(({ config }) => config.multiSession)
+        .map(({ name }) => name),
+    );
+    if (multiSessionChannels.size > 0) {
+      const loops = await abortableStartup(loopStore.list(), startupSignal);
+      const conflicting = loops.find(
+        (loop) => loop.enabled && multiSessionChannels.has(loop.channelName),
+      );
+      if (conflicting) {
+        throw new Error(
+          `Channel "${conflicting.channelName}" cannot enable multiSession while it has an enabled Channel loop. Disable the loop first.`,
+        );
+      }
+    }
+  }
 
   const bridge = new DaemonChannelBridge({
     cwd: daemonWorkspace,
@@ -418,30 +599,56 @@ export async function runChannelDaemonWorker(
       DaemonSessionClient: sdk.DaemonSessionClient,
       clientId: `qwen-channel-worker:${process.pid}`,
     }),
+    sessionAttachments: capabilities.features.includes(
+      SESSION_ATTACHMENTS_FEATURE,
+    ),
+    sessionPermissionVote: capabilities.features.includes(
+      SESSION_PERMISSION_VOTE_FEATURE,
+    ),
+    sessionWorktreePersistence: capabilities.features.includes(
+      SESSION_WORKTREE_PERSISTENCE_FEATURE,
+    ),
+    sessionWorktreeReset: capabilities.features.includes(
+      SESSION_WORKTREE_RESET_FEATURE,
+    ),
+    ...(opts.promptAuthorization
+      ? { promptAuthorization: opts.promptAuthorization }
+      : {}),
+    deleteSessionData: async (sessionId) => {
+      const workspaceClient = client.workspaceByCwd?.(daemonWorkspace);
+      if (!workspaceClient) {
+        throw new Error('Daemon SDK does not support session data deletion.');
+      }
+      const result = await workspaceClient.deleteSessionsData([sessionId]);
+      if (
+        !result.removed.includes(sessionId) &&
+        !result.notFound.includes(sessionId)
+      ) {
+        const detail = result.errors.find(
+          (entry) => entry.sessionId === sessionId,
+        )?.error;
+        throw new Error(detail ?? `Session ${sessionId} was not deleted.`);
+      }
+    },
     ...(modelServiceId ? { modelServiceId } : {}),
+    ...(opts.channelLoopMcpHost
+      ? { channelLoopMcpHost: opts.channelLoopMcpHost }
+      : {}),
   });
 
   const channels = new Map<string, ChannelBase>();
   const connected: string[] = [];
+  let scheduler: ChannelLoopScheduler | undefined;
   let connectFailureCount = 0;
   const diagnosticRedaction = {
     ...(opts.daemonToken ? { daemonToken: opts.daemonToken } : {}),
     workerEnv: process.env,
   };
-  const disconnectAll = () => {
-    for (const channel of channels.values()) {
-      try {
-        channel.disconnect();
-      } catch {
-        // best-effort
-      }
-    }
-  };
-
   let router: SessionRouter | undefined;
   try {
     await abortableStartup(bridge.start(), startupSignal);
     const bridgeFacade = createDaemonChannelBridgeFacade(bridge, {
+      exposeBtw: capabilities.features.includes(SESSION_BTW_FEATURE),
       exposeShellCommand: capabilities.features.includes(
         SESSION_SHELL_COMMAND_FEATURE,
       ),
@@ -456,6 +663,7 @@ export async function runChannelDaemonWorker(
     router = createdRouter;
     for (const { name, config } of parsed) {
       createdRouter.setChannelScope(name, config.sessionScope);
+      createdRouter.setChannelLoopsEnabled(name, !config.multiSession);
       if (config['webhooks']) {
         createdRouter.setChannelApprovalMode(name, config.approvalMode);
       }
@@ -474,10 +682,14 @@ export async function runChannelDaemonWorker(
         name,
         await abortableStartup(
           createChannel(name, config, bridgeFacade, {
+            locale,
             ...(proxy ? { proxy } : {}),
+            ...(displayLanguage ? { displayLanguage } : {}),
             router: createdRouter,
+            stateDir: daemonChannelStateDir(daemonWorkspace, name),
             channelMemory: {
               readChannelMemory,
+              getChannelMemoryRevision,
               listChannelMemoryEntries,
               addChannelMemoryEntries,
               updateChannelMemoryEntry,
@@ -488,12 +700,26 @@ export async function runChannelDaemonWorker(
               bridgeFacade,
               config.cwd,
             ),
+            channelMemoryRecallObserver: recordChannelMemoryRecallMetrics,
+            observedContacts: {
+              observe: (channelName, observation) => {
+                observedContacts.observe(channelName, observation);
+              },
+              list: () =>
+                observedContacts.list({
+                  freshWithinSeconds: OBSERVED_CONTACT_MAX_FRESH_WITHIN_SECONDS,
+                }),
+            },
+            ...(loopController && !config.multiSession
+              ? { loopController }
+              : {}),
           }),
           startupSignal,
         ),
       );
     }
     registerToolCallDispatch(bridgeFacade, createdRouter, channels);
+    registerBackgroundResponseRelay(bridgeFacade, createdRouter, channels);
     registerPermissionRelay(bridgeFacade, createdRouter, channels);
     registerSessionCleanup(bridgeFacade, createdRouter, channels);
 
@@ -516,7 +742,7 @@ export async function runChannelDaemonWorker(
           `[Channel] Failed to connect "${safeName}": ${safeMessage}`,
         );
         try {
-          channel.disconnect();
+          await channel.disconnect();
         } catch {
           // best-effort
         }
@@ -567,6 +793,39 @@ export async function runChannelDaemonWorker(
       throw new Error('No channels connected.');
     }
 
+    if (loopStore) {
+      const schedulerChannels = new Map<string, ChannelLoopRunner>();
+      for (const name of connected) {
+        const channel = channels.get(name)!;
+        schedulerChannels.set(name, {
+          runLoopPrompt: async (job, options) => {
+            let jobWorkspace: string | undefined;
+            try {
+              jobWorkspace = canonicalizeWorkspace(job.cwd);
+            } catch {
+              jobWorkspace = undefined;
+            }
+            if (jobWorkspace !== daemonWorkspace) {
+              await loopStore.disable(job.id).catch(() => false);
+              writeStderrLine(
+                `[Channel] Disabled loop "${sanitizeLogText(job.id, 128)}": its workspace does not match this daemon worker.`,
+              );
+              throw new Error(
+                `Loop ${sanitizeLogText(job.id, 128)} is outside daemon workspace and was disabled.`,
+              );
+            }
+            return channel.runLoopPrompt(job, options);
+          },
+        });
+      }
+      scheduler = new ChannelLoopScheduler({
+        store: loopStore,
+        channels: schedulerChannels,
+        nextFireTime,
+      });
+      scheduler.start();
+    }
+
     opts.sendReady?.({
       channels: connected,
       requestedChannels: parsed.map((p) => p.name),
@@ -575,6 +834,19 @@ export async function runChannelDaemonWorker(
 
     return {
       channels: connected,
+      async deliverChannelMessage(request: ChannelDeliveryRequest) {
+        const channel = channels.get(request.channelName);
+        if (!channel || !connected.includes(request.channelName)) {
+          throw new ChannelDeliveryError(
+            'channel_worker_unavailable',
+            `Channel "${request.channelName}" is not running.`,
+          );
+        }
+        await channel.deliverProactive(
+          { channelName: request.channelName, ...request.target },
+          request.text,
+        );
+      },
       validateWebhookTask(task: ChannelWebhookTask): void {
         const channel = channels.get(task.channelName);
         if (!channel || !connected.includes(task.channelName)) {
@@ -596,8 +868,9 @@ export async function runChannelDaemonWorker(
           await channel.runWebhookTask(task);
         }
       },
-      async close() {
-        disconnectAll();
+      async close(disconnectDrainMs) {
+        scheduler?.stop();
+        await disconnectWorkerChannels(channels.values(), disconnectDrainMs);
         try {
           bridge.stop();
         } finally {
@@ -606,7 +879,11 @@ export async function runChannelDaemonWorker(
       },
     };
   } catch (err) {
-    disconnectAll();
+    scheduler?.stop();
+    await disconnectWorkerChannels(
+      channels.values(),
+      WORKER_STARTUP_ROLLBACK_DRAIN_MS,
+    );
     try {
       bridge.stop();
     } catch {
@@ -636,11 +913,13 @@ function scrubDaemonWorkerEnv(): void {
   delete process.env[QWEN_DAEMON_URL_ENV];
   delete process.env[QWEN_DAEMON_WORKSPACE_ENV];
   delete process.env[QWEN_SERVER_TOKEN_ENV];
+  delete process.env[EXTERNAL_TOOL_GUARD_TOKEN_ENV];
 }
 
 function readDaemonWorkerEnv(): {
   daemonToken: string | undefined;
   daemonUrl: string;
+  promptAuthorization: string;
   workspace: string;
 } {
   const daemonToken = process.env[QWEN_DAEMON_TOKEN_ENV];
@@ -648,6 +927,7 @@ function readDaemonWorkerEnv(): {
     return {
       daemonToken,
       daemonUrl: readRequiredEnv(QWEN_DAEMON_URL_ENV),
+      promptAuthorization: readRequiredEnv(CHANNEL_DAEMON_WORKER_SENTINEL),
       workspace: readRequiredEnv(QWEN_DAEMON_WORKSPACE_ENV),
     };
   } finally {
@@ -666,6 +946,12 @@ function assertInternalDaemonWorkerInvocation(): void {
 function reportStartupToSupervisor(
   message: ChannelStartupReportMessage,
   signal: AbortSignal,
+  subscribeMessage: (listener: (message: unknown) => void) => () => void = (
+    listener,
+  ) => {
+    process.on('message', listener);
+    return () => process.removeListener('message', listener);
+  },
 ): Promise<void> {
   if (signal.aborted) {
     return Promise.reject(startupAbortError());
@@ -676,8 +962,9 @@ function reportStartupToSupervisor(
   }
   return new Promise<void>((resolve, reject) => {
     let settled = false;
+    let unsubscribeMessage = () => {};
     const cleanup = () => {
-      process.removeListener('message', onMessage);
+      unsubscribeMessage();
       process.removeListener('disconnect', onDisconnect);
       signal.removeEventListener('abort', onAbort);
     };
@@ -699,7 +986,7 @@ function reportStartupToSupervisor(
     const onAbort = () => {
       finish(startupAbortError());
     };
-    process.on('message', onMessage);
+    unsubscribeMessage = subscribeMessage(onMessage);
     process.once('disconnect', onDisconnect);
     signal.addEventListener('abort', onAbort, { once: true });
     try {
@@ -725,6 +1012,22 @@ export const daemonWorkerCommand: CommandModule<unknown, DaemonWorkerArgs> = {
     }),
   handler: async (argv) => {
     const startupAbortController = new AbortController();
+    let channelLoopMcpHost: ChannelLoopMcpWorkerHost | undefined;
+    const messageSubscribers = new Set<(message: unknown) => void>();
+    let onWorkerMessage: ((message: unknown) => void) | undefined;
+    const subscribeMessage = (listener: (message: unknown) => void) => {
+      messageSubscribers.add(listener);
+      return () => messageSubscribers.delete(listener);
+    };
+    const disposeChannelLoopMcpHost = () => {
+      if (onWorkerMessage) {
+        process.removeListener('message', onWorkerMessage);
+        onWorkerMessage = undefined;
+      }
+      messageSubscribers.clear();
+      channelLoopMcpHost?.dispose();
+      channelLoopMcpHost = undefined;
+    };
     let pendingShutdownReason: NodeJS.Signals | 'disconnect' | undefined;
     const onEarlyShutdown = (reason: NodeJS.Signals | 'disconnect') => {
       if (pendingShutdownReason) {
@@ -753,7 +1056,29 @@ export const daemonWorkerCommand: CommandModule<unknown, DaemonWorkerArgs> = {
 
     try {
       assertInternalDaemonWorkerInvocation();
-      const { daemonToken, daemonUrl, workspace } = readDaemonWorkerEnv();
+      const { daemonToken, daemonUrl, promptAuthorization, workspace } =
+        readDaemonWorkerEnv();
+      // Mirror the ACP-child self-scrub: in dev mode the supervisor spawns
+      // this worker with the daemon's loader-carrying base env (the harness
+      // tsx loader must reach this .ts entry), but nothing the worker spawns
+      // may inherit them into another workspace. Production base envs are
+      // scrubbed before the freeze, so this is a no-op there.
+      scrubAndReportInheritedLoaderEnv(
+        process.env,
+        'qwen channel daemon-worker',
+        'channel daemon worker',
+      );
+      const send = process.send!;
+      channelLoopMcpHost = new ChannelLoopMcpWorkerHost((message, callback) =>
+        send.call(process, message, callback ?? (() => {})),
+      );
+      onWorkerMessage = (message: unknown) => {
+        if (channelLoopMcpHost?.handleMessage(message)) return;
+        for (const subscriber of [...messageSubscribers]) {
+          subscriber(message);
+        }
+      };
+      process.on('message', onWorkerMessage);
       const selection = normalizeServeChannelSelection(argv.channel);
       if (!selection) {
         throw new Error('--channel is required.');
@@ -761,11 +1086,17 @@ export const daemonWorkerCommand: CommandModule<unknown, DaemonWorkerArgs> = {
       const handle = await runChannelDaemonWorker({
         daemonUrl,
         daemonToken,
+        promptAuthorization,
         workspace,
         selection,
         startupSignal: startupAbortController.signal,
         reportStartup: (message) =>
-          reportStartupToSupervisor(message, startupAbortController.signal),
+          reportStartupToSupervisor(
+            message,
+            startupAbortController.signal,
+            subscribeMessage,
+          ),
+        channelLoopMcpHost,
         sendReady: (ready) => {
           process.send?.({ type: 'ready', ...ready });
         },
@@ -793,8 +1124,74 @@ export const daemonWorkerCommand: CommandModule<unknown, DaemonWorkerArgs> = {
           // Supervisor will time out if the IPC channel is already closed.
         }
       };
+      const sendChannelDeliveryResult = (
+        id: string,
+        result:
+          | { ok: true }
+          | {
+              ok: false;
+              code: ChannelDeliveryErrorCode;
+              error: string;
+            },
+      ) => {
+        try {
+          process.send?.({
+            type: 'channel_delivery_result',
+            id,
+            ...result,
+          });
+        } catch {
+          // The supervisor times out if the IPC channel is already closed.
+        }
+      };
       const activeWebhookTasks = new Map<string, Promise<void>>();
+      const activeChannelDeliveries = new Map<string, Promise<void>>();
       const onMessage = (message: unknown) => {
+        if (isChannelDeliveryMessage(message)) {
+          if (message.expiresAt <= Date.now()) {
+            sendChannelDeliveryResult(message.id, {
+              ok: false,
+              code: 'channel_delivery_timeout',
+              error: 'Channel delivery IPC timed out.',
+            });
+            return;
+          }
+          if (
+            activeChannelDeliveries.size >= MAX_CHANNEL_DELIVERIES_IN_FLIGHT
+          ) {
+            sendChannelDeliveryResult(message.id, {
+              ok: false,
+              code: 'channel_delivery_queue_full',
+              error: 'Channel delivery queue is full.',
+            });
+            return;
+          }
+          const deliveryId = message.id;
+          const delivery = handle
+            .deliverChannelMessage(message.request)
+            .then(() => {
+              sendChannelDeliveryResult(deliveryId, { ok: true });
+            })
+            .catch((error: unknown) => {
+              sendChannelDeliveryResult(deliveryId, {
+                ok: false,
+                code: classifyChannelDeliveryError(error),
+                error: sanitizeWorkerDiagnostic(
+                  error instanceof Error ? error.message : String(error),
+                  512,
+                  {
+                    ...(daemonToken ? { daemonToken } : {}),
+                    workerEnv: process.env,
+                  },
+                ),
+              });
+            })
+            .finally(() => {
+              activeChannelDeliveries.delete(deliveryId);
+            });
+          activeChannelDeliveries.set(deliveryId, delivery);
+          return;
+        }
         if (!isChannelWebhookTaskMessage(message)) return;
         if (message.expiresAt <= Date.now()) {
           sendWebhookTaskResult(message.id, {
@@ -866,7 +1263,7 @@ export const daemonWorkerCommand: CommandModule<unknown, DaemonWorkerArgs> = {
         }
       }, CHANNEL_WORKER_HEARTBEAT_INTERVAL_MS);
       heartbeatTimer.unref();
-      process.on('message', onMessage);
+      const unsubscribeMessage = subscribeMessage(onMessage);
 
       let shuttingDown = false;
       let exitCode = 0;
@@ -879,25 +1276,39 @@ export const daemonWorkerCommand: CommandModule<unknown, DaemonWorkerArgs> = {
           process.exit(1);
         } else {
           shuttingDown = true;
+          const shutdownDeadline =
+            Date.now() + WORKER_CHANNEL_DISCONNECT_DRAIN_MS;
           clearHeartbeat();
-          process.removeListener('message', onMessage);
+          unsubscribeMessage();
           try {
-            if (activeWebhookTasks.size > 0) {
+            const deliveryCount = activeChannelDeliveries.size;
+            const webhookCount = activeWebhookTasks.size;
+            if (deliveryCount > 0) {
               writeStderrLine(
-                `[Channel] shutdown: draining ${activeWebhookTasks.size} webhook task(s)...`,
+                `[Channel] shutdown: draining ${deliveryCount} channel delivery task(s)...`,
               );
+            }
+            if (webhookCount > 0) {
+              writeStderrLine(
+                `[Channel] shutdown: draining ${webhookCount} webhook task(s)...`,
+              );
+            }
+            if (deliveryCount > 0 || webhookCount > 0) {
               await Promise.race([
-                Promise.allSettled(activeWebhookTasks.values()),
+                Promise.allSettled([
+                  ...activeChannelDeliveries.values(),
+                  ...activeWebhookTasks.values(),
+                ]),
                 new Promise<void>((resolve) => {
                   const timer = setTimeout(
                     resolve,
-                    WEBHOOK_TASK_SHUTDOWN_DRAIN_MS,
+                    Math.max(0, shutdownDeadline - Date.now()),
                   );
                   timer.unref();
                 }),
               ]);
             }
-            await handle.close();
+            await handle.close(Math.max(0, shutdownDeadline - Date.now()));
           } catch (err) {
             exitCode = 1;
             const safeReason = sanitizeLogText(reason, 128);
@@ -910,6 +1321,7 @@ export const daemonWorkerCommand: CommandModule<unknown, DaemonWorkerArgs> = {
             );
           } finally {
             clearHeartbeat();
+            disposeChannelLoopMcpHost();
             finish();
           }
         }
@@ -925,13 +1337,14 @@ export const daemonWorkerCommand: CommandModule<unknown, DaemonWorkerArgs> = {
       }
       await finished;
       clearHeartbeat();
-      process.removeListener('message', onMessage);
+      unsubscribeMessage();
       process.removeListener('SIGINT', shutdown);
       process.removeListener('SIGTERM', shutdown);
       process.removeListener('disconnect', onDisconnect);
       process.exit(exitCode);
     } catch (err) {
       removeEarlyShutdownHandlers();
+      disposeChannelLoopMcpHost();
       const safeMessage = sanitizeLogText(
         err instanceof Error ? err.message : String(err),
         512,
@@ -967,4 +1380,19 @@ function classifyWebhookTaskValidationError(
     return 'channel_worker_unavailable';
   }
   return 'channel_webhook_enqueue_failed';
+}
+
+function classifyChannelDeliveryError(
+  error: unknown,
+): ChannelDeliveryErrorCode {
+  if (isChannelDeliveryError(error)) {
+    return error.code;
+  }
+  if (
+    isChannelProactiveDeliveryError(error) &&
+    error.disposition === 'permanent'
+  ) {
+    return 'channel_delivery_rejected';
+  }
+  return 'channel_delivery_failed';
 }

@@ -22,6 +22,7 @@ import {
 } from './retry.js';
 import { retryContext } from './retryContext.js';
 import { getErrorStatus } from './errors.js';
+import { isRateLimitError } from './rateLimit.js';
 import { setSimulate429 } from './testUtils.js';
 import { AuthType } from '../core/contentGenerator.js';
 
@@ -368,6 +369,149 @@ describe('retryWithBackoff', () => {
     expect(mockFn).toHaveBeenCalledTimes(1);
   });
 
+  it('should retry on transient network errors (ECONNRESET) by default', async () => {
+    let attempts = 0;
+    const mockFn = vi.fn(async () => {
+      attempts++;
+      if (attempts <= 2) {
+        const err = Object.assign(new TypeError('terminated'), {
+          cause: Object.assign(new Error('read ECONNRESET'), {
+            code: 'ECONNRESET',
+          }),
+        });
+        throw err;
+      }
+      return 'success';
+    });
+
+    const promise = retryWithBackoff(mockFn, {
+      maxAttempts: 3,
+      initialDelayMs: 10,
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    const result = await promise;
+
+    expect(result).toBe('success');
+    expect(mockFn).toHaveBeenCalledTimes(3);
+  });
+
+  it('should retry on ETIMEDOUT by default', async () => {
+    let attempts = 0;
+    const mockFn = vi.fn(async () => {
+      attempts++;
+      if (attempts <= 1) {
+        throw Object.assign(new Error('connect ETIMEDOUT'), {
+          code: 'ETIMEDOUT',
+        });
+      }
+      return 'ok';
+    });
+
+    const promise = retryWithBackoff(mockFn, {
+      maxAttempts: 3,
+      initialDelayMs: 10,
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    const result = await promise;
+
+    expect(result).toBe('ok');
+    expect(mockFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('should retry on SDK-wrapped transport errors (code at cause depth 2)', async () => {
+    let attempts = 0;
+    const mockFn = vi.fn(async () => {
+      attempts++;
+      if (attempts <= 1) {
+        // Mirrors the OpenAI SDK shape: APIConnectionError ->
+        // TypeError('fetch failed') -> cause { code: 'ECONNRESET' }.
+        throw Object.assign(new Error('Connection error.'), {
+          cause: Object.assign(new TypeError('fetch failed'), {
+            cause: Object.assign(new Error('read ECONNRESET'), {
+              code: 'ECONNRESET',
+            }),
+          }),
+        });
+      }
+      return 'ok';
+    });
+
+    const promise = retryWithBackoff(mockFn, {
+      maxAttempts: 3,
+      initialDelayMs: 10,
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    const result = await promise;
+
+    expect(result).toBe('ok');
+    expect(mockFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('should retry a status-less upstream error carrying a provider request id', async () => {
+    // A gateway error pushed into an already-200 SSE stream reaches us as an
+    // APIError with no HTTP status, so only the classification can open the
+    // retry gate. Without it the turn died on the first attempt.
+    let attempts = 0;
+    const mockFn = vi.fn(async () => {
+      attempts++;
+      if (attempts <= 1) {
+        throw Object.assign(new Error("'id'"), {
+          code: 'KeyError',
+          requestID: 'cd7f37f3-d38a-9dec-804f-f70dda5650eb',
+        });
+      }
+      return 'ok';
+    });
+
+    const promise = retryWithBackoff(mockFn, {
+      maxAttempts: 3,
+      initialDelayMs: 10,
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    const result = await promise;
+
+    expect(result).toBe('ok');
+    expect(mockFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('should not retry a status-less error that carries only a provider code', async () => {
+    // Permanent local failures (missing credentials, invalid MCP config) have a
+    // string `code` but no request id; the request id is what distinguishes an
+    // upstream failure from one of those.
+    const mockFn = vi.fn(async () => {
+      throw Object.assign(new Error('No API key configured'), {
+        code: 'MISSING_API_KEY',
+      });
+    });
+
+    const promise = retryWithBackoff(mockFn, {
+      maxAttempts: 3,
+      initialDelayMs: 10,
+    });
+    await expect(promise).rejects.toThrow('No API key configured');
+    expect(mockFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('should not retry a permanent provider code even when the request is traced', async () => {
+    // Moderation and credential rejections arrive inside an already-200 stream,
+    // so no HTTP status is left to fail fast on. Re-sending the identical
+    // request cannot succeed, and walking the production ladder for it costs
+    // about eighty seconds.
+    const mockFn = vi.fn(async () => {
+      throw Object.assign(new Error('Content filtered'), {
+        code: 'data_inspection_failed',
+        requestID: 'req-1',
+      });
+    });
+
+    const promise = retryWithBackoff(mockFn, {
+      maxAttempts: 3,
+      initialDelayMs: 10,
+    });
+    await expect(promise).rejects.toThrow('Content filtered');
+    expect(mockFn).toHaveBeenCalledTimes(1);
+  });
+
   it('should respect maxDelayMs', async () => {
     const mockFn = createFailingFunction(3);
     const setTimeoutSpy = vi.spyOn(global, 'setTimeout');
@@ -623,6 +767,87 @@ describe('retryWithBackoff', () => {
 
       // Should be called 3 times (2 failures + 1 success)
       expect(fn).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  describe('permanent quota-exhaustion fast-fail (any auth)', () => {
+    it('should throw immediately for a permanent quota-exhaustion error', async () => {
+      // Bailian token-plan "1-week quota has been exhausted" surfaces as a 429
+      // from the OpenAI SDK but is permanent — it must fast-fail, not retry.
+      const quotaError = Object.assign(
+        new Error(
+          '429 Your token-plan 1-week quota has been exhausted. The quota will reset at 07-27 09:25:00 UTC.',
+        ),
+        { status: 429 },
+      );
+      const fn = vi.fn().mockRejectedValue(quotaError);
+
+      const promise = retryWithBackoff(fn, {
+        maxAttempts: 5,
+        initialDelayMs: 1000,
+        maxDelayMs: 5000,
+        authType: AuthType.USE_OPENAI,
+      });
+
+      await expect(promise).rejects.toMatchObject({
+        message: expect.stringContaining('Quota exhausted'),
+      });
+
+      // Should be called only once (no retries)
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    it('thrown error must not be a rate-limit error (pins no-status intent)', async () => {
+      // The thrown error deliberately carries no .status so that
+      // isRateLimitError() returns false — preventing the stream-side
+      // rate-limit retry loop in llm-chat.ts from re-driving it.
+      const quotaError = Object.assign(
+        new Error(
+          '429 Your token-plan 1-week quota has been exhausted. The quota will reset at 07-27 09:25:00 UTC.',
+        ),
+        { status: 429 },
+      );
+      const fn = vi.fn().mockRejectedValue(quotaError);
+
+      const promise = retryWithBackoff(fn, {
+        maxAttempts: 5,
+        initialDelayMs: 1000,
+        maxDelayMs: 5000,
+        authType: AuthType.USE_OPENAI,
+      });
+
+      let thrown: unknown;
+      const assertionPromise = promise.catch((e: unknown) => {
+        thrown = e;
+      });
+      await vi.runAllTimersAsync();
+      await assertionPromise;
+
+      expect(isRateLimitError(thrown)).toBe(false);
+    });
+
+    it('should retry a transient 429 that does not carry a reset time', async () => {
+      // A plain TPM/RPM 429 (no "will reset at") stays retryable — the
+      // quota-exhaustion fast-fail must not swallow transient throttling.
+      const transient429 = Object.assign(
+        new Error('Rate limit exceeded. Please retry later.'),
+        { status: 429 },
+      );
+      const fn = vi
+        .fn()
+        .mockRejectedValueOnce(transient429)
+        .mockResolvedValue('success');
+
+      const promise = retryWithBackoff(fn, {
+        maxAttempts: 5,
+        initialDelayMs: 100,
+        maxDelayMs: 1000,
+        authType: AuthType.USE_OPENAI,
+      });
+      await vi.runAllTimersAsync();
+
+      await expect(promise).resolves.toBe('success');
+      expect(fn).toHaveBeenCalledTimes(2);
     });
   });
 });

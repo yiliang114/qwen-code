@@ -30,12 +30,14 @@ import { ToolNames, ToolDisplayNames } from './tool-names.js';
 import type { Config } from '../config/config.js';
 import { DiscoveredMCPTool } from './mcp-tool.js';
 import { createDebugLogger } from '../utils/debugLogger.js';
+import { escapeJsonTagCharacters } from '../utils/formatters.js';
 import {
   getLeaderOnlyToolUnavailableMessage,
   getSubagentPlanToolUnavailableMessage,
   isLeaderOnlyToolUnavailableInSubagent,
   isPlanLifecycleToolUnavailableInSubagent,
 } from '../agents/runtime/subagent-plan-tool-policy.js';
+import { isMediaPolicyToolHiddenFromModel } from '../omni/policy/model-access.js';
 
 const debugLogger = createDebugLogger('TOOL_SEARCH');
 
@@ -246,9 +248,13 @@ class ToolSearchInvocation extends BaseToolInvocation<
    */
   private collectCandidates(): AnyDeclarativeTool[] {
     const registry = this.config.getToolRegistry();
-    return registry
-      .getAllTools()
-      .filter((t) => registry.isDeferredAndHidden(t.name));
+    return registry.getAllTools().filter(
+      (t) =>
+        registry.isDeferredAndHidden(t.name) &&
+        // Media-policy tools without modelAccess.enabled must never be
+        // surfaced to the model — not even via keyword discovery.
+        !isMediaPolicyToolHiddenFromModel(this.config, t),
+    );
   }
 
   private async loadAndReturnSchemas(
@@ -286,6 +292,15 @@ class ToolSearchInvocation extends BaseToolInvocation<
         missing.push(requested);
         continue;
       }
+      if (!registry.isToolDeclared(canonical)) {
+        const tool = registry.getTool(canonical);
+        if (tool && isMediaPolicyToolHiddenFromModel(this.config, tool)) {
+          blocked.push(canonical);
+        } else {
+          missing.push(requested);
+        }
+        continue;
+      }
       if (
         isPlanLifecycleToolUnavailableInSubagent(canonical) ||
         isLeaderOnlyToolUnavailableInSubagent(canonical)
@@ -320,12 +335,20 @@ class ToolSearchInvocation extends BaseToolInvocation<
         missing.push(requested);
         continue;
       }
+      // Hidden media-policy tools cannot be revealed by exact-name lookup
+      // either: modelAccess.enabled is the only switch that exposes them.
+      // Blocking here (after ensureTool, which is where the descriptor
+      // becomes inspectable) guarantees no schema reveal happens below.
+      if (isMediaPolicyToolHiddenFromModel(this.config, tool)) {
+        blocked.push(canonical);
+        continue;
+      }
       // Only reveal + count toward the setTools() trigger when the tool
       // is actually deferred. `select:` mode also accepts already-loaded
       // / alwaysLoad tools (the model may use it to re-inspect a schema)
       // — those don't need reveal (they're already in the declaration
       // list) and pulling them through setTools() would risk a spurious
-      // "GeminiClient not initialised" failure for what is just a
+      // "LlmClient not initialised" failure for what is just a
       // schema-inspection call.
       const isLoadable = registry.isDeferredAndHidden(canonical);
       if (isLoadable) {
@@ -345,17 +368,17 @@ class ToolSearchInvocation extends BaseToolInvocation<
     // what is just a schema-inspection request).
     let setToolsError: string | undefined;
     if (newlyRevealed.length > 0) {
-      const geminiClient = this.config.getGeminiClient();
-      if (!geminiClient) {
+      const llmClient = this.config.getLlmClient();
+      if (!llmClient) {
         // Optional chaining (`?.setTools()`) used to silently no-op here,
         // leaving the registry with reveals the API never received —
         // exactly the inconsistency `setTools() throws` already guards
         // against. Treat null client identically: rollback + surface an
         // error so the caller can retry once init is complete.
-        setToolsError = 'GeminiClient not initialised';
+        setToolsError = 'LlmClient not initialised';
       } else {
         try {
-          await geminiClient.setTools();
+          await llmClient.setTools();
         } catch (err) {
           setToolsError = err instanceof Error ? err.message : String(err);
           // Same rationale as ensureTool above: debugLogger.warn is
@@ -401,15 +424,16 @@ class ToolSearchInvocation extends BaseToolInvocation<
       };
     }
 
-    // Escape `<` in the JSON-stringified schema so any `</function>`
+    // Escape tag boundary characters in the JSON-stringified schema so any
+    // `</function>`
     // (or `</functions>`) substring inside a tool's description / enum
     // / examples can't prematurely close the pseudo-XML wrapper. The
-    // `<` JSON unicode escape decodes back to `<` when the model
-    // interprets the JSON, but as raw text inside the wrapper it's no
-    // longer the start of a closing tag.
+    // JSON unicode escapes decode back to their original characters when the
+    // model interprets the JSON, but as raw text inside the wrapper they are
+    // no longer tag delimiters.
     const schemaBlocks = loaded.map(
       (tool) =>
-        `<function>${JSON.stringify(tool.schema).replace(/</g, '\\u003c')}</function>`,
+        `<function>${escapeJsonTagCharacters(JSON.stringify(tool.schema))}</function>`,
     );
     let llmContent = '';
     if (schemaBlocks.length > 0) {
@@ -424,7 +448,9 @@ class ToolSearchInvocation extends BaseToolInvocation<
       const blockedMessages = blocked.map((name) =>
         isLeaderOnlyToolUnavailableInSubagent(name)
           ? getLeaderOnlyToolUnavailableMessage(name)
-          : getSubagentPlanToolUnavailableMessage(name),
+          : isPlanLifecycleToolUnavailableInSubagent(name)
+            ? getSubagentPlanToolUnavailableMessage(name)
+            : `Tool "${name}" is a media policy tool and is not available to the model.`,
       );
       blockedErrorMessage = blockedMessages.join('\n');
       const header = llmContent ? '\n\n' : '';

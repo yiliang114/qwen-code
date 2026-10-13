@@ -14,6 +14,20 @@ import { z } from 'zod';
 
 export const ACP_ROUTE_ID_PREFIX = 'qwen-route:v1:';
 
+export function publicProviderBaseUrl(baseUrl: string): string | undefined {
+  if (!/^https?:\/\//i.test(baseUrl.trim())) return undefined;
+  try {
+    const url = new URL(baseUrl);
+    url.username = '';
+    url.password = '';
+    url.search = '';
+    url.hash = '';
+    return url.href;
+  } catch {
+    return undefined;
+  }
+}
+
 function getRouteEndpointIdentity(baseUrl: string | undefined): string | null {
   if (!baseUrl) return null;
   try {
@@ -52,7 +66,12 @@ export function buildAcpModelOptions(
   models: readonly AvailableModel[],
 ): AcpModelOption[] {
   const candidates = models
-    .filter((model) => model.fastOnly !== true && model.voiceOnly !== true)
+    .filter(
+      (model) =>
+        model.fastOnly !== true &&
+        model.voiceOnly !== true &&
+        model.imageOnly !== true,
+    )
     .map((model) => {
       const effectiveModelId =
         model.isRuntimeModel && model.runtimeSnapshotId
@@ -296,7 +315,7 @@ export function isInlineModelOverrideAllowed(
   const activeEnvKey = contentGeneratorConfig.apiKeyEnvKey;
   return config
     .getAvailableModelsForAuthType(authType)
-    .filter((m) => !m.fastOnly && !m.voiceOnly)
+    .filter((m) => !m.fastOnly && !m.voiceOnly && !m.imageOnly)
     .some(
       (m) =>
         m.id === modelId &&

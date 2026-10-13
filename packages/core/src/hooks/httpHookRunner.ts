@@ -8,7 +8,7 @@ import { createDebugLogger } from '../utils/debugLogger.js';
 import { interpolateHeaders, interpolateUrl } from './envInterpolator.js';
 import { UrlValidator } from './urlValidator.js';
 import { combineAbortSignals } from '../utils/abortController.js';
-import { isBlockedAddress } from './ssrfGuard.js';
+import { isBlockedAddress, isMetadataAddress } from './ssrfGuard.js';
 import { lookup as dnsLookup } from 'dns';
 import type {
   HttpHookConfig,
@@ -31,11 +31,6 @@ const DEFAULT_HTTP_TIMEOUT = 10 * 60 * 1000;
 const MAX_OUTPUT_LENGTH = 10000;
 
 /**
- * Callback for displaying status messages during hook execution
- */
-export type StatusMessageCallback = (message: string) => void;
-
-/**
  * Resolve a hostname and validate that all resolved IPs are not in blocked
  * ranges. This is the core of DNS-level SSRF protection, aligned with
  *
@@ -45,10 +40,21 @@ export type StatusMessageCallback = (message: string) => void;
  */
 async function validateResolvedHost(
   hostname: string,
+  allowPrivateNetworkHosts: boolean = false,
 ): Promise<{ ok: boolean; error?: string }> {
   return new Promise((resolve) => {
+    // Cloud metadata endpoints stay blocked in every configuration, even
+    // when private-network hooks are explicitly allowed (trusted scopes).
+    if (isMetadataAddress(hostname)) {
+      resolve({
+        ok: false,
+        error: `HTTP hook blocked: ${hostname} is a cloud metadata endpoint`,
+      });
+      return;
+    }
+
     // If hostname is already an IP literal, validate directly.
-    if (isBlockedAddress(hostname)) {
+    if (!allowPrivateNetworkHosts && isBlockedAddress(hostname)) {
       resolve({
         ok: false,
         error: `HTTP hook blocked: ${hostname} is in a private/link-local range`,
@@ -56,7 +62,9 @@ async function validateResolvedHost(
       return;
     }
 
-    // For hostnames, resolve DNS and validate all returned IPs.
+    // For hostnames, resolve DNS and validate all returned IPs. This runs
+    // even when private ranges are allowed, so that a hostname resolving
+    // to a metadata endpoint is still caught.
     dnsLookup(hostname, { all: true }, (err, addresses) => {
       if (err) {
         // DNS resolution failure — let the fetch call handle it.
@@ -65,7 +73,14 @@ async function validateResolvedHost(
       }
 
       for (const addr of addresses) {
-        if (isBlockedAddress(addr.address)) {
+        if (isMetadataAddress(addr.address)) {
+          resolve({
+            ok: false,
+            error: `HTTP hook blocked: ${hostname} resolves to ${addr.address} (cloud metadata endpoint)`,
+          });
+          return;
+        }
+        if (!allowPrivateNetworkHosts && isBlockedAddress(addr.address)) {
           resolve({
             ok: false,
             error: `HTTP hook blocked: ${hostname} resolves to ${addr.address} (private/link-local). Loopback (127.0.0.1, ::1) is allowed.`,
@@ -84,18 +99,15 @@ async function validateResolvedHost(
  */
 export class HttpHookRunner {
   private urlValidator: UrlValidator;
+  private readonly allowPrivateNetworkHosts: boolean;
   private readonly executedOnceHooks: Set<string> = new Set();
-  private statusMessageCallback?: StatusMessageCallback;
 
-  constructor(allowedUrls?: string[]) {
-    this.urlValidator = new UrlValidator(allowedUrls);
-  }
-
-  /**
-   * Set callback for displaying status messages
-   */
-  setStatusMessageCallback(callback: StatusMessageCallback): void {
-    this.statusMessageCallback = callback;
+  constructor(
+    allowedUrls?: string[],
+    allowPrivateNetworkHosts: boolean = false,
+  ) {
+    this.allowPrivateNetworkHosts = allowPrivateNetworkHosts;
+    this.urlValidator = new UrlValidator(allowedUrls, allowPrivateNetworkHosts);
   }
 
   /**
@@ -143,11 +155,6 @@ export class HttpHookRunner {
       this.executedOnceHooks.add(onceKey);
     }
 
-    // Display status message if configured
-    if (hookConfig.statusMessage && this.statusMessageCallback) {
-      this.statusMessageCallback(hookConfig.statusMessage);
-    }
-
     try {
       // Interpolate URL with allowed env vars
       const url = interpolateUrl(
@@ -170,7 +177,10 @@ export class HttpHookRunner {
       // DNS-level SSRF protection: validate resolved IPs
       // It checks that the hostname resolves to non-private IPs.
       const parsed = new URL(url);
-      const hostValidation = await validateResolvedHost(parsed.hostname);
+      const hostValidation = await validateResolvedHost(
+        parsed.hostname,
+        this.allowPrivateNetworkHosts,
+      );
       if (!hostValidation.ok) {
         return {
           hookConfig,
@@ -215,6 +225,11 @@ export class HttpHookRunner {
           },
           body,
           signal: combinedSignal,
+          // Never follow redirects: the whitelist and DNS-level SSRF checks
+          // above validated only this URL, and a 30x would re-send the hook
+          // payload to an unvalidated target. A 3xx response falls into the
+          // non-2xx branch below (non-blocking error).
+          redirect: 'manual',
         });
 
         cleanup();
@@ -421,6 +436,9 @@ export class HttpHookRunner {
    */
   updateAllowedUrls(allowedUrls: string[]): void {
     // Create new validator with updated patterns
-    this.urlValidator = new UrlValidator(allowedUrls);
+    this.urlValidator = new UrlValidator(
+      allowedUrls,
+      this.allowPrivateNetworkHosts,
+    );
   }
 }

@@ -13,9 +13,17 @@ import type {
   CreateChannelWorkerSupervisorOptions,
 } from './channel-worker-supervisor.js';
 import { ChannelWorkerStartupError } from './channel-worker-supervisor.js';
+import { CHANNEL_LOOP_MCP_SERVER_NAME } from '@qwen-code/channel-base';
+import {
+  CLIENT_MCP_OVER_WS_CONFIG_FLAG,
+  type ClientMcpOverWsRuntimeConfig,
+} from '@qwen-code/acp-bridge/bridgeTypes';
+import { SessionNotFoundError } from '@qwen-code/acp-bridge/bridgeErrors';
+import { ChannelDeliveryError } from '../runtime/channel-delivery-ipc.js';
 import { ChannelWebhookEnqueueError } from './channel-webhook-ipc.js';
 import type { ChannelWorkspaceGroup } from './channel-workspace-grouping.js';
 import type { WorkspaceRegistry } from './workspace-registry.js';
+import { assertChannelControlWorkspaceCapacity } from './channel-control-capacity.js';
 
 /** A channel worker snapshot annotated with its owning workspace. */
 export interface ChannelWorkerGroupSnapshot extends ChannelWorkerSnapshot {
@@ -67,7 +75,11 @@ export interface ChannelWorkerGroup {
   stop(): Promise<void>;
   reconcile(
     groups: readonly ChannelWorkspaceGroup[],
-    options?: { force?: boolean; onRollingBack?: () => void },
+    options?: {
+      force?: boolean;
+      forceWorkspaceCwd?: string;
+      onRollingBack?: () => void;
+    },
   ): Promise<ChannelWorkerGroupReconcileResult>;
   isHealthy(): boolean;
   killAllSync(): void;
@@ -77,8 +89,17 @@ export interface ChannelWorkerGroup {
   beginWorkspaceDrain(workspaceCwd: string): void;
   cancelWorkspaceDrain(workspaceCwd: string): void;
   workspaceActivity(workspaceCwd: string): number;
-  removeWorkspace(workspaceCwd: string): Promise<void>;
+  removeWorkspace(
+    workspaceCwd: string,
+    options?: { permanent?: boolean },
+  ): Promise<void>;
   restoreWorkspace(workspaceCwd: string): Promise<void>;
+  deliverChannelMessage(
+    request: Parameters<
+      NonNullable<ChannelWorkerSupervisor['deliverChannelMessage']>
+    >[0],
+    workspaceCwd?: string,
+  ): ReturnType<NonNullable<ChannelWorkerSupervisor['deliverChannelMessage']>>;
   enqueueWebhookTask: ChannelWorkerSupervisor['enqueueWebhookTask'];
 }
 
@@ -86,6 +107,7 @@ export interface ChannelWorkerGroupSharedOptions {
   cliEntryPath: string;
   daemonUrl: string;
   daemonToken?: string;
+  workerTlsCaCertPath?: string;
   restartPolicy?: ChannelWorkerRestartPolicy;
   startupTimeoutMs?: number;
   heartbeatTimeoutMs?: number;
@@ -152,6 +174,9 @@ function startupFailureDetails(error: unknown): {
 export function createChannelWorkerGroup(
   opts: CreateChannelWorkerGroupOptions,
 ): ChannelWorkerGroup {
+  assertChannelControlWorkspaceCapacity(
+    opts.groups.map((group) => group.workspaceCwd),
+  );
   let generation = 0;
   let entries = new Map<string, ChannelWorkerGroupEntry>();
   const groupsByWorkspace = new Map(
@@ -214,6 +239,9 @@ export function createChannelWorkerGroup(
       ...(opts.shared.daemonToken
         ? { daemonToken: opts.shared.daemonToken }
         : {}),
+      ...(opts.shared.workerTlsCaCertPath
+        ? { tlsCaCertPath: opts.shared.workerTlsCaCertPath }
+        : {}),
       workspace: runtime.workspaceCwd,
       selection: group.selection,
       // Multi-workspace runtimes expose a per-workspace env overlay; a
@@ -231,6 +259,84 @@ export function createChannelWorkerGroup(
       ...(opts.shared.heartbeatTimeoutMs !== undefined
         ? { heartbeatTimeoutMs: opts.shared.heartbeatTimeoutMs }
         : {}),
+      registerChannelLoopMcp: async ({ sessionId, ownerId, sendMessage }) => {
+        runtime.clientMcpSenderRegistry.setSession(
+          CHANNEL_LOOP_MCP_SERVER_NAME,
+          sessionId,
+          sendMessage,
+          ownerId,
+        );
+        try {
+          const config: ClientMcpOverWsRuntimeConfig = {
+            type: 'sdk',
+            [CLIENT_MCP_OVER_WS_CONFIG_FLAG]: true,
+          };
+          const result = await runtime.bridge.addSessionRuntimeMcpServer(
+            sessionId,
+            CHANNEL_LOOP_MCP_SERVER_NAME,
+            config,
+            ownerId,
+          );
+          if ((result as { skipped?: boolean }).skipped) {
+            throw new Error(
+              `runtime MCP add skipped: ${
+                (result as { reason?: string }).reason ?? 'unknown'
+              }`,
+            );
+          }
+          if ((result as { shadowedSettings?: boolean }).shadowedSettings) {
+            throw new Error(
+              `channel loop MCP server conflicts with a configured MCP server`,
+            );
+          }
+          if (
+            !runtime.clientMcpSenderRegistry.ownsSession(
+              CHANNEL_LOOP_MCP_SERVER_NAME,
+              sessionId,
+              ownerId,
+            )
+          ) {
+            throw new Error('Channel loop MCP registration was superseded.');
+          }
+        } catch (error) {
+          if (
+            runtime.clientMcpSenderRegistry.deleteSession(
+              CHANNEL_LOOP_MCP_SERVER_NAME,
+              sessionId,
+              ownerId,
+            )
+          ) {
+            await runtime.bridge
+              .removeSessionRuntimeMcpServer(
+                sessionId,
+                CHANNEL_LOOP_MCP_SERVER_NAME,
+                ownerId,
+              )
+              .catch(() => {});
+          }
+          throw error;
+        }
+      },
+      unregisterChannelLoopMcp: async (sessionId, ownerId) => {
+        if (
+          !runtime.clientMcpSenderRegistry.deleteSession(
+            CHANNEL_LOOP_MCP_SERVER_NAME,
+            sessionId,
+            ownerId,
+          )
+        ) {
+          return;
+        }
+        try {
+          await runtime.bridge.removeSessionRuntimeMcpServer(
+            sessionId,
+            CHANNEL_LOOP_MCP_SERVER_NAME,
+            ownerId,
+          );
+        } catch (error) {
+          if (!(error instanceof SessionNotFoundError)) throw error;
+        }
+      },
       ...(opts.onReady
         ? {
             onReady: (snapshot) => {
@@ -377,7 +483,19 @@ export function createChannelWorkerGroup(
 
   const routeEntry = (
     channelName: string,
+    workspaceCwd?: string,
   ): ChannelWorkerGroupEntry | undefined => {
+    if (workspaceCwd !== undefined) {
+      const entry = entries.get(workspaceCwd);
+      if (
+        entry &&
+        (entry.selection.mode === 'all' ||
+          entry.selection.names.includes(channelName))
+      ) {
+        return entry;
+      }
+      return undefined;
+    }
     for (const entry of entries.values()) {
       if (
         entry.selection.mode === 'all' ||
@@ -460,6 +578,20 @@ export function createChannelWorkerGroup(
         const targets = new Map(
           targetGroups.map((target) => [target.workspaceCwd, target]),
         );
+        if (reconcileOptions?.forceWorkspaceCwd) {
+          for (const workspaceCwd of targets.keys()) {
+            if (workspaceCwd !== reconcileOptions.forceWorkspaceCwd) {
+              targets.delete(workspaceCwd);
+            }
+          }
+        }
+        // Failed rollback can retain both the previous and candidate owners.
+        assertChannelControlWorkspaceCapacity([
+          ...entries.keys(),
+          ...groupsByWorkspace.keys(),
+          ...Array.from(pendingEntries, (entry) => entry.workspaceCwd),
+          ...targets.keys(),
+        ]);
         const unchanged = new Map<string, ChannelWorkerGroupEntry>();
         const oldAffected: ChannelWorkerGroupEntry[] = [];
         const newEntries: ChannelWorkerGroupEntry[] = [];
@@ -467,9 +599,20 @@ export function createChannelWorkerGroup(
         for (const [workspaceCwd, entry] of entries) {
           const target = targets.get(workspaceCwd);
           const healthy = entry.supervisor.snapshot().state === 'running';
+          const forceWorkspace =
+            reconcileOptions?.forceWorkspaceCwd === workspaceCwd;
+          const preserveOtherWorkspace =
+            reconcileOptions?.forceWorkspaceCwd !== undefined &&
+            !forceWorkspace;
+          if (preserveOtherWorkspace) {
+            unchanged.set(workspaceCwd, entry);
+            targets.delete(workspaceCwd);
+            continue;
+          }
           if (
             target &&
             !reconcileOptions?.force &&
+            !forceWorkspace &&
             healthy &&
             selectionsEqual(entry.selection, target.selection)
           ) {
@@ -563,16 +706,17 @@ export function createChannelWorkerGroup(
           committed.set(entry.workspaceCwd, entry);
         }
         entries = committed;
-        const targetWorkspaceCwds = new Set(
-          targetGroups.map((target) => target.workspaceCwd),
-        );
+        const targetWorkspaceCwds = new Set(committed.keys());
         for (const workspaceCwd of groupsByWorkspace.keys()) {
           if (!targetWorkspaceCwds.has(workspaceCwd)) {
             groupsByWorkspace.delete(workspaceCwd);
           }
         }
-        for (const target of targetGroups) {
-          groupsByWorkspace.set(target.workspaceCwd, target);
+        for (const entry of committed.values()) {
+          groupsByWorkspace.set(entry.workspaceCwd, {
+            workspaceCwd: entry.workspaceCwd,
+            selection: entry.selection,
+          });
         }
         return { changed: true, workers: entrySnapshots() };
       })().finally(() => {
@@ -622,9 +766,13 @@ export function createChannelWorkerGroup(
         ? 1
         : 0;
     },
-    removeWorkspace(workspaceCwd) {
+    removeWorkspace(workspaceCwd, options) {
       const existing = removalPromises.get(workspaceCwd);
-      if (existing) return existing;
+      if (existing) {
+        return options?.permanent
+          ? existing.finally(() => groupsByWorkspace.delete(workspaceCwd))
+          : existing;
+      }
       drainingWorkspaces.add(workspaceCwd);
       const removal = (async () => {
         try {
@@ -646,6 +794,7 @@ export function createChannelWorkerGroup(
           if (killError) throw killError;
         } finally {
           drainingWorkspaces.delete(workspaceCwd);
+          if (options?.permanent) groupsByWorkspace.delete(workspaceCwd);
         }
       })();
       removalPromises.set(workspaceCwd, removal);
@@ -667,6 +816,12 @@ export function createChannelWorkerGroup(
       if (entries.has(workspaceCwd)) return;
       const target = groupsByWorkspace.get(workspaceCwd);
       if (!target) return;
+      assertChannelControlWorkspaceCapacity([
+        ...entries.keys(),
+        ...groupsByWorkspace.keys(),
+        ...Array.from(pendingEntries, (entry) => entry.workspaceCwd),
+        target.workspaceCwd,
+      ]);
       const entry = createEntry(target);
       entries.set(workspaceCwd, entry);
       if (!groupStarted || stopping) {
@@ -697,9 +852,32 @@ export function createChannelWorkerGroup(
         throw err;
       }
     },
+    async deliverChannelMessage(request, workspaceCwd) {
+      const entry = routeEntry(request.channelName, workspaceCwd);
+      const deliver = entry?.supervisor.deliverChannelMessage;
+      if (entry && drainingWorkspaces.has(entry.workspaceCwd)) {
+        throw new ChannelDeliveryError(
+          'channel_worker_unavailable',
+          `Channel worker for channel "${request.channelName}" is unavailable while its workspace is draining.`,
+        );
+      }
+      if (!entry || !deliver) {
+        const hint = workspaceCwd
+          ? `No channel worker for the selected workspace owns channel "${request.channelName}".`
+          : `No channel worker owns channel "${request.channelName}".`;
+        throw new ChannelDeliveryError('channel_worker_unavailable', hint);
+      }
+      return deliver.call(entry.supervisor, request);
+    },
     async enqueueWebhookTask(task) {
       const entry = routeEntry(task.channelName);
-      if (!entry || drainingWorkspaces.has(entry.workspaceCwd)) {
+      if (entry && drainingWorkspaces.has(entry.workspaceCwd)) {
+        throw new ChannelWebhookEnqueueError(
+          'channel_worker_unavailable',
+          `Channel worker for channel "${task.channelName}" is unavailable while its workspace is draining.`,
+        );
+      }
+      if (!entry) {
         throw new ChannelWebhookEnqueueError(
           'channel_worker_unavailable',
           `No channel worker owns channel "${task.channelName}".`,

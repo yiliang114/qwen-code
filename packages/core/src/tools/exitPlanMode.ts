@@ -7,6 +7,7 @@
 import type {
   ToolCallConfirmationDetails,
   ToolPlanConfirmationDetails,
+  ToolConfirmationPayload,
   ToolResult,
 } from './tools.js';
 import type { PermissionDecision } from '../permissions/types.js';
@@ -28,6 +29,8 @@ import {
 } from '../agents/runtime/subagent-plan-tool-policy.js';
 import { getTeammateContext } from '../agents/team/identity.js';
 import type { TeamPlanApprovalDecision } from '../agents/team/TeamManager.js';
+import { StructuredToolError } from './priorReadEnforcement.js';
+import { ToolErrorType } from './tool-error.js';
 
 const debugLogger = createDebugLogger('EXIT_PLAN_MODE');
 
@@ -86,6 +89,18 @@ const exitPlanModeToolSchemaData: FunctionDeclaration = {
   },
 };
 
+/**
+ * `llmContent` prefixes that mark a successful plan-mode exit (user or
+ * leader approval). The tool scheduler keys its post-execution history
+ * sanitization (#6237) off these, so they must stay in lockstep with the
+ * success returns in `ExitPlanModeToolInvocation.execute` /
+ * `executePlanRequiredTeammate` below.
+ */
+export const PLAN_EXIT_APPROVED_LLM_CONTENT_PREFIXES = [
+  'User approved.',
+  'Leader approved.',
+] as const;
+
 interface ExitApprovalSnapshot {
   plan: string;
   approvalModeRevision: number;
@@ -115,6 +130,11 @@ class ExitPlanModeToolInvocation extends BaseToolInvocation<
   }
 
   override requiresUserInteraction(): boolean {
+    // Outside plan mode, no user interaction is needed — execute() will
+    // return a guidance error directly (#7671).
+    if (this.config.getApprovalMode() !== ApprovalMode.PLAN) {
+      return false;
+    }
     return (
       !isPlanRequiredTeammateContext() &&
       !isPlanLifecycleToolUnavailableInSubagent(ToolNames.EXIT_PLAN_MODE)
@@ -122,13 +142,11 @@ class ExitPlanModeToolInvocation extends BaseToolInvocation<
   }
 
   override async getDefaultPermission(): Promise<PermissionDecision> {
-    if (
-      isPlanRequiredTeammateContext() ||
-      isPlanLifecycleToolUnavailableInSubagent(ToolNames.EXIT_PLAN_MODE)
-    ) {
-      return 'allow';
-    }
-    return this.config.getApprovalMode() === ApprovalMode.PLAN ? 'ask' : 'deny';
+    // Always allow at the permission layer. Plan-mode gating lives in
+    // requiresUserInteraction() (forces 'ask' via permissionFlow) and
+    // execute() (returns guidance error outside plan mode). A single
+    // source of truth avoids duplicated conditionals (#7671).
+    return 'allow';
   }
 
   override async getConfirmationDetails(
@@ -141,7 +159,10 @@ class ExitPlanModeToolInvocation extends BaseToolInvocation<
       return super.getConfirmationDetails(abortSignal);
     }
     if (this.config.getApprovalMode() !== ApprovalMode.PLAN) {
-      throw new Error('Cannot request plan approval outside plan mode.');
+      throw new StructuredToolError(
+        this.outsidePlanGuidanceMessage(),
+        ToolErrorType.EXECUTION_DENIED,
+      );
     }
 
     const snapshot: ExitApprovalSnapshot = {
@@ -157,14 +178,29 @@ class ExitPlanModeToolInvocation extends BaseToolInvocation<
       hideAlwaysAllow: true,
       plan: snapshot.plan,
       prePlanMode: snapshot.prePlanMode,
-      onConfirm: async (outcome: ToolConfirmationOutcome) => {
+      onConfirm: async (
+        outcome: ToolConfirmationOutcome,
+        payload?: ToolConfirmationPayload,
+      ) => {
         switch (outcome) {
-          case ToolConfirmationOutcome.RestorePrevious:
+          case ToolConfirmationOutcome.RestorePrevious: {
+            this.approval = undefined;
+            const executionMode = this.config.getPlanExecutionMode?.();
+            if (
+              executionMode !== undefined &&
+              payload?.expectedPlanExecutionMode !== executionMode
+            ) {
+              throw new StructuredToolError(
+                'Execution permission changed or was not confirmed. Request plan approval again with the current permission.',
+                ToolErrorType.EXECUTION_DENIED,
+              );
+            }
             this.approval = {
               snapshot,
-              targetMode: snapshot.prePlanMode,
+              targetMode: executionMode ?? snapshot.prePlanMode,
             };
             break;
+          }
           case ToolConfirmationOutcome.ProceedAlways:
             this.approval = {
               snapshot,
@@ -201,6 +237,17 @@ class ExitPlanModeToolInvocation extends BaseToolInvocation<
       );
     }
 
+    // Not in plan mode and no approval snapshot — the user may have
+    // manually switched modes. Return a guidance error instead of a
+    // permission deny (#7671). If there IS an approval snapshot, let the
+    // stale-revision check below handle it (concurrent exit scenario).
+    if (this.config.getApprovalMode() !== ApprovalMode.PLAN && !this.approval) {
+      return this.errorResult(
+        this.outsidePlanGuidanceMessage(),
+        ToolErrorType.EXECUTION_DENIED,
+      );
+    }
+
     const { plan, originalRequest, researchSummary } = this.params;
     if (isPlanRequiredTeammateContext()) {
       return this.executePlanRequiredTeammate(
@@ -234,7 +281,9 @@ class ExitPlanModeToolInvocation extends BaseToolInvocation<
 
     this.savePlanBestEffort(snapshot.plan);
     try {
-      this.config.setApprovalMode(targetMode);
+      this.config.setApprovalMode(targetMode, {
+        fromApprovedPlanExit: true,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       debugLogger.error(
@@ -331,7 +380,9 @@ class ExitPlanModeToolInvocation extends BaseToolInvocation<
 
     this.savePlanBestEffort(plan);
     try {
-      this.config.setApprovalMode(decision.targetMode);
+      this.config.setApprovalMode(decision.targetMode, {
+        fromApprovedPlanExit: true,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return this.errorResult(
@@ -352,6 +403,15 @@ class ExitPlanModeToolInvocation extends BaseToolInvocation<
     };
   }
 
+  private outsidePlanGuidanceMessage(): string {
+    const currentMode = this.config.getApprovalMode();
+    return (
+      `You are not in plan mode (current mode: ${currentMode}). ` +
+      `The user may have manually switched modes via Shift+Tab or /approval-mode. ` +
+      `Do not call exit_plan_mode again. Continue working in the current mode.`
+    );
+  }
+
   private savePlanBestEffort(plan: string): void {
     try {
       this.config.savePlan(plan);
@@ -362,11 +422,11 @@ class ExitPlanModeToolInvocation extends BaseToolInvocation<
     }
   }
 
-  private errorResult(message: string): ToolResult {
+  private errorResult(message: string, type?: ToolErrorType): ToolResult {
     return {
       llmContent: message,
       returnDisplay: message,
-      error: { message },
+      error: { message, type },
     };
   }
 

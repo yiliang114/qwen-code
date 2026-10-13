@@ -3,16 +3,94 @@
 Qwen Code Web Shell 是面向浏览器的 daemon 会话终端 UI，可以作为 React
 组件嵌入到其他项目中。
 
+## 开发网页预览
+
+独立 Web Shell 的右侧面板提供「网页预览」。先通过终端启动开发服务器，
+再打开面板并输入当前浏览器可访问的 HTTP/HTTPS 地址。预览支持热更新、
+刷新、390px 手机宽度与桌面宽度切换，以及外部打开。
+
+面板内切换标签会保留页面运行状态。URL 和宽度模式按工作区与会话保存；
+重新打开整个面板、切换会话或刷新 Web Shell 后会从保存的入口 URL 加载。
+预览中的跨域页面导航不会同步到地址栏，刷新也会返回入口 URL。
+关闭预览不会停止开发服务器。
+
+Artifact 发布的网页链接会在对应轮次留下产物卡片；开启网页预览后，
+点击卡片「打开」可在右栏查看。普通 `record_artifact` 链接显示详情，
+可从详情外部打开。关闭页签不删除卡片，之后仍能从历史消息重新打开。手动输入的地址只保存为面板状态，不会新增对话记录。
+实时链接始终显示当前内容。
+
+需要保留当时的网页时，使用 `Artifact` 发布自包含 HTML：每次发布会额外
+保存一份独立的历史版本，包含内联样式、脚本、数据和内嵌资源。原消息的
+卡片打开当次保存的内容，关闭面板、刷新或重启 daemon 后仍可回看和交互，
+不依赖源文件、最新发布地址或开发服务器。重新打开会从交付时的初始状态
+开始，不保存用户在预览中的临时操作状态。
+
+历史版本文件保存在所属运行目录的 `artifacts/snapshots/` 中；原发布 URL
+仍更新为最新版。记录沿用会话产物的保留策略（默认最多 200 条，超过后
+可能淘汰旧记录），并非无限存档。淘汰、删除记录、回退历史或删除会话时，
+会释放该会话的快照引用；分支会话仍在使用的内容会保留，最后一个引用
+释放后才回收文件。持久化失败时不会提前删除历史文件。旧版没有引用信息
+的快照，以及落盘前崩溃或清理失败留下的文件会保守保留。仅开启会话记录的受管 ACP 会话保存快照，普通 CLI 发布
+不额外写入历史文件。删除运行目录、移动会话而未复制快照，
+或修改快照文件后会提示不可用，不会退回最新版。普通实时链接和过去未保存
+内容的记录不能自动还原；任意开发网站也不会自动打包成离线网页。
+
+嵌入式接入方通过 `rightPanel={{ items: ['review', 'sideTask', 'webPreview'] }}`
+开启入口。宿主 CSP 需要允许预览来源的 `frame-src`，同时用
+`frame-ancestors` 限制宿主页面只能被受信任的宿主嵌入，不能允许开发页面
+反过来嵌入宿主。预览容器会限制直接子页面跳转，但开发应用自己的后代
+iframe 仍需宿主的防嵌入策略保护。
+
+地址必须使用主机名或 IPv4，不能包含登录凭据，也不能指向 Web Shell 或
+daemon 自身。页面的防嵌入策略可能要求使用外部打开。远程开发目前需要
+浏览器可访问的地址或已有端口转发；预览不会自动把浏览器的 `localhost`
+转成远程 daemon 地址，也不会转发 daemon 凭据。
+
 ## 环境要求
 
 - React：`^18.0.0 || ^19.0.0`
 - React DOM：`^18.0.0 || ^19.0.0`
-- `@qwen-code/webui`：`>=0.0.1`
 - `@qwen-code/sdk`：`>=0.1.8`
 - 浏览器环境需要能访问 Qwen Code daemon serve 的 HTTP 接口。
 
 组件包会自动注入自身的 CSS（包括 Tailwind 编译产物），接入方不需要配置
 Tailwind 或额外引入全局 CSS。
+
+## 浏览器任务通知
+
+通过 `qwen serve` 打开的独立 Web Shell 可在 **Settings → UI → 浏览器任务通知**
+管理提醒。内置 `main.tsx` 显式设置默认开启；用户已保存的关闭选择优先。仅在用户点击后申请浏览器授权；偏好保存在当前浏览器站点，
+不写入 daemon 或 workspace 设置，同源标签页之间同步。
+
+页面在后台或窗口失焦时，当前聊天及 Split View 中仍挂载的聊天在回合结束或失败后
+可以发送系统通知。取消回合、初次加载历史和前台已处理的回合保持静默。通知显示会话标题（最多 60 个 Unicode 码点）、回合状态，以及带“提问 / 回复”标签的本轮提问（最多 80 个码点）和回复（最多 120 个码点）纯文本摘录。
+标题显示 QwenCode · 会话名，尚未生成时使用本轮问题首行，两者均缺失时显示 QwenCode；业务文案不额外添加地址。通知携带 Qwen Code 图标，实际显示位置由浏览器和操作系统决定，不能替换 macOS 上 Chrome 自身的标志。摘要直接截取文本，不额外调用模型；提问或回复缺失时省略对应行，两者均缺失时只显示状态。失败时可显示本轮提问，不展示错误详情或部分回复。系统可能进一步截短通知正文。
+通知内容可能显示在系统通知中心或锁屏上，遵循系统的预览设置；点击通知尝试聚焦原窗口并在主聊天中打开对应会话，退出设置页或分屏；已在目标会话时不会重新加载。
+
+需要支持 Notifications API 的桌面浏览器以及 HTTPS 或可信的 localhost 环境。
+支持 Web Locks 且存储可用时，同源标签页协调去重；否则退化为页面内去重及相同 tag
+的通知替换。关闭网页、页面冻结或离开未挂载的聊天后不保证提醒。嵌入式组件不自动
+启用此能力；Channel 推送不在首版范围内。
+
+`WebShellWithProviders`（及别名 `StandaloneWebShell`）支持通过 `browserNotifications` 接入通知并配置名称和图标：
+
+```tsx
+<WebShellWithProviders
+  baseUrl="https://daemon.example.com"
+  sidebar
+  browserNotifications={{
+    defaultEnabled: true,
+    appName: 'DataAgent',
+    iconUrl: 'https://cdn.example.com/assets/dataagent.png',
+  }}
+/>
+```
+
+传入 `{}` 时使用默认 `QwenCode` 名称和随包图标；名称和图标均可单独省略，空白值也回退默认。标题显示“应用名称 · 会话标题”。图片 URL 由浏览器直接加载，可使用 HTTPS CDN 地址；加载失败不保证自动回退到默认图标。
+
+`defaultEnabled` 默认 `false`；设为 `true` 时仅对没有保存通知偏好的浏览器站点默认开启。用户明确开启或关闭的选择优先，刷新后也保留；挂载后修改默认值不会覆盖当前选择。不传 `browserNotifications` 时保持嵌入入口原有行为，不接入通知。即使默认开启，也不会自动申请权限，用户仍需在 Settings → UI 中允许浏览器通知。修改品牌值不会重新加载当前会话。通知点击只导航所属实例，并遵守其当前锁定工作区。
+
+低层 `WebShell` 的 daemon providers 由宿主管理，不支持这个配置属性；qwen serve 内置页面继续使用默认品牌。本配置仅影响通知，不改变侧边栏品牌、Chrome 来源地址或浏览器标志。
 
 ## Tailwind 与 shadcn/ui
 
@@ -52,6 +130,45 @@ Web Shell 内部使用；没有明确的公共 API 需求时，不要从包入�
 Tailwind 会在发布前编译并内联到 npm 包，接入方不需要安装或配置 Tailwind，也不
 需要额外引入 `globals.css`。
 
+## 可选 Shadow DOM 隔离
+
+宿主页面存在 `*`、`h2`、`button` 等全局规则时，可以按场景开启 Shadow DOM：
+
+```tsx
+import customShadowStyles from './web-shell-shadow.css?inline';
+
+<WebShellWithProviders
+  shadowDom={{
+    plugins: true,
+    portals: true,
+    styles: customShadowStyles,
+  }}
+/>;
+```
+
+- `plugins` 隔离所有插件管理页面主体，包括统一的 Plugins 页面，以及
+  `/extensions`、`/mcp`、`/skills` 等兼容入口打开的页面。
+- `portals` 统一隔离 Web Shell 的所有弹窗层，包括 Dialog、Drawer、Popover、
+  DropdownMenu、Select 和 Tooltip；插件页面发起的弹窗也由这个开关管理。
+- `styles` 会追加到每个启用的 ShadowRoot，供 render props 等业务自定义内容继续
+  使用 class 样式。内联样式和通过 Web Shell `style` 设置的 CSS 变量不需要迁移。
+- `--web-shell-portal-root-z-index` 控制 Shadow portal host 的整体层级，默认
+  `1000`。需要与宿主自己的全局浮层协调时，可以通过 Web Shell `style` 覆盖。
+- `shadowDom={true}` 是同时开启 `plugins` 和 `portals` 的简写。
+
+默认不开启，现有 Light DOM 接入行为不变。两个场景相互独立，例如
+`{ plugins: true, portals: false }` 会隔离插件页面主体，但所有弹窗仍挂载到原来的
+Light DOM portal root。
+
+Shadow 内部仍由原 React 树通过 portal 渲染，不会创建第二个 React root；props、
+context、事件、ref 和状态语义保持不变。开启后，宿主普通选择器不会匹配 Shadow
+内部节点，但宿主也无法再用普通选择器直接覆盖这些节点，所需定制样式应通过
+`shadowDom.styles` 传入。
+
+Web Shell 会在挂载 Shadow 内容前安装样式，并在浏览器支持时让多个 ShadowRoot
+复用已经解析的 constructable stylesheet，以避免页面首次进入时的无样式闪烁和
+重复解析 CSS。
+
 ### 图标约定
 
 - 新增图标统一优先使用 `lucide-react`，不要为已有的常见图标重复编写 SVG。
@@ -75,7 +192,7 @@ npm install @qwen-code/web-shell
 Peer dependencies 需要同时安装：
 
 ```bash
-npm install react react-dom @qwen-code/webui @qwen-code/sdk
+npm install react react-dom @qwen-code/sdk
 ```
 
 ## 接入方式
@@ -96,8 +213,9 @@ export function QwenCodePanel() {
       baseUrl="http://127.0.0.1:4170"
       token="your-bearer-token"
       sessionId="838e1811-9f84-4848-9915-d9a7f01ff5c6"
-      onSessionIdChange={(sessionId) => {
-        console.log('current session:', sessionId);
+      sessionContext={{ kind: 'standalone' }}
+      onSessionIdChange={(sessionId, _workspaceId, _workspaceCwd, context) => {
+        console.log('current session:', sessionId, context);
       }}
       onSessionCreated={async (sessionId) => {
         await registerSession(sessionId);
@@ -118,23 +236,102 @@ chat + terminal）。宿主自行提供 Provider，WebShell 只消费 hooks。
 import {
   DaemonWorkspaceProvider,
   DaemonSessionProvider,
-} from '@qwen-code/webui/daemon-react-sdk';
-import { WebShell } from '@qwen-code/web-shell';
+  WebShell,
+  useWorkspace,
+} from '@qwen-code/web-shell';
+
+function SessionViews() {
+  const workspace = useWorkspace();
+  if (!workspace.capabilities) {
+    if (workspace.status === 'error') {
+      return (
+        <button
+          onClick={() => void workspace.refreshCapabilities?.().catch(() => {})}
+        >
+          Try again
+        </button>
+      );
+    }
+    return <p role="status">Loading workspace…</p>;
+  }
+  return (
+    <DaemonSessionProvider sessionId="...">
+      <ChatPanel />
+      <WebShell theme="dark" language="zh-CN" />
+    </DaemonSessionProvider>
+  );
+}
 
 export function App() {
   return (
     <DaemonWorkspaceProvider baseUrl="http://127.0.0.1:4170" token="...">
-      <DaemonSessionProvider sessionId="...">
-        <ChatPanel />
-        <WebShell theme="dark" language="zh-CN" />
-      </DaemonSessionProvider>
+      <SessionViews />
     </DaemonWorkspaceProvider>
   );
 }
 ```
 
+恢复已有会话时，直接组合 Provider 的宿主需要像示例一样，等待首次 capabilities
+成功后再挂载 `DaemonSessionProvider`，并在它上方提供发现失败的重试入口。
+否则主工作区稍后确定时，会话上下文变化可能触发重复恢复。后续刷新失败会保留已知
+capabilities，此时应保持会话挂载。该等待只用于首次发现，不应屏蔽真正的工作区切换。
+
 > **注意**：不要在已有 `DaemonSessionProvider` 下使用
 > `WebShellWithProviders`，否则会创建嵌套的重复 Provider。
+
+### 3. 只读 ChatRecord JSONL
+
+`WebShellTranscript` 只接收已经投影完成的 blocks，不连接 daemon，也不提供 composer、
+审批或 session mutation。浏览器宿主可以逐行解析 JSONL，再通过 SDK 的 opt-in facade
+投影：
+
+> 只渲染 transcript 的宿主请从 `@qwen-code/web-shell/transcript` 子路径导入。包根会连带
+> `App`、daemon providers 和编辑器/终端相关代码，不要依赖 tree shaking 把它们摇掉。
+
+```tsx
+import { projectChatRecordsToDaemonTranscript } from '@qwen-code/sdk/daemon/transcript';
+import { WebShellTranscript } from '@qwen-code/web-shell/transcript';
+
+const records = jsonl
+  .split(/\r?\n/)
+  .filter((line) => line.trim())
+  .map((line) => JSON.parse(line) as unknown);
+const projection = projectChatRecordsToDaemonTranscript(records);
+
+<WebShellTranscript
+  blocks={projection.blocks}
+  theme="dark"
+  language="zh-CN"
+  style={{ height: 640 }}
+/>;
+```
+
+宿主应显示 `projection.diagnostics`，并在 `complete=false` 或 `truncated=true` 时提示
+历史可能不完整。组件需要一个可用高度；自定义 renderer 的副作用仍由宿主负责。
+
+## 拖入文件的默认行为
+
+通过 `fileDropAction` 指定拖入文件时的默认去向，适用于 `WebShell` 和
+`WebShellWithProviders`：
+
+```tsx
+<WebShellWithProviders fileDropAction="upload" fileUploadDirectory="uploads" />
+<WebShellWithProviders fileDropAction="attach" />
+```
+
+- `upload`：直接上传到工作区，并插入 `@文件` 引用。
+- `attach`：直接添加为当前消息的附件。
+- 不传：仅当上传和附件都可用时显示选择弹窗。
+
+只有一种方式可用时直接使用它，即使配置的默认去向是另一种；两种都不可用时
+不接收拖入文件。`fileUploadEnabled={false}` 只关闭工作区上传，不再关闭附件
+拖入或添加附件入口。上传仍受 daemon 能力、工作区信任及目标路径检查约束。
+修改默认去向或可用方式时，会关闭已经打开的选择弹窗；需要重新拖入文件。
+
+## 消息操作
+
+- 已完成的 assistant 消息支持复制；具备持久化 checkpoint 时还支持分支。
+- 终态 turn error 支持复制显示的错误文本。重试入口保持独立，错误轮次不支持分支。
 
 ## Props
 
@@ -142,25 +339,152 @@ export function App() {
 
 包含 `WebShell` 的所有 Props，加上 Provider 配置：
 
-| 属性               | 类型     | 说明                                                                                 |
-| ------------------ | -------- | ------------------------------------------------------------------------------------ |
-| `baseUrl`          | `string` | daemon API 地址，未传时使用 `window.location.origin`                                 |
-| `token`            | `string` | daemon API Bearer token                                                              |
-| `sessionId`        | `string` | 要连接的 session id；未传或 `undefined` 时保持空页面                                 |
-| `workspaceId`      | `string` | 已注册工作区 id，主要用于定位已有 session；不会注册或锁定工作区                      |
-| `workspaceCwd`     | `string` | 已注册工作区路径，语义同 `workspaceId`；不会注册或锁定工作区，且优先于 `workspaceId` |
-| `lockWorkspaceCwd` | `string` | 锁定到指定工作区路径；未注册时自动持久注册，并隐藏其他工作区及添加、移除和选择入口   |
+| 属性                   | 类型                                  | 说明                                                                                                                                           |
+| ---------------------- | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `browserNotifications` | `WebShellBrowserNotificationsOptions` | 可选接入通知；`appName` 默认 QwenCode，`iconUrl` 默认内联 PNG（支持 CDN），`defaultEnabled` 默认 false；已保存偏好优先；不传时停用，不重建会话 |
+| `baseUrl`              | `string`                              | daemon API 地址，未传时使用 `window.location.origin`                                                                                           |
+| `token`                | `string`                              | daemon API Bearer token                                                                                                                        |
+| `sessionId`            | `string`                              | 要连接的 session id；未传或 `undefined` 时保持空页面                                                                                           |
+| `workspaceId`          | `string`                              | 已注册工作区 id，主要用于定位已有 session；不会注册或锁定工作区                                                                                |
+| `workspaceCwd`         | `string`                              | 已注册工作区路径，语义同 `workspaceId`；不会注册或锁定工作区，且优先于 `workspaceId`                                                           |
+| `sessionContext`       | `DaemonProductSessionContext`         | 显式产品上下文；standalone 或 Live 上下文不能同时传 `workspaceId`、`workspaceCwd` 或 `lockWorkspaceCwd`                                        |
+| `lockWorkspaceCwd`     | `string`                              | 锁定到指定工作区路径；未注册时自动持久注册，并隐藏其他工作区及添加、移除和选择入口                                                             |
+| `restartSseOnPrompt`   | `boolean`                             | 每次 prompt 被 daemon 接收后重建存活 SSE 流；流断开时提交 prompt 总会立即重建（与此开关无关）；默认关闭                                        |
 
 ### WebShell
 
-| 属性                | 类型                                                                                    | 说明                                                                             |
-| ------------------- | --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `onSessionIdChange` | `(sessionId: string \| undefined, workspaceId?: string, workspaceCwd?: string) => void` | 当前 session 或工作区变化时触发                                                  |
-| `onSessionCreated`  | `(sessionId: string) => Promise<void> \| void`                                          | 新 session 创建后触发；完成前会阻塞 session 初始化和 prompt 提交，最长等待 30 秒 |
-| `theme`             | `'dark' \| 'light'`                                                                     | UI 主题，默认 `dark`                                                             |
-| `onThemeChange`     | `(theme: WebShellTheme) => void`                                                        | `/theme` 命令切换主题后触发                                                      |
-| `language`          | `'en' \| 'zh-CN' \| 'zh' \| 'zh-cn'`                                                    | UI 语言                                                                          |
-| `onLanguageChange`  | `(language: WebShellLanguage) => void`                                                  | `/language ui` 切换 UI 语言后触发                                                |
+| 属性                       | 类型                                                                                                                                  | 说明                                                                                                                                           |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `onSessionIdChange`        | `(sessionId: string \| undefined, workspaceId?: string, workspaceCwd?: string, sessionContext?: DaemonProductSessionContext) => void` | 当前 session、工作区或显式产品上下文变化时触发；standalone 和 Live 通过第四个参数上报                                                          |
+| `onSessionCreated`         | `(sessionId: string) => Promise<void> \| void`                                                                                        | 新 session 创建后触发；完成前会阻塞 session 初始化和 prompt 提交，最长等待 30 秒                                                               |
+| `theme`                    | `'dark' \| 'light'`                                                                                                                   | UI 主题，默认 `dark`                                                                                                                           |
+| `onThemeChange`            | `(theme: WebShellTheme) => void`                                                                                                      | `/theme` 命令切换主题后触发                                                                                                                    |
+| `onThemeResolved`          | `(theme: WebShellTheme) => void`                                                                                                      | 未提供 `theme` 且 shell 从 daemon 设置解析出主题时触发；仅供宿主同步文档外观，不应持久化为宿主偏好                                             |
+| `language`                 | `'en' \| 'zh-CN' \| 'zh' \| 'zh-cn'`                                                                                                  | UI 语言                                                                                                                                        |
+| `onLanguageChange`         | `(language: WebShellLanguage) => void`                                                                                                | `/language ui` 切换 UI 语言后触发                                                                                                              |
+| `onLanguageResolved`       | `(language: WebShellLanguage) => void`                                                                                                | 未提供 `language` 时，有效 UI 语言在未成为宿主偏好时触发，包括设置解析、乐观切换与回滚；仅供同步文档外观                                       |
+| `brand`                    | `WebShellBrand`                                                                                                                       | 产品品牌（名称与 Logo，`logo` 为 React 节点）；提供时整体取代 daemon 解析出的品牌，见下方「品牌（白标）」                                      |
+| `onBrandResolved`          | `(brand: WebShellResolvedBrand) => void`                                                                                              | 品牌解析完成后触发，载荷只含 `name` 与 `logoDataUri`（不含 `logo` 节点），供宿主应用到自己的文档；shell 自身从不写 `document.title` 或 favicon |
+| `onSlashCommand`           | `(command: WebShellSlashCommand) => boolean \| void`                                                                                  | 斜杠命令进入默认处理前触发；返回 `true` 时由宿主接管并跳过默认行为                                                                             |
+| `onSessionArtifactsChange` | `(change: WebShellSessionArtifactsChange) => void`                                                                                    | Session Artifact 初始恢复或变化后返回当前完整快照与 turn 投影                                                                                  |
+
+宿主可以通过 `onContextUsageOpen?: (sessionId: string) => void` 接管上下文
+详情的打开操作：
+
+```tsx
+<WebShell onContextUsageOpen={(sessionId) => openContextDetails(sessionId)} />
+```
+
+此参数也适用于 `WebShellWithProviders`。提供回调后，composer hover 弹层的
+「查看明细」及页头上下文详情入口会将来源会话 ID 交给宿主，不再打开内置右侧
+面板或自动读取详情；分屏传入对应分屏的会话 ID。不提供回调则保留默认行为。
+直接点击上下文圆环生成 `/context` 快照、压缩操作和已保存面板的恢复不受影响。
+
+宿主可以监听命令，也可以返回 `true` 接管对应操作：
+
+```tsx
+<WebShell
+  onSlashCommand={({ command, args, input }) => {
+    if (command !== 'deploy') return;
+    openDeployDialog({ environment: args, source: input });
+    return true;
+  }}
+/>
+```
+
+回调在主聊天和分屏聊天中都会触发，也可以在 daemon 断连时处理纯宿主操作。
+命令名后必须是空白或输入结束，因此 `/usr/local/bin/tool` 等绝对路径不会触发
+回调。如果回调抛出异常，Web Shell 会报告错误并继续执行默认命令流程。
+
+宿主需要同步 Session 产物时，可以监听完整快照：
+
+```tsx
+<WebShell
+  onSessionArtifactsChange={({
+    reason,
+    sessionId,
+    sequence,
+    artifacts,
+    artifactsByTurn,
+  }) => {
+    replaceSessionArtifacts({
+      reason,
+      sessionId,
+      sequence,
+      artifacts,
+      artifactsByTurn,
+    });
+  }}
+/>
+```
+
+`restore` 表示进入新 Session 后的首次恢复，可携带空快照；`change` 表示实时
+Artifact 变化、同 Session 重连对账发现的差异，或 transcript 补齐后的 turn
+归属变化。每次都返回完整 `artifacts` 和 `artifactsByTurn`，不提供增量。新 Artifact
+可能先于 turn 归属交付，归属稍后补齐时会再交付一份完整快照。回调会等待 transcript
+load/catch-up 结束；同 Session 短暂断线保留去重基线并主动对账，因此宿主应接受重复
+交付，但不需要从 SSE 时序推断遗漏。`sequence` 在每个新 Session 从 1 开始。宿主回调
+抛错不会影响 WebShell 内置 Artifact 面板与轮末渲染。
+
+嵌入宿主只展示普通任务会话时，可以隐藏 Sidebar 的“任务 / 频道”来源切换：
+
+```tsx
+<WebShellWithProviders sidebar={{ showSessionSourceSwitch: false }} />
+```
+
+隐藏后，Sidebar 的会话目录固定查询 `sourceType: "default"`；独立 WebShell 和未配置
+该选项的宿主仍默认展示来源切换。
+
+### 品牌（白标）
+
+独立部署（`qwen serve` 打开的 Web Shell）用 `settings.json` 换名换 Logo，嵌入宿主用
+`brand` 属性覆盖：
+
+```json
+{
+  "ui": {
+    "brand": {
+      "name": "QiuQiu Code",
+      "logoPath": "~/.qwen/brand/logo.svg"
+    }
+  }
+}
+```
+
+daemon 把该 SVG 读成 `data:image/svg+xml` URI，通过 `GET /brand` 下发。客户端始终以
+`<img>` 渲染它，绝不作为 markup 注入：作为图片加载的 SVG 不能执行脚本，注入的可以，而
+daemon 不净化它读到的文件。该配置只从 User / System / SystemDefaults 三层读取，工作区的
+`.qwen/settings.json` 无法改写品牌 —— 那份文件通常来自打开 shell 的人并未撰写的仓库。
+
+品牌名会替换 Sidebar 品牌行、Sidebar 底部版本 tooltip、欢迎页标题、About 面板的版本行
+标签，以及独立部署下的 `document.title`；Logo 会替换 Sidebar 标记与 favicon。它不会替换
+正文文案：本地化字符串里仍有若干处提到 Qwen Code，auth provider 标签也仍是 `Qwen OAuth`
+（那是身份提供方的名字，不是产品名）。
+
+嵌入宿主传 `brand` 时整体接管名称与 Logo。`logo` 可以是任意 React 节点，因为宿主拥有自己
+的文档与 CSP；宿主也拥有标签页标题和 favicon，shell 只在 standalone 入口写 `document`，
+嵌入时通过 `onBrandResolved` 把名称与 Logo URI 交回宿主自行处理。该回调只在品牌确定后、
+以及这两个值之一发生变化时触发，因此宿主可以直接传内联对象和内联函数，不会每次渲染都重放。
+名称为空字符串等同于未设置，回退到内置名称。
+
+优先级从高到低：`sidebar.branding.render`（整行替换，仍受支持）→ `brand` 属性 → daemon
+解析值 → 内置默认。
+
+```tsx
+<WebShellWithProviders
+  brand={{ name: 'QiuQiu Code', logo: <MyLogo /> }}
+  onBrandResolved={(brand) => {
+    document.title = `${brand.name || 'Qwen Code'} — My Host`;
+  }}
+/>
+```
+
+`Live` 会话分组默认不向嵌入宿主展示；此前版本会默认展示，依赖该分组的宿主升级时
+需要显式开启：
+
+```tsx
+<WebShellWithProviders sidebar={{ showLive: true }} />
+```
 
 锁定工作区时，可以自定义 Sidebar 文件夹行的内容：
 
@@ -182,54 +506,59 @@ export function App() {
 自定义内容仍使用内置的展开、收起行为，`expanded` 会随状态更新；文件夹行右侧的内置操作不会渲染。
 未提供 `lockWorkspaceCwd` 时，该 renderer 不会执行。
 
-## 可选图表 Renderer
+## Markdown 图表接入
 
-`WebShell` 支持宿主通过 `customization.markdown.renderCodeBlock` 接管特定
-fenced code block 的渲染。图表类场景可以注册内置的
-`echarts-fulldata` renderer：
+`WebShell` 已内置 `markdown-chart` renderer 和 ECharts 运行时。宿主只需将
+[`markdown-chart` skill](https://github.com/datafe/markdown-chart/tree/main/skills/markdown-chart)
+安装到 Qwen Code 的项目级或用户级 skills 目录；例如项目级安装结果为：
 
-```tsx
-import { createEchartsFullDataRenderer } from '@qwen-code/web-shell';
-
-<WebShellWithProviders
-  markdown={{
-    renderCodeBlock: createEchartsFullDataRenderer({
-      loadEcharts: () => window.echarts,
-      resolveDataRef: async (ref, meta) =>
-        loadControlledChartDataset(ref, meta),
-    }),
-  }}
-/>;
+```text
+.qwen/skills/markdown-chart/SKILL.md
 ```
 
-renderer 会把 `echarts-fulldata` code block 替换为图表卡片，并内置图表/数据
-icon 切换；ECharts runtime 由宿主通过 `loadEcharts` 提供。若启用
-`data.kind="ref"` envelope，数据只能通过宿主提供的 `resolveDataRef` 解析，
-renderer 不会自己读取 URL 或本地路径。
+安装 skill 后按原方式使用 WebShell，不需要额外安装或导入 ECharts，也不需要传入
+图表配置：
 
-如果需要让模型主动输出 `echarts-fulldata` block，宿主应在自己的 skills 来源中
-提供对应 skill，并且只在确认当前 Web Shell 宿主已经注册 renderer 时启用。
-`@qwen-code/web-shell` 不内置或自动加载这个 skill；可从
-`packages/web-shell/docs/examples/qwencode-viz/SKILL.md` 复制模板到宿主的
-`.qwen/skills/qwencode-viz/SKILL.md`，或通过宿主自己的 skill 注入机制提供等价
-说明。
+```tsx
+<WebShellWithProviders baseUrl="http://127.0.0.1:4170" />
+```
 
-`echarts-fulldata` 的 block body 可以是旧版纯 JSON ECharts option，也可以是
-`{ "version": 1, "data": ..., "option": ... }` envelope。新版 inline envelope
-使用 `data.dimensions: string[]` 和 `data.source` array-of-arrays；renderer 会先
-normalize 成原生 ECharts option，并注入 `option.dataset`，再渲染图表和数据视图。
-新版 ref envelope 必须使用受控 `artifact://` 或 `session-file://` ref，并提供
-`data.format`（`csv` 或 `json`）和 `data.dimensions`，这些元信息会传给宿主的
-`resolveDataRef(ref, meta)`。
-宿主应使用 `JSON.parse` 解析，不能用 `eval`、`new Function` 或 script injection
-执行模型生成内容。
+skill 默认输出 `data.kind="inline"` 的 canonical `markdown-chart` block。
+WebShell 负责严格 JSON 校验、流式渲染、ECharts 生命周期以及 Chart/Data
+切换；已经闭合的图表会立即渲染，只有末尾尚未闭合的 fence 显示 loading。
+
+只有需要支持 skill 输出 `data.kind="ref"` 时，宿主才需要提供受控的
+`resolveDataRef`：
+
+```tsx
+import {
+  createMarkdownChartRegistry,
+  WebShellWithProviders,
+} from '@qwen-code/web-shell';
+
+const chartRegistry = createMarkdownChartRegistry({
+  resolveDataRef: async (ref, context) =>
+    loadControlledChartDataset(ref, context),
+});
+const markdown = { chart: { registry: chartRegistry } };
+
+<WebShellWithProviders baseUrl="http://127.0.0.1:4170" markdown={markdown} />;
+```
+
+`resolveDataRef` 是 ref 数据的唯一读取入口；WebShell 不会自行读取 URL 或本地
+路径。默认只接受规范化的 `artifact://` 和 `session-file://` ref，将 ref
+规范化后交给 resolver，并在 30 秒后终止等待。`markdown` 及其中的 `chart`
+对象应在图表挂载期间保持引用稳定。
+Chart/Data 控件、无数据提示和错误提示默认跟随 WebShell 语言；需要覆盖个别
+文案时可在稳定的 `chart` 对象上提供 `labels`。
+协议和数据格式见
+[`markdown-chart`](https://github.com/datafe/markdown-chart)。
 
 ## 架构说明
 
 ```text
 @qwen-code/sdk/daemon         ← 协议层（SSE, REST, normalizer）
-@qwen-code/webui/daemon-react-sdk  ← React adapter（Provider, hooks, store）
-@qwen-code/web-shell          ← 终端 UI 组件
+@qwen-code/web-shell          ← React adapter（Provider, hooks, store）+ 终端 UI 组件
 ```
 
 - `WebShell` 必须在 `DaemonWorkspaceProvider` 和 `DaemonSessionProvider` 之下使用。
@@ -254,7 +583,7 @@ normalize 成原生 ECharts option，并注入 `option.dataset`，再渲染图�
 | `/approval-mode` | 本地实现            | 打开审批模式弹窗或直接切换审批模式。                                                                                    |
 | `/mode`          | 本地实现            | web-shell 本地别名，用于切换审批模式。                                                                                  |
 | `/mcp`           | 本地实现            | 打开 MCP 管理弹窗。                                                                                                     |
-| `/skills`        | 本地实现 + ACP 透传 | 无参数打开 skills 弹窗；带参数时透传给 daemon 执行。                                                                    |
+| `/skills`        | 本地实现 + ACP 透传 | 无参数或 `detail`/`details` 打开 skills 弹窗；其他参数转换为直接 skill 命令（`/skills review` → `/review`）。           |
 | `/tools`         | 本地实现            | 打开 tools 弹窗，列表展示工具名称、启用状态和 `description`。                                                           |
 | `/memory`        | 本地实现            | 打开 memory 弹窗，支持 `show`、`refresh`、`add user`、`add project` 等分支。                                            |
 | `/agents`        | 本地实现            | 打开 agents 弹窗，支持 `manage`、`create user`、`create project` 等分支。                                               |
@@ -278,5 +607,7 @@ normalize 成原生 ECharts option，并注入 `option.dataset`，再渲染图�
 | `/init`          | ACP 透传            | 分析项目并创建定制的 `QWEN.md`。                                                                                        |
 | `/stats`         | ACP 透传            | 显示统计信息，包含 `model`、`tools` 子命令。                                                                            |
 | `/summary`       | ACP 透传            | 生成当前会话摘要。                                                                                                      |
-| `/tasks`         | ACP 透传            | 列出后台任务。                                                                                                          |
+| `/tasks`         | 本地实现            | 打开环境信息面板并刷新后台任务。                                                                                        |
+| `/btw`           | 本地实现 + ACP 透传 | daemon 支持侧边任务时新建侧边任务；否则发送一个不影响主对话的侧边问题。                                                 |
+| `/fork`          | 本地实现 + ACP 透传 | 启动共享当前上下文的后台智能体。                                                                                        |
 | `/insight`       | ACP 透传            | 查看 insight 相关信息。                                                                                                 |

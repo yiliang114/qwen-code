@@ -4,15 +4,28 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   DaemonSessionProvider,
   useConnection,
-  type DaemonWorkspaceActions,
-} from '@qwen-code/webui/daemon-react-sdk';
-import type { DaemonSessionArtifact } from '@qwen-code/sdk/daemon';
+  type DaemonSessionActions,
+} from '@qwen-code/web-shell/daemon-react-sdk';
+import type {
+  DaemonSessionArtifact,
+  DaemonSessionMonitorTaskStatus,
+  DaemonWorkspaceCapability,
+} from '@qwen-code/sdk/daemon';
+import type { WebShellSlashCommandHandler } from '../App';
+import type { RegisterContextUsageControls } from '../hooks/useContextUsageControls';
 import { useI18n } from '../i18n';
-import { ChatPane } from './ChatPane';
+import { ChatPane, type PaneHeaderActionsRenderer } from './ChatPane';
 import { ErrorBoundary } from './ErrorBoundary';
 import { MAX_SPLIT_PANES } from '../utils/splitUrl';
 import type {
@@ -22,6 +35,7 @@ import type {
 import {
   SESSION_LIST_PAGE_SIZE,
   SESSION_ORGANIZATION_FEATURE,
+  WEB_SHELL_HISTORY_PAGE_SIZE,
   WEB_SHELL_MAX_TRANSCRIPT_BLOCKS,
 } from '../constants/sessions';
 import { useOtherWorkspaceSessions } from '../hooks/useOtherWorkspaceSessions';
@@ -29,7 +43,7 @@ import { useScopedSessions } from '../hooks/useScopedSessions';
 import {
   hasMultipleWorkspaces,
   mergeSessionsById,
-  workspaceBasename,
+  workspaceLabelForCwd,
 } from '../utils/workspace';
 import { isEditableTarget } from '../utils/dom';
 import styles from './SplitView.module.css';
@@ -39,6 +53,8 @@ const MAX_PANES = MAX_SPLIT_PANES;
 export interface SplitViewProps {
   /** Sessions to show in the split view. */
   sessionIds?: string[];
+  /** Respect the host's session-details action allowlist. */
+  showSessionDetails?: boolean;
   /**
    * Report the live pane set (after every add / remove) up to the parent so it
    * survives this view unmounting. Switching away from the split and back must
@@ -47,25 +63,52 @@ export interface SplitViewProps {
    * each render would re-fire the reporting effect and loop.
    */
   onPanesChange?: (sessionIds: string[]) => void;
+  /**
+   * Report panes surfacing approvals, including hidden panes. Keep stable while
+   * consumer inputs are unchanged; a new callback receives the current list.
+   */
+  onPendingPanesChange?: (sessionIds: string[]) => void;
   /** Leave the split view (back to the single-session chat). */
   onExit: () => void;
   onError?: (error: unknown, fallback: string) => void;
+  onImageIngestionNotice?: (tone: 'warning' | 'error', message: string) => void;
+  onSlashCommand?: WebShellSlashCommandHandler;
+  onOpenGoals?: () => void;
   onRightPanelOpen?: (request: TurnOutputOpenRequest) => void;
+  onOpenMonitor?: (
+    task: DaemonSessionMonitorTaskStatus,
+    sessionId: string,
+    sessionActions: DaemonSessionActions,
+  ) => void;
+  registerContextUsageControls?: RegisterContextUsageControls;
+  onBeforeContextCompress?: (sessionId: string) => void;
+  onOpenContextUsage?: (
+    sessionId: string,
+    sessionActions: DaemonSessionActions,
+  ) => void;
   onPaneArtifactsChange?: (
     sessionId: string,
     artifacts: readonly DaemonSessionArtifact[],
-    workspaceActions: DaemonWorkspaceActions,
   ) => void;
   messageTurnOutputs?: readonly TurnOutputKind[];
   /**
-   * Bumped by the parent whenever the session list changes elsewhere (create /
-   * delete / rename). The "add pane" picker reloads on a change so it never
-   * offers a session that has since been removed or misses one just created.
+   * Extra actions rendered in each pane header, before the built-in close
+   * button. See `ChatPaneProps.renderHeaderActions`.
    */
-  sessionListReloadToken?: number;
+  renderPaneHeaderActions?: PaneHeaderActionsRenderer;
+  /** Include active sessions from every trusted registered workspace. */
   includeOtherWorkspaces?: boolean;
   /** Limit session discovery and pane attachment to this workspace. */
   workspaceCwd?: string;
+  /** Restart each pane's SSE event stream after an accepted prompt. */
+  restartSseOnPrompt?: boolean;
+  /** Persisted transcript records requested per page by each pane. */
+  historyPageSize?: number;
+  voiceUserRevision?: number;
+  voiceWorkspaceRevisions?: Readonly<Record<string, number>>;
+  voiceWorkspaces?: readonly DaemonWorkspaceCapability[];
+  sessionWorkflowEnabled?: boolean;
+  planControlVisible?: boolean;
 }
 
 /**
@@ -77,15 +120,31 @@ export interface SplitViewProps {
  */
 export function SplitView({
   sessionIds,
+  showSessionDetails = true,
   onPanesChange,
+  onPendingPanesChange,
   onExit,
   onError,
+  onImageIngestionNotice,
+  onSlashCommand,
+  onOpenGoals,
   onRightPanelOpen,
+  onOpenMonitor,
   onPaneArtifactsChange,
+  registerContextUsageControls,
+  onBeforeContextCompress,
+  onOpenContextUsage,
   messageTurnOutputs,
-  sessionListReloadToken,
+  renderPaneHeaderActions,
   includeOtherWorkspaces = true,
   workspaceCwd,
+  restartSseOnPrompt,
+  historyPageSize = WEB_SHELL_HISTORY_PAGE_SIZE,
+  voiceUserRevision = 0,
+  voiceWorkspaceRevisions = {},
+  voiceWorkspaces,
+  sessionWorkflowEnabled = false,
+  planControlVisible = false,
 }: SplitViewProps) {
   const { t } = useI18n();
   const connection = useConnection();
@@ -130,6 +189,61 @@ export function SplitView({
     return currentSessionId ? [currentSessionId] : [];
   });
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [activePaneId, setActivePaneId] = useState(paneIds[0]);
+  const [pendingPaneIds, setPendingPaneIds] = useState<Set<string>>(new Set());
+  const [paneFocusId, setPaneFocusId] = useState<string | null>(null);
+  const panesRef = useRef<HTMLDivElement>(null);
+  const previousPaneIdsRef = useRef(paneIds);
+  const activeId = paneIds.includes(activePaneId ?? '')
+    ? activePaneId
+    : paneIds[
+        Math.min(
+          Math.max(previousPaneIdsRef.current.indexOf(activePaneId ?? ''), 0),
+          paneIds.length - 1,
+        )
+      ];
+  useLayoutEffect(() => {
+    if (previousPaneIdsRef.current === paneIds) return;
+    previousPaneIdsRef.current = paneIds;
+    if (activeId === activePaneId) return;
+    setActivePaneId(activeId);
+    if (document.activeElement === document.body) {
+      setPaneFocusId(activeId ?? null);
+    }
+  }, [paneIds, activeId, activePaneId]);
+  // Keep report identity stable across parent renders: consumers may store it
+  // in state, which would otherwise retrigger the reporting effect below.
+  const pendingIds = useMemo(
+    () => paneIds.filter((id) => pendingPaneIds.has(id)),
+    [paneIds, pendingPaneIds],
+  );
+  useEffect(() => {
+    onPendingPanesChange?.(pendingIds);
+  }, [pendingIds, onPendingPanesChange]);
+  useEffect(() => () => onPendingPanesChange?.([]), [onPendingPanesChange]);
+  const backButtonRef = useRef<HTMLButtonElement>(null);
+  const pendingButtonRef = useRef<HTMLButtonElement | null>(null);
+  const setPendingButtonRef = useCallback(
+    (button: HTMLButtonElement | null) => {
+      if (!button && pendingButtonRef.current === document.activeElement) {
+        backButtonRef.current?.focus();
+      }
+      pendingButtonRef.current = button;
+    },
+    [],
+  );
+  const handleApprovalChange = useCallback(
+    (sessionId: string, pending: boolean) => {
+      setPendingPaneIds((current) => {
+        if (current.has(sessionId) === pending) return current;
+        const next = new Set(current);
+        if (pending) next.add(sessionId);
+        else next.delete(sessionId);
+        return next;
+      });
+    },
+    [],
+  );
   // Which pane, if any, is maximized to fill the whole split. Purely visual and
   // ephemeral (not deep-linked via `?split=`, like the dialog fullscreen toggle
   // it mirrors): the other panes stay mounted and streaming, just hidden.
@@ -179,34 +293,10 @@ export function SplitView({
   // created since the split was first entered.
   useEffect(() => {
     if (pickerOpen) {
-      void reload();
-      void reloadOther();
+      void reload().catch(() => undefined);
+      void reloadOther().catch(() => undefined);
     }
   }, [pickerOpen, reload, reloadOther]);
-
-  // Also refresh when the parent signals the list changed elsewhere (a session
-  // created / deleted / renamed in the sidebar or another tab), so an open
-  // picker — or the next open — reflects it without re-entering the split.
-  // Reload on every distinct token bump. `useDaemonResource` serializes
-  // responses via its sequence counter (last write wins), so overlapping reloads
-  // are safe; and the token is bumped only on discrete session-change events
-  // (App fires an immediate bump plus one delayed follow-up per change), not as a
-  // high-frequency stream. Deliberately *not* skipping while a reload is in
-  // flight: doing so would drop a bump that lands mid-reload — the effect has
-  // already run for that value and clearing an in-flight flag wouldn't re-run it,
-  // so the picker could stay stale after a burst. An occasional redundant fetch
-  // is far cheaper than a lost refresh, and the split has no polling fallback.
-  const prevReloadTokenRef = useRef(sessionListReloadToken);
-  useEffect(() => {
-    if (
-      sessionListReloadToken !== undefined &&
-      sessionListReloadToken !== prevReloadTokenRef.current
-    ) {
-      prevReloadTokenRef.current = sessionListReloadToken;
-      void reload();
-      void reloadOther();
-    }
-  }, [sessionListReloadToken, reload, reloadOther]);
 
   const titleById = useMemo(() => {
     const map = new Map<string, string>();
@@ -218,6 +308,11 @@ export function SplitView({
     }
     return map;
   }, [allSessions]);
+
+  const sessionById = useMemo(
+    () => new Map(allSessions.map((session) => [session.sessionId, session])),
+    [allSessions],
+  );
 
   // The workspace each session lives in, so a pane attaches under its owning
   // workspace (a non-primary session 409s if loaded with the primary cwd). The
@@ -253,6 +348,7 @@ export function SplitView({
       // Reveal the freshly added pane rather than leaving it hidden behind a
       // still-maximized one.
       setMaximizedPaneId(null);
+      setActivePaneId(sessionId);
       if (sessionIdsControlled) {
         onPanesChange?.(next);
       } else {
@@ -297,8 +393,32 @@ export function SplitView({
   );
 
   const toggleMaximize = useCallback((sessionId: string) => {
+    setActivePaneId(sessionId);
     setMaximizedPaneId((current) => (current === sessionId ? null : sessionId));
   }, []);
+
+  const goToPendingPane = () => {
+    const activeIndex = paneIds.indexOf(activeId ?? '');
+    const nextId =
+      pendingIds.find((id) => paneIds.indexOf(id) > activeIndex) ??
+      pendingIds[0];
+    if (!nextId) return;
+    setActivePaneId(nextId);
+    if (maximizedPaneId) setMaximizedPaneId(nextId);
+    setPaneFocusId(nextId);
+  };
+
+  useLayoutEffect(() => {
+    if (!paneFocusId) return;
+    const pane = Array.from(panesRef.current?.children ?? []).find(
+      (element) => element.getAttribute('data-pane-session-id') === paneFocusId,
+    );
+    pane?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    // Approval panels submit on Escape, Enter, and digits. Navigation must
+    // stop outside those keyboard scopes until the user deliberately enters.
+    if (pane instanceof HTMLElement) pane.focus({ preventScroll: true });
+    setPaneFocusId(null);
+  }, [paneFocusId]);
 
   // Maximize only makes sense against another pane, so drop it whenever it no
   // longer can hold: the maximized pane left the set (closed here, or removed by
@@ -345,6 +465,7 @@ export function SplitView({
         <button
           type="button"
           className={styles.backButton}
+          ref={backButtonRef}
           onClick={onExit}
           aria-label={t('common.back')}
           title={t('common.back')}
@@ -364,6 +485,25 @@ export function SplitView({
         <span className={styles.count}>
           {t('splitView.count', { count: paneIds.length })}
         </span>
+        <span className="sr-only" role="status">
+          {pendingIds.length > 0
+            ? t('splitView.pendingCount', { count: pendingIds.length })
+            : ''}
+        </span>
+        {pendingIds.length > 0 && (
+          <button
+            type="button"
+            className={styles.pendingButton}
+            onClick={goToPendingPane}
+            ref={setPendingButtonRef}
+            title={t('splitView.nextPending')}
+            aria-label={`${t('splitView.pendingCount', {
+              count: pendingIds.length,
+            })} — ${t('splitView.nextPending')}`}
+          >
+            {t('splitView.pendingCount', { count: pendingIds.length })}
+          </button>
+        )}
         <div className={styles.addWrap} ref={addWrapRef}>
           <button
             type="button"
@@ -393,7 +533,10 @@ export function SplitView({
                         className={styles.pickerItemWorkspace}
                         title={session.workspaceCwd}
                       >
-                        {workspaceBasename(session.workspaceCwd)}
+                        {workspaceLabelForCwd(
+                          session.workspaceCwd,
+                          connection.capabilities?.workspaces,
+                        )}
                       </span>
                     )}
                   </button>
@@ -404,7 +547,7 @@ export function SplitView({
         </div>
       </header>
 
-      <div className={styles.panes}>
+      <div className={styles.panes} ref={panesRef}>
         {paneIds.length === 0 ? (
           <div className={styles.empty}>{t('splitView.empty')}</div>
         ) : (
@@ -417,7 +560,21 @@ export function SplitView({
             return (
               <div
                 className={styles.paneSlot}
+                data-pane-session-id={sessionId}
                 data-pane-hidden={isHidden ? '' : undefined}
+                role="group"
+                aria-label={titleById.get(sessionId) ?? sessionId.slice(0, 8)}
+                tabIndex={-1}
+                onPointerDownCapture={(event) => {
+                  if (event.currentTarget.contains(event.target as Node)) {
+                    setActivePaneId(sessionId);
+                  }
+                }}
+                onFocusCapture={(event) => {
+                  if (event.currentTarget.contains(event.target as Node)) {
+                    setActivePaneId(sessionId);
+                  }
+                }}
                 // Include the resolved workspace in the key on a multi-workspace
                 // daemon so a pane whose workspace resolves only after mount (e.g.
                 // a `?split=` deep link) remounts under the right workspace rather
@@ -468,12 +625,31 @@ export function SplitView({
                     // tab's panes) for the same session, so the attachments don't
                     // collide on one client identity.
                     clientId={`split-pane:${instanceId}:${sessionId}`}
-                    suppressOwnUserEcho
+                    historyPageSize={historyPageSize}
+                    subagentTranscriptMode="summary"
                     maxBlocks={WEB_SHELL_MAX_TRANSCRIPT_BLOCKS}
+                    suppressOwnUserEcho
+                    restartEventStreamOnPrompt={restartSseOnPrompt}
                   >
                     <ChatPane
                       title={titleById.get(sessionId)}
+                      sessionSummary={
+                        showSessionDetails
+                          ? sessionById.get(sessionId)
+                          : undefined
+                      }
+                      isActive={activeId === sessionId}
+                      onApprovalChange={handleApprovalChange}
                       workspaceCwd={paneWorkspaceCwd}
+                      reportCatalogTurnCompletion={
+                        sessionId !== currentSessionId ||
+                        paneWorkspaceCwd !== connection.workspaceCwd
+                      }
+                      renderHeaderActions={renderPaneHeaderActions}
+                      hidden={isHidden}
+                      voiceUserRevision={voiceUserRevision}
+                      voiceWorkspaceRevisions={voiceWorkspaceRevisions}
+                      voiceWorkspaces={voiceWorkspaces}
                       onClose={() => removePane(sessionId)}
                       onToggleMaximize={
                         canMaximize
@@ -482,9 +658,20 @@ export function SplitView({
                       }
                       isMaximized={isMaximized}
                       onError={onError}
+                      onImageIngestionNotice={onImageIngestionNotice}
+                      onSlashCommand={onSlashCommand}
+                      onOpenGoals={onOpenGoals}
                       onRightPanelOpen={onRightPanelOpen}
+                      onOpenMonitor={onOpenMonitor}
                       onPaneArtifactsChange={onPaneArtifactsChange}
+                      registerContextUsageControls={
+                        registerContextUsageControls
+                      }
+                      onBeforeContextCompress={onBeforeContextCompress}
+                      onOpenContextUsage={onOpenContextUsage}
                       messageTurnOutputs={messageTurnOutputs}
+                      sessionWorkflowEnabled={sessionWorkflowEnabled}
+                      planControlVisible={planControlVisible}
                     />
                   </DaemonSessionProvider>
                 </ErrorBoundary>

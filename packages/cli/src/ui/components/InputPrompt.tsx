@@ -7,7 +7,11 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import { Box, Text } from 'ink';
-import { SuggestionsDisplay, MAX_WIDTH } from './SuggestionsDisplay.js';
+import {
+  SuggestionsDisplay,
+  MAX_WIDTH,
+  type SuggestionCategory,
+} from './SuggestionsDisplay.js';
 import type { RecentSlashCommands } from '../hooks/useSlashCompletion.js';
 import { theme } from '../semantic-colors.js';
 import { useInputHistory } from '../hooks/useInputHistory.js';
@@ -26,12 +30,12 @@ import { useFollowupSuggestionsCLI } from '../hooks/useFollowupSuggestions.js';
 import type { Key } from '../hooks/useKeypress.js';
 import { keyMatchers, Command } from '../keyMatchers.js';
 import type { CommandContext, SlashCommand } from '../commands/types.js';
-import {
-  ApprovalMode,
-  type Config,
-  Storage,
-  createDebugLogger,
-} from '@qwen-code/qwen-code-core';
+import { parseSlashCommand } from '../commands/commands.js';
+import { StreamingState } from '../types.js';
+import { ApprovalMode } from '@qwen-code/qwen-code-core/config/approval-mode.js';
+import type { Config } from '@qwen-code/qwen-code-core/config/config.js';
+import { Storage } from '@qwen-code/qwen-code-core/config/storage.js';
+import { createDebugLogger } from '@qwen-code/qwen-code-core/utils/debugLogger.js';
 import {
   parseInputForHighlighting,
   buildSegmentsForVisualSlice,
@@ -49,6 +53,9 @@ import { useShellFocusState } from '../contexts/ShellFocusContext.js';
 import { useUIState } from '../contexts/UIStateContext.js';
 import { useUIActions } from '../contexts/UIActionsContext.js';
 import { useSettings } from '../contexts/SettingsContext.js';
+import { useVirtualViewport } from '../contexts/VirtualViewportContext.js';
+import { useMouseTrackingEnabled } from '../hooks/use-mouse-tracking-enabled.js';
+import { useContextMenu } from '../context-menu/ContextMenuContext.js';
 import { useKeypressContext } from '../contexts/KeypressContext.js';
 import {
   useAgentViewState,
@@ -61,6 +68,7 @@ import {
 import {
   isLiveAgentPanelVisibleEntry,
   LIVE_AGENT_PANEL_MAX_ROWS,
+  getLiveAgentPanelVpMaxRows,
 } from './background-view/liveAgentPanelVisibility.js';
 import { panelDisplayOrder } from './background-view/agent-forest.js';
 import { FEEDBACK_DIALOG_KEYS } from '../FeedbackDialog.js';
@@ -69,6 +77,7 @@ import type { RenderLineOptions } from './BaseTextInput.js';
 import { getApprovalModePromptStyle } from './approvalModeVisuals.js';
 import {
   useVoiceInput,
+  type MicrophonePermission,
   type VoiceTranscriber,
 } from '../hooks/use-voice-input.js';
 import { createVoiceRecorder } from '../voice/voice-recorder.js';
@@ -165,7 +174,13 @@ export function expandPendingPastePlaceholders(
 
 export interface InputPromptProps {
   buffer: TextBuffer;
-  onSubmit: (value: string) => void;
+  onSubmit: (
+    value: string,
+    options?: {
+      deferUntilIdle?: boolean;
+      submittedPrompt?: string;
+    },
+  ) => void;
   userMessages: readonly string[];
   onClearScreen: () => void;
   config: Config;
@@ -205,6 +220,8 @@ export interface InputPromptProps {
   /** Called when prompt suggestion is dismissed (user typed) */
   onPromptSuggestionDismiss?: () => void;
   clipboardUnavailableShownRef?: React.MutableRefObject<boolean>;
+  /** Session-scoped so the microphone notice survives InputPrompt remounts. */
+  voiceMicWarnedStatusRef?: React.MutableRefObject<MicrophonePermission | null>;
 }
 
 // Re-export from shared utils for backwards compatibility
@@ -239,6 +256,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
   promptSuggestion,
   onPromptSuggestionDismiss,
   clipboardUnavailableShownRef: sessionClipboardUnavailableShownRef,
+  voiceMicWarnedStatusRef: sessionVoiceMicWarnedStatusRef,
 }) => {
   const isShellFocused = useShellFocusState();
   const uiState = useUIState();
@@ -246,10 +264,14 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
   const settings = useSettings();
   // Mouse interactions (suggestion list + click-to-position cursor) are enabled
   // in alternate-screen mode (see RowMouseController's coordinate assumptions).
-  const mouseInteractionsEnabled = !!settings.merged.ui?.useTerminalBuffer;
+  const mouseTrackingEnabled = useMouseTrackingEnabled();
+  const mouseInteractionsEnabled =
+    useVirtualViewport(settings.merged.ui?.useTerminalBuffer) &&
+    mouseTrackingEnabled;
   const { pasteWorkaround } = useKeypressContext();
   const { agents, agentTabBarFocused } = useAgentViewState();
   const { setAgentTabBarFocused } = useAgentViewActions();
+  const { menu: contextMenu, closeMenu: closeContextMenu } = useContextMenu();
   const {
     entries: bgEntries,
     dialogOpen: bgDialogOpen,
@@ -271,22 +293,28 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
   // `livePanelSelectedIndex - 1` indexes the same agent the user sees
   // highlighted. Filtering alone (snapshot order, newest-first, unsliced)
   // opened the wrong agent's detail on Enter.
+  // Window by the same cap the panel actually renders (VP mode uses a
+  // height-aware cap via getLiveAgentPanelVpMaxRows in DefaultAppLayout)
+  // so the keyboard selection can't address a row that is scrolled off.
+  const liveAgentPanelMaxRows = uiState.useTerminalBuffer
+    ? getLiveAgentPanelVpMaxRows(uiState.terminalHeight)
+    : LIVE_AGENT_PANEL_MAX_ROWS;
   const getVisibleBgAgents = useCallback(
     () =>
       panelDisplayOrder(
         bgEntries.filter((e) => isLiveAgentPanelVisibleEntry(e, Date.now())),
-      ).slice(-LIVE_AGENT_PANEL_MAX_ROWS),
-    [bgEntries],
+      ).slice(-liveAgentPanelMaxRows),
+    [bgEntries, liveAgentPanelMaxRows],
   );
   const hasActiveToolConfirmation = useMemo(
     () =>
       Boolean(uiState.confirmationRequest) ||
-      (uiState.pendingGeminiHistoryItems ?? []).some(
+      (uiState.pendingLlmHistoryItems ?? []).some(
         (item) =>
           item.type === 'tool_group' &&
           item.tools.some((tool) => tool.confirmationDetails),
       ),
-    [uiState.confirmationRequest, uiState.pendingGeminiHistoryItems],
+    [uiState.confirmationRequest, uiState.pendingLlmHistoryItems],
   );
   const [historyRestoredText, setHistoryRestoredText] = useState<string | null>(
     null,
@@ -363,6 +391,12 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
   );
   const showCompletionSuggestions =
     completion.showSuggestions && !isHistoryRestoredText;
+  const categoryTabsVisible =
+    !exportCompletion.suggestionDisplayProps &&
+    !commandSearchActive &&
+    !reverseSearchActive &&
+    !isAttachmentMode &&
+    (completion.availableCategories?.length ?? 0) > 2;
 
   // Ref so renderLineWithHighlighting (stable useCallback) can access fresh ghost text
   const midInputGhostTextRef = useRef<{
@@ -426,7 +460,13 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       refineVoiceTranscript(config, raw, signal),
     [config],
   );
-  const voiceMicWarnedStatusRef = useRef<string | null>(null);
+  const localVoiceMicWarnedStatusRef = useRef<MicrophonePermission | null>(
+    null,
+  );
+  // Falls back to a local ref only when no session-scoped ref is supplied; the
+  // session ref keeps the notice to once per run across InputPrompt remounts.
+  const voiceMicWarnedStatusRef =
+    sessionVoiceMicWarnedStatusRef ?? localVoiceMicWarnedStatusRef;
   const voiceRecorderRef = useRef<ReturnType<
     typeof createVoiceRecorder
   > | null>(null);
@@ -437,6 +477,11 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
   const warmupVoice = useCallback(() => {
     const recorder = getVoiceRecorder();
     void Promise.resolve(recorder.warmup?.()).catch(() => {});
+  }, [getVoiceRecorder]);
+  // Runs when a recording starts, not on warmup: users who never dictate
+  // should not be told about microphone access on every startup.
+  const checkVoiceMicPermission = useCallback(() => {
+    const recorder = getVoiceRecorder();
     void Promise.resolve(recorder.microphoneStatus?.())
       .then((status) => {
         if (voiceMicWarnedStatusRef.current === status) {
@@ -470,7 +515,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
         }
       })
       .catch(() => {});
-  }, [getVoiceRecorder, uiState.historyManager]);
+  }, [getVoiceRecorder, uiState.historyManager, voiceMicWarnedStatusRef]);
   const voiceStreaming = voiceModel ? isStreamingVoiceModel(voiceModel) : false;
   const openVoiceStreamSession = useCallback(
     (callbacks: {
@@ -516,6 +561,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
     refine: voiceRefineEnabled ? refineVoice : undefined,
     onSubmit: (text) => voiceSubmitRef.current(text),
     warmup: warmupVoice,
+    checkMicrophonePermission: checkVoiceMicPermission,
     streaming: voiceStreaming,
     openStream: voiceStreaming ? openVoiceStreamSession : undefined,
   });
@@ -585,9 +631,10 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
   const resetHistoryNavRef = useRef<() => void>(() => {});
 
   const handleSubmitAndClear = useCallback(
-    (submittedValue: string) => {
+    (submittedValue: string, deferUntilIdle = false) => {
       exportCompletion.reset();
       // Expand any large paste placeholders to their full content before submitting
+      const submittedPrompt = submittedValue;
       let finalValue = submittedValue;
       if (pendingPastes.size > 0) {
         finalValue = expandPendingPastePlaceholders(finalValue, pendingPastes);
@@ -610,7 +657,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       // if onSubmit triggers a re-render while the buffer still holds the old value.
       buffer.setText('');
       clearPromptStash(targetDir);
-      onSubmit(finalValue);
+      onSubmit(finalValue, { deferUntilIdle, submittedPrompt });
 
       // Reset history navigation so the next Up-arrow starts from the newest
       // entry rather than advancing from whatever index the user picked.
@@ -654,10 +701,11 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
 
   const customSetTextAndResetCompletionSignal = useCallback(
     (newText: string) => {
+      uiActions.invalidateSubmittedPromptProvenance();
       buffer.setText(newText);
       setHistoryRestoredText(newText);
     },
-    [buffer],
+    [buffer, uiActions],
   );
 
   const inputHistory = useInputHistory({
@@ -857,6 +905,25 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
 
   const handleInput = useCallback(
     (key: Key): boolean => {
+      // While the right-click context menu is open it owns navigation keys
+      // (the menu overlay handles them); any other key closes the menu and is
+      // then processed normally — mirroring click-away dismissal.
+      if (contextMenu !== null) {
+        if (
+          key.name === 'up' ||
+          key.name === 'down' ||
+          key.name === 'return' ||
+          key.name === 'escape'
+        ) {
+          return true;
+        }
+        closeContextMenu();
+        // Fall through: the dismissing key continues through the normal
+        // pipeline (vim, paste handling, shell-mode, shortcuts) after the
+        // menu closes — returning here would skip every remaining
+        // interceptor and drop the key into the bare readline layer.
+      }
+
       // When the Background tasks dialog is open, swallow every key so
       // nothing reaches the composer buffer — the dialog's own keypress
       // handler owns selection, open/close, and stop actions. Keep this ahead
@@ -1060,6 +1127,21 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
         return true;
       }
 
+      // The visible category tabs own the bare arrows, including in Vim mode.
+      // All other states fall through to their existing input owner.
+      if (showCompletionSuggestions && categoryTabsVisible) {
+        if (keyMatchers[Command.COMPLETION_TAB_RIGHT](key)) {
+          completion.switchCategory(1);
+          setExpandedSuggestionIndex(-1);
+          return true;
+        }
+        if (keyMatchers[Command.COMPLETION_TAB_LEFT](key)) {
+          completion.switchCategory(-1);
+          setExpandedSuggestionIndex(-1);
+          return true;
+        }
+      }
+
       if (vimHandleInput && vimHandleInput(key)) {
         return true;
       }
@@ -1179,8 +1261,33 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
           return true;
         }
 
-        // Pop queued messages into input on ESC (before double-ESC clear)
-        if (!isAttachmentMode && uiState.messageQueue.length > 0) {
+        // Pop queued messages into input on ESC (before double-ESC clear).
+        // Skip when the agent is actively responding: popQueueIntoInput()
+        // fills the shared buffer (a live getter over stateRef.current, not
+        // React state), which makes AppContainer's broadcast ESC handler -
+        // which runs AFTER this one because child useEffects subscribe to
+        // KeypressContext first and useKeypress memoizes on [] - take its
+        // "input has content -> double-press to clear" branch instead of the
+        // cancel-work branch. This guard breaks that chain. #8201.
+        //
+        // Relies on one invariant: buffer.text reads through to
+        // stateRef.current synchronously. Subscription order does not gate the
+        // cancel: the Responding pop guard skips the pop in either order (and
+        // BaseTextInput re-subscribes after AppContainer after any remount of
+        // InputPrompt, e.g. a tool-confirmation round trip). Break the buffer
+        // invariant and the single-ESC cancel regresses with a fully green
+        // suite (no integration test covers this hop yet - the two harnesses
+        // mock each other's side).
+        // Only Responding is gated (matching AppContainer's cancel branch).
+        // WaitingForConfirmation needs no handling here: Composer unmounts
+        // InputPrompt whenever isInputActive is false (isInputActiveForState
+        // admits only Idle/Responding), so this branch never runs during a
+        // tool confirmation.
+        if (
+          !isAttachmentMode &&
+          uiState.messageQueue.length > 0 &&
+          uiState.streamingState !== StreamingState.Responding
+        ) {
           if (popQueueIntoInput()) {
             resetEscapeState();
             return true;
@@ -1188,7 +1295,13 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
           // returned false (queue already cleared) — fall through
         }
 
-        // Handle double ESC for clearing input
+        // Handle double ESC for clearing input. Note: while Responding this
+        // clear composes with AppContainer's broadcast ESC handler - in the
+        // initial subscription order this handler empties the buffer first and
+        // AppContainer's cancel branch fires on the SAME keypress; after any
+        // remount of InputPrompt (e.g. a tool-confirmation round trip)
+        // AppContainer runs first, so the cancel lands on the next press
+        // instead. #8201.
         if (escPressCount === 0) {
           if (buffer.text === '') {
             return true;
@@ -1273,6 +1386,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
             }
           }
           if (keyMatchers[Command.ACCEPT_SUGGESTION_REVERSE_SEARCH](key)) {
+            uiActions.invalidateSubmittedPromptProvenance();
             sc.handleAutocomplete(activeSuggestionIndex);
             resetState();
             setActive(false);
@@ -1285,6 +1399,9 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
             showSuggestions && activeSuggestionIndex > -1
               ? suggestions[activeSuggestionIndex].value
               : buffer.text;
+          if (showSuggestions && activeSuggestionIndex > -1) {
+            uiActions.invalidateSubmittedPromptProvenance();
+          }
           handleSubmitAndClear(textToSubmit);
           resetState();
           setActive(false);
@@ -1329,8 +1446,28 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
         return true;
       };
 
-      // If the command is a perfect match, pressing enter should execute it.
-      if (completion.isPerfectMatch && keyMatchers[Command.RETURN](key)) {
+      // The buffer updates synchronously, but completion is render-derived and
+      // can still describe the previous keystroke when Enter arrives.
+      const isSubmit = keyMatchers[Command.SUBMIT](key);
+      let isLiveSlashCommand = false;
+      if (isSubmit && buffer.text.startsWith('/') && !/\s$/.test(buffer.text)) {
+        const { commandToExecute, args, canonicalPath } = parseSlashCommand(
+          buffer.text,
+          slashCommands,
+        );
+        const commandPartCount = buffer.text.slice(1).split(/\s+/).length;
+        isLiveSlashCommand =
+          commandToExecute?.action !== undefined &&
+          args.length === 0 &&
+          canonicalPath.length === commandPartCount;
+      }
+
+      // Use SUBMIT (which requires shift: false) instead of RETURN to avoid
+      // intercepting Shift+Enter as submit when the user wants a newline.
+      const isCurrentPerfectMatch = buffer.text.startsWith('/')
+        ? isLiveSlashCommand
+        : completion.isPerfectMatch;
+      if (isSubmit && isCurrentPerfectMatch) {
         if (
           showCompletionSuggestions &&
           exportCompletion.navigatedRef.current &&
@@ -1616,14 +1753,27 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
         // Shell History Navigation
         if (keyMatchers[Command.NAVIGATION_UP](key)) {
           const prevCommand = shellHistory.getPreviousCommand();
-          if (prevCommand !== null) buffer.setText(prevCommand);
+          if (prevCommand !== null) {
+            uiActions.invalidateSubmittedPromptProvenance();
+            buffer.setText(prevCommand);
+          }
           return true;
         }
         if (keyMatchers[Command.NAVIGATION_DOWN](key)) {
           const nextCommand = shellHistory.getNextCommand();
-          if (nextCommand !== null) buffer.setText(nextCommand);
+          if (nextCommand !== null) {
+            uiActions.invalidateSubmittedPromptProvenance();
+            buffer.setText(nextCommand);
+          }
           return true;
         }
+      }
+
+      if (keyMatchers[Command.QUEUE_MESSAGE](key)) {
+        if (buffer.text.trim()) {
+          handleSubmitAndClear(buffer.text, true);
+        }
+        return true;
       }
 
       if (keyMatchers[Command.SUBMIT](key)) {
@@ -1762,6 +1912,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       focus,
       buffer,
       completion,
+      slashCommands,
       shellModeActive,
       setShellModeActive,
       onClearScreen,
@@ -1798,6 +1949,8 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       parsePlaceholder,
       freePlaceholderId,
       agentTabBarFocused,
+      contextMenu,
+      closeContextMenu,
       bgDialogOpen,
       bgPillFocused,
       hasAgents,
@@ -1819,6 +1972,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       exportCompletion,
       isHistoryRestoredText,
       showCompletionSuggestions,
+      categoryTabsVisible,
       voiceInput,
       targetDir,
     ],
@@ -1992,6 +2146,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
         const sc = isCommandSearch
           ? commandSearchCompletion
           : reverseSearchCompletion;
+        uiActions.invalidateSubmittedPromptProvenance();
         sc.handleAutocomplete(index);
         sc.resetCompletionState();
         (isCommandSearch ? setCommandSearchActive : setReverseSearchActive)(
@@ -2039,7 +2194,15 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       setExpandedSuggestionIndex,
       setCommandSearchActive,
       setReverseSearchActive,
+      uiActions,
     ],
+  );
+  const handleCategorySelect = useCallback(
+    (category: SuggestionCategory | 'all') => {
+      completion.selectCategory(category);
+      setExpandedSuggestionIndex(-1);
+    },
+    [completion],
   );
 
   // Whether any input-side handler would consume a Tab keystroke. AppContainer
@@ -2210,11 +2373,28 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
             }
             expandedIndex={expandedSuggestionIndex}
             mouseEnabled={mouseInteractionsEnabled}
+            activeCategory={
+              suggestionsFromExport ||
+              commandSearchActive ||
+              reverseSearchActive
+                ? undefined
+                : completion.activeCategory
+            }
+            availableCategories={
+              categoryTabsVisible ? completion.availableCategories : undefined
+            }
             onHoverIndex={
               suggestionsFromExport ? undefined : handleSuggestionHover
             }
             onSelectIndex={
               suggestionsFromExport ? undefined : handleSuggestionSelect
+            }
+            onSelectCategory={
+              suggestionsFromExport ||
+              commandSearchActive ||
+              reverseSearchActive
+                ? undefined
+                : handleCategorySelect
             }
           />
         </Box>

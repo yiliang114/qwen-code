@@ -61,8 +61,10 @@ describe('HookSystem', () => {
     mockConfig = {
       getSessionId: vi.fn().mockReturnValue('test-session-id'),
       getTranscriptPath: vi.fn().mockReturnValue('/test/transcript'),
+      getApprovalMode: vi.fn().mockReturnValue('default'),
       getWorkingDir: vi.fn().mockReturnValue('/test/cwd'),
       getAllowedHttpHookUrls: vi.fn().mockReturnValue([]),
+      getAllowPrivateNetworkHooks: vi.fn().mockReturnValue(false),
     } as unknown as Config;
 
     mockHookRegistry = {
@@ -94,6 +96,7 @@ describe('HookSystem', () => {
       fireMessageDisplayEvent: vi.fn(),
       fireSessionStartEvent: vi.fn(),
       fireSessionEndEvent: vi.fn(),
+      fireSessionDeleteEvent: vi.fn(),
       firePreToolUseEvent: vi.fn(),
       firePostToolUseEvent: vi.fn(),
       firePostToolUseFailureEvent: vi.fn(),
@@ -261,6 +264,16 @@ describe('HookSystem', () => {
 
       expect(mockHookRegistry.getHooksForEvent).toHaveBeenCalledWith(
         'SessionEnd',
+      );
+    });
+
+    it('should check the correct event name for SessionDelete', () => {
+      vi.mocked(mockHookRegistry.getHooksForEvent).mockReturnValue([]);
+
+      hookSystem.hasHooksForEvent('SessionDelete');
+
+      expect(mockHookRegistry.getHooksForEvent).toHaveBeenCalledWith(
+        'SessionDelete',
       );
     });
 
@@ -454,7 +467,7 @@ describe('HookSystem', () => {
 
       expect(
         mockHookEventHandler.fireUserPromptSubmitEvent,
-      ).toHaveBeenCalledWith('test prompt', undefined);
+      ).toHaveBeenCalledWith('test prompt', undefined, undefined);
       expect(result).toBeDefined();
     });
 
@@ -476,7 +489,31 @@ describe('HookSystem', () => {
 
       expect(
         mockHookEventHandler.fireUserPromptSubmitEvent,
-      ).toHaveBeenCalledWith('my custom prompt', undefined);
+      ).toHaveBeenCalledWith('my custom prompt', undefined, undefined);
+    });
+
+    it('should pass submitted prompt after the existing signal argument', async () => {
+      const mockResult = {
+        success: true,
+        allOutputs: [],
+        errors: [],
+        totalDuration: 0,
+        finalOutput: undefined,
+      };
+      vi.mocked(
+        mockHookEventHandler.fireUserPromptSubmitEvent,
+      ).mockResolvedValue(mockResult);
+      const signal = new AbortController().signal;
+
+      await hookSystem.fireUserPromptSubmitEvent(
+        'model prompt',
+        signal,
+        'submitted prompt',
+      );
+
+      expect(
+        mockHookEventHandler.fireUserPromptSubmitEvent,
+      ).toHaveBeenCalledWith('model prompt', signal, 'submitted prompt');
     });
 
     it('should return undefined when no final output', async () => {
@@ -821,6 +858,25 @@ describe('HookSystem', () => {
     });
   });
 
+  describe('fireSessionDeleteEvent', () => {
+    it('should fire the event with the deleted session id', async () => {
+      const mockResult = createMockAggregatedResult(true, {
+        decision: 'allow',
+      });
+      vi.mocked(mockHookEventHandler.fireSessionDeleteEvent).mockResolvedValue(
+        mockResult,
+      );
+
+      const result = await hookSystem.fireSessionDeleteEvent('deleted-id');
+
+      expect(mockHookEventHandler.fireSessionDeleteEvent).toHaveBeenCalledWith(
+        'deleted-id',
+        undefined,
+      );
+      expect(result).toBeDefined();
+    });
+  });
+
   describe('firePreToolUseEvent', () => {
     it('should fire PreToolUse event and return output', async () => {
       const mockResult = {
@@ -1031,6 +1087,7 @@ describe('HookSystem', () => {
         PermissionMode.AutoEdit,
         undefined,
         undefined,
+        undefined,
       );
       expect(result).toBeDefined();
     });
@@ -1063,6 +1120,7 @@ describe('HookSystem', () => {
         { content: 'file content' },
         'toolu_test456',
         PermissionMode.Plan,
+        undefined,
         undefined,
         undefined,
       );
@@ -1100,6 +1158,7 @@ describe('HookSystem', () => {
         PermissionMode.Plan,
         undefined,
         'call_def456',
+        undefined,
       );
     });
 
@@ -1243,6 +1302,7 @@ describe('HookSystem', () => {
         PermissionMode.AutoEdit,
         undefined,
         undefined,
+        undefined,
       );
       expect(result).toBeDefined();
     });
@@ -1279,6 +1339,7 @@ describe('HookSystem', () => {
         'Permission denied',
         true,
         PermissionMode.Yolo,
+        undefined,
         undefined,
         undefined,
       );
@@ -1320,6 +1381,7 @@ describe('HookSystem', () => {
         PermissionMode.AutoEdit,
         undefined,
         'call_ghi789',
+        undefined,
       );
     });
 
@@ -1349,6 +1411,7 @@ describe('HookSystem', () => {
         'bash',
         { command: 'ls' },
         'Error occurred',
+        undefined,
         undefined,
         undefined,
         undefined,

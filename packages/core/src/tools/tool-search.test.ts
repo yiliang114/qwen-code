@@ -12,7 +12,7 @@ import { ToolRegistry } from './tool-registry.js';
 import { DiscoveredMCPTool } from './mcp-tool.js';
 import { MockTool } from '../test-utils/mock-tool.js';
 import { ToolSearchTool, scoreTool, tokenize } from './tool-search.js';
-import type { ToolResult } from './tools.js';
+import type { MediaPolicyToolDescriptor, ToolResult } from './tools.js';
 import { CronCreateTool } from './cron-create.js';
 import { CronDeleteTool } from './cron-delete.js';
 import { CronListTool } from './cron-list.js';
@@ -29,7 +29,7 @@ const baseConfigParams: ConfigParameters = {
   targetDir: '/test/dir',
   debugMode: false,
   userMemory: '',
-  geminiMdFileCount: 0,
+  memoryFileCount: 0,
   approvalMode: ApprovalMode.DEFAULT,
 };
 
@@ -41,8 +41,8 @@ function makeConfigWithRegistry(): {
   const registry = new ToolRegistry(config);
   vi.spyOn(config, 'getToolRegistry').mockReturnValue(registry);
   // Stub out the chat client reference so ToolSearch can sync newly
-  // revealed tools via setTools() without a real GeminiClient.
-  vi.spyOn(config, 'getGeminiClient').mockReturnValue({
+  // revealed tools via setTools() without a real LlmClient.
+  vi.spyOn(config, 'getLlmClient').mockReturnValue({
     setTools: vi.fn().mockResolvedValue(undefined),
   } as never);
   return { config, registry };
@@ -208,6 +208,29 @@ describe('ToolSearchTool', () => {
     expect(registry.isDeferredToolRevealed('cron_create')).toBe(true);
   });
 
+  it('does not publish a Goal proposal schema outside an armed ACP turn', async () => {
+    const acpConfig = new Config({
+      ...baseConfigParams,
+      experimentalZedIntegration: true,
+    });
+    acpConfig.setGoalProposalHostSupported(true);
+    const acpRegistry = new ToolRegistry(acpConfig);
+    vi.spyOn(acpConfig, 'getToolRegistry').mockReturnValue(acpRegistry);
+    acpRegistry.registerTool(new MockTool({ name: 'propose_goal' }));
+    const tool = new ToolSearchTool(acpConfig);
+
+    const unavailable = await tool
+      .build({ query: 'select:propose_goal' })
+      .execute(new AbortController().signal);
+    expect(String(unavailable.llmContent)).toBe('Not found: propose_goal');
+
+    acpConfig.setGoalProposalTurnKey('user-turn');
+    const available = await tool
+      .build({ query: 'select:propose_goal' })
+      .execute(new AbortController().signal);
+    expect(String(available.llmContent)).toContain('"name":"propose_goal"');
+  });
+
   it('escapes `<` in schema JSON so embedded </function> cannot close the wrapper', async () => {
     // MCP descriptions are remote-supplied untrusted text. A description
     // containing the literal substring `</function>` would prematurely
@@ -230,7 +253,7 @@ describe('ToolSearchTool', () => {
     const content = String(result.llmContent);
     // The `<` from the embedded `</function>` MUST be unicode-escaped
     // so the wrapper stays intact.
-    expect(content).toContain('\\u003c/function>');
+    expect(content).toContain('\\u003c/function\\u003e');
     // Sanity: there's still exactly one closing wrapper tag, not two.
     const closeMatches = content.match(/<\/function>/g) ?? [];
     expect(closeMatches.length).toBe(1);
@@ -250,6 +273,95 @@ describe('ToolSearchTool', () => {
     expect(content).toContain('Not found: missing');
     expect(registry.isDeferredToolRevealed('alpha')).toBe(true);
     expect(registry.isDeferredToolRevealed('bravo')).toBe(true);
+  });
+
+  describe('media-policy tool hiding', () => {
+    class MockMediaPolicyTool extends MockTool {
+      override get mediaPolicyDescriptor(): MediaPolicyToolDescriptor {
+        return {
+          kind: 'media_policy',
+          inputMediaTypes: ['image'],
+          outputs: [{ kind: 'media', required: true }],
+        };
+      }
+    }
+
+    const registerPolicyTool = (reg: ToolRegistry) => {
+      reg.registerTool(
+        new MockMediaPolicyTool({
+          name: 'omni_compress_image',
+          description: 'compress an image to a target size',
+          shouldDefer: true,
+        }),
+      );
+    };
+
+    function makeEnabledConfigWithRegistry(): {
+      config: Config;
+      registry: ToolRegistry;
+    } {
+      const enabledConfig = new Config({
+        ...baseConfigParams,
+        omniPolicyTools: {
+          omni_compress_image: { modelAccess: { enabled: true } },
+        },
+      });
+      const enabledRegistry = new ToolRegistry(enabledConfig);
+      vi.spyOn(enabledConfig, 'getToolRegistry').mockReturnValue(
+        enabledRegistry,
+      );
+      vi.spyOn(enabledConfig, 'getGeminiClient').mockReturnValue({
+        setTools: vi.fn().mockResolvedValue(undefined),
+      } as never);
+      return { config: enabledConfig, registry: enabledRegistry };
+    }
+
+    it('keyword search never surfaces a hidden media-policy tool', async () => {
+      registerPolicyTool(registry);
+
+      const tool = new ToolSearchTool(config);
+      const result = await tool
+        .build({ query: 'compress image' })
+        .execute(new AbortController().signal);
+
+      expect(String(result.llmContent)).toContain('No tools found');
+      expect(String(result.llmContent)).not.toContain('omni_compress_image');
+    });
+
+    it('select: mode blocks a hidden media-policy tool without revealing it', async () => {
+      registerPolicyTool(registry);
+
+      const tool = new ToolSearchTool(config);
+      const result = await tool
+        .build({ query: 'select:omni_compress_image' })
+        .execute(new AbortController().signal);
+
+      const content = String(result.llmContent);
+      expect(content).toContain('media policy tool');
+      expect(content).not.toContain('<functions>');
+      expect(result.error?.message).toContain('media policy tool');
+      expect(registry.isDeferredToolRevealed('omni_compress_image')).toBe(
+        false,
+      );
+    });
+
+    it('surfaces the tool in both modes once modelAccess.enabled is true', async () => {
+      const { config: enabledConfig, registry: enabledRegistry } =
+        makeEnabledConfigWithRegistry();
+      registerPolicyTool(enabledRegistry);
+
+      const tool = new ToolSearchTool(enabledConfig);
+      const keywordResult = await tool
+        .build({ query: 'compress image' })
+        .execute(new AbortController().signal);
+      expect(String(keywordResult.llmContent)).toContain(
+        '"name":"omni_compress_image"',
+      );
+
+      expect(
+        enabledRegistry.isDeferredToolRevealed('omni_compress_image'),
+      ).toBe(true);
+    });
   });
 
   it('keyword search returns top-N ranked tools', async () => {
@@ -540,13 +652,13 @@ describe('ToolSearchTool', () => {
     // the revealedDeferred set (which is meant to track on-demand
     // reveals only) and must not trigger setTools(): the tool is
     // already in the chat's declaration list. Triggering setTools()
-    // here also risks a spurious "GeminiClient not initialised"
+    // here also risks a spurious "LlmClient not initialised"
     // failure when the inspection happens before init completes.
     registry.registerTool(
       new MockTool({ name: 'core_tool', shouldDefer: false }),
     );
     const setToolsSpy = vi.fn().mockResolvedValue(undefined);
-    vi.spyOn(config, 'getGeminiClient').mockReturnValue({
+    vi.spyOn(config, 'getLlmClient').mockReturnValue({
       setTools: setToolsSpy,
     } as never);
 
@@ -576,7 +688,7 @@ describe('ToolSearchTool', () => {
       }),
     );
     const setToolsSpy = vi.fn().mockResolvedValue(undefined);
-    vi.spyOn(config, 'getGeminiClient').mockReturnValue({
+    vi.spyOn(config, 'getLlmClient').mockReturnValue({
       setTools: setToolsSpy,
     } as never);
 
@@ -599,7 +711,7 @@ describe('ToolSearchTool', () => {
       }),
     );
     const setToolsSpy = vi.fn().mockResolvedValue(undefined);
-    vi.spyOn(config, 'getGeminiClient').mockReturnValue({
+    vi.spyOn(config, 'getLlmClient').mockReturnValue({
       setTools: setToolsSpy,
     } as never);
 
@@ -643,7 +755,7 @@ describe('ToolSearchTool', () => {
         }),
       );
       const setToolsSpy = vi.fn().mockResolvedValue(undefined);
-      vi.spyOn(config, 'getGeminiClient').mockReturnValue({
+      vi.spyOn(config, 'getLlmClient').mockReturnValue({
         setTools: setToolsSpy,
       } as never);
 
@@ -864,7 +976,7 @@ describe('ToolSearchTool', () => {
         shouldDefer: true,
       }),
     );
-    vi.spyOn(config, 'getGeminiClient').mockReturnValue({
+    vi.spyOn(config, 'getLlmClient').mockReturnValue({
       setTools: vi.fn().mockRejectedValue(new Error('chat not initialised')),
     } as never);
 
@@ -901,7 +1013,7 @@ describe('ToolSearchTool', () => {
     // reveals, not pre-existing ones.
     registry.revealDeferredTool('cron_list');
 
-    vi.spyOn(config, 'getGeminiClient').mockReturnValue({
+    vi.spyOn(config, 'getLlmClient').mockReturnValue({
       setTools: vi.fn().mockRejectedValue(new Error('chat not initialised')),
     } as never);
 
@@ -948,7 +1060,7 @@ describe('ToolSearchTool', () => {
     expect(registry.isDeferredToolRevealed('bravo')).toBe(false);
   });
 
-  it('treats a null GeminiClient identically to setTools() throwing', async () => {
+  it('treats a null LlmClient identically to setTools() throwing', async () => {
     // Without the explicit null-check, optional chaining (`?.setTools()`)
     // silently no-ops if init hasn't completed yet, leaving the reveal
     // in the registry while the API never received the schema. The
@@ -957,8 +1069,8 @@ describe('ToolSearchTool', () => {
     registry.registerTool(
       new MockTool({ name: 'cron_create', shouldDefer: true }),
     );
-    vi.spyOn(config, 'getGeminiClient').mockReturnValue(
-      null as unknown as ReturnType<typeof config.getGeminiClient>,
+    vi.spyOn(config, 'getLlmClient').mockReturnValue(
+      null as unknown as ReturnType<typeof config.getLlmClient>,
     );
 
     const tool = new ToolSearchTool(config);
@@ -967,7 +1079,7 @@ describe('ToolSearchTool', () => {
       .execute(new AbortController().signal);
 
     expect(result.error).toBeDefined();
-    expect(result.error?.message).toContain('GeminiClient not initialised');
+    expect(result.error?.message).toContain('LlmClient not initialised');
     expect(String(result.llmContent)).not.toContain('"name":"cron_create"');
     // Reveal rolled back so subsequent ToolSearch can find the tool.
     expect(registry.isDeferredToolRevealed('cron_create')).toBe(false);
@@ -995,7 +1107,7 @@ describe('ToolSearchTool', () => {
     );
 
     vi.spyOn(visibleConfig, 'getToolRegistry').mockReturnValue(visibleRegistry);
-    vi.spyOn(visibleConfig, 'getGeminiClient').mockReturnValue({
+    vi.spyOn(visibleConfig, 'getLlmClient').mockReturnValue({
       setTools: vi.fn().mockResolvedValue(undefined),
       refreshStartupContextReminder: vi.fn().mockResolvedValue(undefined),
     } as never);
@@ -1023,7 +1135,7 @@ describe('ToolSearchTool', () => {
     vi.spyOn(visibleConfig, 'getToolRegistry').mockReturnValue(visibleRegistry);
 
     const mockSetTools = vi.fn().mockResolvedValue(undefined);
-    vi.spyOn(visibleConfig, 'getGeminiClient').mockReturnValue({
+    vi.spyOn(visibleConfig, 'getLlmClient').mockReturnValue({
       setTools: mockSetTools,
       refreshStartupContextReminder: vi.fn().mockResolvedValue(undefined),
     } as never);
@@ -1072,7 +1184,7 @@ describe('ToolSearchTool', () => {
     vi.spyOn(visibleConfig, 'getToolRegistry').mockReturnValue(visibleRegistry);
 
     const mockSetTools = vi.fn().mockResolvedValue(undefined);
-    vi.spyOn(visibleConfig, 'getGeminiClient').mockReturnValue({
+    vi.spyOn(visibleConfig, 'getLlmClient').mockReturnValue({
       setTools: mockSetTools,
       refreshStartupContextReminder: vi.fn().mockResolvedValue(undefined),
     } as never);

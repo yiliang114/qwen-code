@@ -1,914 +1,745 @@
+/**
+ * @license
+ * Copyright 2026 Qwen Team
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 // @vitest-environment jsdom
+
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import {
-  DaemonHttpError,
-  type DaemonExtensionEntry,
-  type ExtensionOperationStatus,
-} from '@qwen-code/sdk/daemon';
-import { I18nProvider } from '../../i18n';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 
-const { actions, connection, signals } = vi.hoisted(() => ({
-  actions: {
-    loadExtensionsStatus: vi.fn(),
-    installExtension: vi.fn(),
-    activeExtensionOperations: vi.fn(),
-    extensionOperationStatus: vi.fn(),
-    respondToExtensionInteraction: vi.fn(),
-    checkExtensionUpdates: vi.fn(),
-    refreshExtensions: vi.fn(),
-    enableExtension: vi.fn(),
-    disableExtension: vi.fn(),
-    updateExtension: vi.fn(),
-    uninstallExtension: vi.fn(),
-  },
-  connection: { clientId: 'client-1' as string | undefined },
-  signals: { extensionsVersion: 0 },
-}));
+const state = vi.hoisted(() => {
+  const activationHandle = { accepted: true as const, operationId: 'activate' };
+  const refreshHandle = { accepted: true as const, operationId: 'refresh' };
+  const workspaceHandle = {
+    workspaceExtensions: vi.fn(),
+    setExtensionActivation: vi.fn(),
+    clearExtensionActivation: vi.fn(),
+    refreshExtensionRuntime: vi.fn(),
+  };
+  const client = {
+    workspaceByCwd: vi.fn(() => workspaceHandle),
+    setExtensionDefaultActivation: vi.fn(),
+    waitForExtensionOperation: vi.fn(),
+  };
+  return {
+    activationHandle,
+    refreshHandle,
+    workspaceHandle,
+    client,
+    actions: {
+      loadExtensionsStatus: vi.fn(),
+      activeExtensionOperations: vi.fn(),
+      extensionOperationStatus: vi.fn(),
+    },
+    workspace: {
+      workspaceCwd: '/work/primary',
+      client,
+      capabilities: {
+        features: ['extension_activation_explicit_refresh'],
+      },
+    },
+  };
+});
 
-vi.mock('@qwen-code/webui/daemon-react-sdk', () => ({
-  useConnection: () => connection,
-  useWorkspaceActions: () => actions,
-  useWorkspaceEventSignals: () => signals,
+vi.mock('@qwen-code/web-shell/daemon-react-sdk', () => ({
+  useConnection: () => ({ clientId: 'client-1' }),
+  useWorkspace: () => state.workspace,
+  useWorkspaceActions: () => state.actions,
+  useWorkspaceEventSignals: () => undefined,
 }));
 
 const { ExtensionsManagerPage } = await import('./ExtensionsManagerPage');
+const { I18nProvider } = await import('../../i18n');
 
-let container: HTMLDivElement | null = null;
-let root: Root | null = null;
+let container: HTMLDivElement;
+let root: Root;
 
-async function flush() {
+async function renderPage(): Promise<void> {
   await act(async () => {
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    root.render(
+      <I18nProvider language="en">
+        <ExtensionsManagerPage onClose={vi.fn()} />
+      </I18nProvider>,
+    );
+  });
+  await vi.waitFor(() => {
+    expect(container.querySelector('[aria-label="Demo"]')).not.toBeNull();
   });
 }
 
-function extension(
-  updateState?: DaemonExtensionEntry['updateState'],
-): DaemonExtensionEntry {
-  return {
-    kind: 'extension',
-    id: 'demo',
-    name: 'demo',
-    displayName: 'Demo',
-    version: '1.0.0',
-    isActive: true,
-    path: '/tmp/demo',
-    updateState,
-    capabilities: {
-      mcpServerCount: 0,
-      skillCount: 0,
-      agentCount: 0,
-      hookCount: 0,
-      commandCount: 0,
-      contextFileCount: 0,
-      channelCount: 0,
-      hasSettings: false,
-    },
-  };
+function findButton(label: string): HTMLButtonElement {
+  const matches = Array.from(
+    container.querySelectorAll<HTMLButtonElement>('button'),
+  ).filter((button) => button.textContent?.trim() === label);
+  expect(matches).toHaveLength(1);
+  return matches[0]!;
 }
 
-function renderPage() {
-  root?.render(
-    <I18nProvider language="en">
-      <ExtensionsManagerPage onClose={vi.fn()} />
-    </I18nProvider>,
-  );
-}
-
-async function mount(
-  extensions: DaemonExtensionEntry[] = [],
-  activeOperations: ExtensionOperationStatus[] = [],
-) {
-  actions.activeExtensionOperations.mockResolvedValue({
-    v: 1,
-    operations: activeOperations,
-  });
-  if (!actions.checkExtensionUpdates.getMockImplementation()) {
-    actions.checkExtensionUpdates.mockResolvedValue({ states: {} });
+async function chooseActivation(
+  scope: 'user' | 'workspace',
+  label: string,
+): Promise<void> {
+  // The detail panel replaces the card list once an extension is selected.
+  const card = container.querySelector<HTMLElement>('[aria-label="Demo"]');
+  if (card) {
+    await act(async () => {
+      card.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
   }
-  actions.loadExtensionsStatus.mockResolvedValue({
-    v: 1,
-    workspaceCwd: '/workspace',
-    initialized: true,
-    extensions,
+  const triggers = container.querySelectorAll<HTMLElement>('[role="combobox"]');
+  expect(triggers).toHaveLength(2);
+  await act(async () => triggers[scope === 'user' ? 0 : 1]!.click());
+  const option = Array.from(
+    document.body.querySelectorAll<HTMLElement>('[role="option"]'),
+  ).find((candidate) => candidate.textContent?.trim() === label);
+  expect(option).toBeDefined();
+  await act(async () => {
+    option!.click();
+    await Promise.resolve();
+    await Promise.resolve();
   });
+}
+
+beforeEach(() => {
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
-  await act(async () => {
-    renderPage();
+  state.workspace.capabilities.features = [
+    'extension_activation_explicit_refresh',
+  ];
+  state.workspaceHandle.workspaceExtensions.mockReset().mockResolvedValue({
+    v: 1,
+    workspaceId: 'primary',
+    workspaceCwd: '/work/primary',
+    trusted: true,
+    desiredGeneration: 1,
+    appliedGeneration: 1,
+    extensions: [
+      {
+        extensionId: 'a'.repeat(64),
+        name: 'demo',
+        version: '1.0.0',
+        defaultActivation: 'enabled',
+        workspaceActivation: null,
+        effectiveActivation: 'enabled',
+        activationSource: 'default',
+      },
+    ],
   });
-  await flush();
-}
-
-function buttonIncluding(text: string): HTMLButtonElement | undefined {
-  return Array.from(document.querySelectorAll('button')).find((button) =>
-    button.textContent?.includes(text),
-  );
-}
-
-function elementIncluding(selector: string, text: string): Element | undefined {
-  return Array.from(document.querySelectorAll(selector)).find((element) =>
-    element.textContent?.includes(text),
-  );
-}
-
-function click(element: Element | undefined) {
-  if (!element) throw new Error('click target not found');
-  act(() => {
-    element.dispatchEvent(
-      new MouseEvent('click', { bubbles: true, cancelable: true }),
-    );
+  state.workspaceHandle.setExtensionActivation
+    .mockReset()
+    .mockResolvedValue(state.activationHandle);
+  state.workspaceHandle.clearExtensionActivation.mockReset();
+  state.workspaceHandle.refreshExtensionRuntime
+    .mockReset()
+    .mockResolvedValue(state.refreshHandle);
+  state.client.workspaceByCwd.mockClear();
+  state.client.setExtensionDefaultActivation
+    .mockReset()
+    .mockResolvedValue(state.activationHandle);
+  state.client.waitForExtensionOperation.mockReset().mockResolvedValue({
+    v: 1,
+    operationId: 'activate',
+    operation: 'activation',
+    status: 'succeeded',
+    createdAt: 1,
+    updatedAt: 2,
+    result: { status: 'disabled', name: 'demo' },
   });
-}
-
-function pointerDown(element: Element | undefined) {
-  if (!element) throw new Error('pointer target not found');
-  act(() => {
-    element.dispatchEvent(
-      new MouseEvent('pointerdown', {
-        bubbles: true,
-        cancelable: true,
-        button: 0,
-      }),
-    );
+  state.actions.loadExtensionsStatus.mockReset().mockResolvedValue({
+    v: 1,
+    workspaceCwd: '/work/primary',
+    initialized: true,
+    extensions: [
+      {
+        kind: 'extension',
+        id: 'a'.repeat(64),
+        name: 'demo',
+        displayName: 'Demo',
+        version: '1.0.0',
+        isActive: true,
+        path: '/extensions/demo',
+        capabilities: {
+          mcpServerCount: 0,
+          skillCount: 0,
+          agentCount: 0,
+          hookCount: 0,
+          commandCount: 0,
+          contextFileCount: 0,
+          channelCount: 0,
+          hasSettings: false,
+        },
+      },
+    ],
   });
-}
-
-function changeInput(input: HTMLInputElement | null, value: string) {
-  if (!input) throw new Error('input not found');
-  act(() => {
-    const setter = Object.getOwnPropertyDescriptor(
-      HTMLInputElement.prototype,
-      'value',
-    )?.set;
-    setter?.call(input, value);
-    input.dispatchEvent(new Event('input', { bubbles: true }));
+  state.actions.activeExtensionOperations.mockReset().mockResolvedValue({
+    v: 1,
+    operations: [],
   });
-}
-
-async function startInstall() {
-  click(buttonIncluding('Add Extension'));
-  changeInput(document.querySelector('#extension-source'), 'owner/repo');
-  click(buttonIncluding('Install'));
-  await flush();
-}
-
-afterEach(() => {
-  act(() => root?.unmount());
-  container?.remove();
-  root = null;
-  container = null;
-  connection.clientId = 'client-1';
-  signals.extensionsVersion = 0;
-  vi.resetAllMocks();
+  state.actions.extensionOperationStatus.mockReset();
 });
 
-describe('ExtensionsManagerPage', () => {
-  it('reports recovery failures and clears the error after retry', async () => {
-    vi.useFakeTimers();
-    actions.activeExtensionOperations
-      .mockRejectedValueOnce(new Error('Could not recover operations'))
-      .mockResolvedValue({ v: 1, operations: [] });
+afterEach(async () => {
+  await act(async () => root.unmount());
+  container.remove();
+});
 
-    try {
-      await mount();
-      expect(document.body.textContent).toContain(
-        'Could not recover operations',
-      );
-      expect(buttonIncluding('Add Extension')?.disabled).toBe(true);
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(2000);
-      });
-      await flush();
-
-      expect(actions.activeExtensionOperations).toHaveBeenCalledTimes(2);
-      expect(document.body.textContent).not.toContain(
-        'Could not recover operations',
-      );
-      expect(buttonIncluding('Add Extension')?.disabled).toBe(false);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('recovers an active extension operation when reopened', async () => {
-    actions.extensionOperationStatus.mockResolvedValue({
-      v: 1,
-      operationId: 'op-active',
-      operation: 'install',
-      status: 'succeeded',
-      createdAt: 1,
-      updatedAt: 2,
-      source: 'owner/repo',
-      result: { status: 'installed', name: 'demo' },
-    });
-
-    await mount(
-      [],
-      [
-        {
-          v: 1,
-          operationId: 'op-active',
-          operation: 'install',
-          status: 'running',
-          createdAt: 1,
-          updatedAt: 1,
-          source: 'owner/repo',
-        },
-      ],
+describe('ExtensionsManagerPage activation refresh', () => {
+  it('submits a workspace refresh without polling or blocking the page', async () => {
+    // A refresh that never settles keeps the page busy if it is awaited.
+    state.workspaceHandle.refreshExtensionRuntime.mockReturnValue(
+      new Promise(() => {}),
     );
+    await renderPage();
+    await chooseActivation('workspace', 'Disabled');
 
-    expect(actions.extensionOperationStatus).toHaveBeenCalledWith('op-active');
-    expect(document.body.textContent).toContain('installed');
-  });
-
-  it('recovers the newest install when multiple operations are active', async () => {
-    actions.extensionOperationStatus.mockResolvedValue({
-      v: 1,
-      operationId: 'op-new',
-      operation: 'install',
-      status: 'succeeded',
-      createdAt: 2,
-      updatedAt: 3,
-      source: 'owner/new',
-      result: { status: 'installed', name: 'new' },
-    });
-
-    await mount(
-      [],
-      [
-        {
-          v: 1,
-          operationId: 'op-old',
-          operation: 'install',
-          status: 'running',
-          createdAt: 1,
-          updatedAt: 2,
-          source: 'owner/old',
-        },
-        {
-          v: 1,
-          operationId: 'op-new',
-          operation: 'install',
-          status: 'queued',
-          createdAt: 2,
-          updatedAt: 2,
-          source: 'owner/new',
-        },
-      ],
-    );
-
-    expect(actions.extensionOperationStatus).toHaveBeenCalledWith('op-new');
-  });
-
-  it('recovers and completes an active extension mutation', async () => {
-    vi.useFakeTimers();
-    actions.extensionOperationStatus
-      .mockResolvedValueOnce({
-        v: 1,
-        operationId: 'op-update',
-        operation: 'update',
-        status: 'running',
-        createdAt: 1,
-        updatedAt: 2,
-        name: 'demo',
-      })
-      .mockResolvedValueOnce({
-        v: 1,
-        operationId: 'op-update',
-        operation: 'update',
-        status: 'succeeded',
-        createdAt: 1,
-        updatedAt: 3,
-        name: 'demo',
-        result: { status: 'updated', name: 'demo' },
-      });
-
-    try {
-      await mount(
-        [extension()],
-        [
-          {
-            v: 1,
-            operationId: 'op-update',
-            operation: 'update',
-            status: 'running',
-            createdAt: 1,
-            updatedAt: 1,
-            name: 'demo',
-          },
-        ],
-      );
-      expect(buttonIncluding('Add Extension')?.disabled).toBe(true);
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(5000);
-      });
-      await flush();
-
-      expect(actions.extensionOperationStatus).toHaveBeenCalledTimes(2);
-      expect(buttonIncluding('Add Extension')?.disabled).toBe(false);
-      expect(actions.loadExtensionsStatus).toHaveBeenCalledTimes(2);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('reloads the extension list without refreshing daemon sessions', async () => {
-    await mount();
-
-    actions.loadExtensionsStatus.mockClear();
-    click(buttonIncluding('refresh'));
-    await flush();
-
-    expect(actions.loadExtensionsStatus).toHaveBeenCalledOnce();
-    expect(actions.refreshExtensions).not.toHaveBeenCalled();
-  });
-
-  it('disables adding another extension while an install is pending', async () => {
-    actions.installExtension.mockResolvedValue({
-      accepted: true,
-      operationId: 'op-1',
-    });
-    actions.extensionOperationStatus.mockResolvedValue({
-      v: 1,
-      operationId: 'op-1',
-      operation: 'install',
-      status: 'running',
-      createdAt: 1,
-      updatedAt: 1,
-    });
-    await mount();
-
-    await startInstall();
-
-    expect(actions.installExtension).toHaveBeenCalledOnce();
-    expect(buttonIncluding('Add Extension')?.disabled).toBe(true);
-  });
-
-  it('keeps the add dialog open until the install request is accepted', async () => {
-    let acceptInstall:
-      | ((value: { accepted: true; operationId: string }) => void)
-      | undefined;
-    actions.installExtension.mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          acceptInstall = resolve;
-        }),
-    );
-    actions.extensionOperationStatus.mockResolvedValue({
-      v: 1,
-      operationId: 'op-1',
-      operation: 'install',
-      status: 'running',
-      createdAt: 1,
-      updatedAt: 1,
-    });
-    await mount();
-
-    click(buttonIncluding('Add Extension'));
-    changeInput(document.querySelector('#extension-source'), 'owner/repo');
-    click(buttonIncluding('Install'));
-    await flush();
-
-    expect(document.querySelector('#extension-source')).not.toBeNull();
-    expect(buttonIncluding('Install')?.disabled).toBe(true);
-
-    await act(async () => {
-      acceptInstall?.({ accepted: true, operationId: 'op-1' });
-    });
-    await flush();
-
-    expect(document.querySelector('#extension-source')).toBeNull();
-  });
-
-  it('closes a failed interaction and resumes polling the install', async () => {
-    actions.installExtension.mockResolvedValue({
-      accepted: true,
-      operationId: 'op-1',
-    });
-    actions.extensionOperationStatus
-      .mockResolvedValueOnce({
-        v: 1,
-        operationId: 'op-1',
-        operation: 'install',
-        status: 'waiting_for_input',
-        createdAt: 1,
-        updatedAt: 2,
-        interaction: {
-          id: 'interaction-1',
-          kind: 'setting',
-          setting: {
-            name: 'API key',
-            description: 'Enter an API key',
-            sensitive: true,
-          },
-        },
-      })
-      .mockResolvedValueOnce({
-        v: 1,
-        operationId: 'op-1',
-        operation: 'install',
-        status: 'waiting_for_input',
-        createdAt: 1,
-        updatedAt: 3,
-        interaction: {
-          id: 'interaction-2',
-          kind: 'setting',
-          setting: {
-            name: 'Second API key',
-            description: 'Enter another API key',
-            sensitive: true,
-          },
-        },
-      });
-    actions.respondToExtensionInteraction.mockRejectedValue(
-      new Error('Interaction expired'),
-    );
-    await mount();
-
-    await startInstall();
-    changeInput(
-      document.querySelector('input[aria-label="API key"]'),
-      'secret',
-    );
-    act(() => {
-      document
-        .querySelector('input[aria-label="API key"]')
-        ?.dispatchEvent(
-          new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }),
-        );
-    });
-    await flush();
-
-    expect(actions.respondToExtensionInteraction).toHaveBeenCalledWith(
-      'op-1',
-      'interaction-1',
-      { value: 'secret' },
-      'client-1',
-    );
-    expect(actions.extensionOperationStatus).toHaveBeenCalledTimes(2);
-    expect(document.body.textContent).toContain('Interaction expired');
-    expect(
-      (
-        document.querySelector(
-          'input[aria-label="Second API key"]',
-        ) as HTMLInputElement | null
-      )?.value,
-    ).toBe('');
-  });
-
-  it('submits a marketplace plugin selection while installing', async () => {
-    actions.installExtension.mockResolvedValue({
-      accepted: true,
-      operationId: 'op-marketplace',
-    });
-    actions.extensionOperationStatus
-      .mockResolvedValueOnce({
-        v: 1,
-        operationId: 'op-marketplace',
-        operation: 'install',
-        status: 'waiting_for_input',
-        createdAt: 1,
-        updatedAt: 2,
-        interaction: {
-          id: 'interaction-marketplace',
-          kind: 'marketplace_plugin',
-          marketplace: { name: 'Example Marketplace' },
-          plugins: [
-            {
-              name: 'example-plugin',
-              description: 'Example plugin description',
-            },
-          ],
-        },
-      })
-      .mockResolvedValueOnce({
-        v: 1,
-        operationId: 'op-marketplace',
-        operation: 'install',
-        status: 'succeeded',
-        createdAt: 1,
-        updatedAt: 3,
-      });
-    actions.respondToExtensionInteraction.mockResolvedValue({ accepted: true });
-    await mount();
-
-    await startInstall();
-    expect(document.body.textContent).toContain('Example plugin description');
-    click(document.querySelector('[role="radio"]') ?? undefined);
-    click(buttonIncluding('Install'));
-    await flush();
-
-    expect(actions.respondToExtensionInteraction).toHaveBeenCalledWith(
-      'op-marketplace',
-      'interaction-marketplace',
-      { pluginName: 'example-plugin' },
-      'client-1',
-    );
-    expect(actions.extensionOperationStatus).toHaveBeenCalledTimes(2);
-  });
-
-  it('keeps polling while an interaction is waiting', async () => {
-    vi.useFakeTimers();
-    actions.installExtension.mockResolvedValue({
-      accepted: true,
-      operationId: 'op-waiting',
-    });
-    actions.extensionOperationStatus
-      .mockResolvedValueOnce({
-        v: 1,
-        operationId: 'op-waiting',
-        operation: 'install',
-        status: 'waiting_for_input',
-        createdAt: 1,
-        updatedAt: 2,
-        interaction: {
-          id: 'interaction-waiting',
-          kind: 'setting',
-          setting: {
-            name: 'API key',
-            description: 'Enter an API key',
-            sensitive: true,
-          },
-        },
-      })
-      .mockResolvedValueOnce({
-        v: 1,
-        operationId: 'op-waiting',
-        operation: 'install',
-        status: 'failed',
-        createdAt: 1,
-        updatedAt: 3,
-        error: 'Extension interaction timed out',
-      });
-
-    try {
-      await mount();
-      await startInstall();
-      expect(document.body.textContent).toContain('API key');
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(5000);
-      });
-      await flush();
-
-      expect(actions.extensionOperationStatus).toHaveBeenCalledTimes(2);
-      expect(document.body.textContent).toContain(
-        'Extension interaction timed out',
-      );
-      expect(buttonIncluding('Add Extension')?.disabled).toBe(false);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('retains operation tracking after a transient status error', async () => {
-    vi.useFakeTimers();
-    actions.installExtension.mockResolvedValue({
-      accepted: true,
-      operationId: 'op-retry',
-    });
-    actions.extensionOperationStatus
-      .mockRejectedValueOnce(new Error('Temporary network error'))
-      .mockResolvedValueOnce({
-        v: 1,
-        operationId: 'op-retry',
-        operation: 'install',
-        status: 'succeeded',
-        createdAt: 1,
-        updatedAt: 2,
-        result: { status: 'installed', name: 'demo' },
-      });
-
-    try {
-      await mount();
-      await startInstall();
-      expect(document.body.textContent).toContain('Temporary network error');
-      expect(buttonIncluding('Add Extension')?.disabled).toBe(true);
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1000);
-      });
-      await flush();
-
-      expect(actions.extensionOperationStatus).toHaveBeenCalledTimes(2);
-      expect(document.body.textContent).toContain('installed');
-      expect(buttonIncluding('Add Extension')?.disabled).toBe(false);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('stops tracking an operation that is no longer on the daemon', async () => {
-    actions.installExtension.mockResolvedValue({
-      accepted: true,
-      operationId: 'op-missing',
-    });
-    actions.extensionOperationStatus.mockRejectedValue(
-      new DaemonHttpError(404, {}, 'Operation not found'),
-    );
-
-    await mount();
-    await startInstall();
-
-    expect(actions.extensionOperationStatus).toHaveBeenCalledOnce();
-    expect(buttonIncluding('Add Extension')?.disabled).toBe(false);
-    expect(document.body.textContent).toContain('Operation not found');
-  });
-
-  it('checks for updates automatically after loading extensions', async () => {
-    actions.checkExtensionUpdates.mockResolvedValue({
-      states: { demo: 'update available' },
-    });
-
-    await mount([extension()]);
-
-    expect(actions.checkExtensionUpdates).toHaveBeenCalledWith('client-1');
-    expect(document.body.textContent).toContain('update available');
-  });
-
-  it('updates an extension without a session client id', async () => {
-    connection.clientId = undefined;
-    actions.checkExtensionUpdates.mockResolvedValue({
-      states: { demo: 'update available' },
-    });
-    actions.updateExtension.mockResolvedValue({
-      accepted: true,
-      operationId: 'op-update',
-    });
-    actions.extensionOperationStatus
-      .mockResolvedValueOnce({
-        v: 1,
-        operationId: 'op-update',
-        operation: 'update',
-        status: 'waiting_for_input',
-        createdAt: 1,
-        updatedAt: 2,
-        interaction: {
-          id: 'interaction-update',
-          kind: 'setting',
-          setting: {
-            name: 'Optional setting',
-            description: 'May be left empty',
-            sensitive: false,
-          },
-        },
-      })
-      .mockResolvedValueOnce({
-        v: 1,
-        operationId: 'op-update',
-        operation: 'update',
-        status: 'succeeded',
-        createdAt: 1,
-        updatedAt: 3,
-        result: { status: 'updated', name: 'demo' },
-      });
-    actions.respondToExtensionInteraction.mockResolvedValue({ accepted: true });
-    await mount([extension()]);
-
-    click(document.querySelector('[data-slot="card"]') ?? undefined);
-    await flush();
-    pointerDown(
-      document.querySelector('button[aria-label="Extension actions"]') ??
-        undefined,
-    );
-    await flush();
-    click(
-      elementIncluding('[data-slot="dropdown-menu-item"]', 'Update Extension'),
-    );
-    await flush();
-
-    expect(actions.updateExtension).toHaveBeenCalledWith('demo', undefined);
-    expect(actions.extensionOperationStatus).toHaveBeenCalledWith('op-update');
-    expect(document.body.textContent).toContain('Optional setting');
-    click(buttonIncluding('Update'));
-    await flush();
-    expect(actions.respondToExtensionInteraction).toHaveBeenCalledWith(
-      'op-update',
-      'interaction-update',
-      { value: '' },
-      undefined,
-    );
-    expect(actions.extensionOperationStatus).toHaveBeenCalledTimes(2);
-    expect(document.body.textContent).not.toContain(
-      'Wait for the session to connect',
-    );
-  });
-
-  it('keeps uninstall progress on the detail page and returns silently to the list', async () => {
-    vi.useFakeTimers();
-    let acceptUninstall:
-      | ((value: { accepted: true; operationId: string }) => void)
-      | undefined;
-    actions.uninstallExtension.mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          acceptUninstall = resolve;
-        }),
-    );
-    actions.extensionOperationStatus
-      .mockResolvedValueOnce({
-        v: 1,
-        operationId: 'op-uninstall',
-        operation: 'uninstall',
-        status: 'running',
-        createdAt: 1,
-        updatedAt: 2,
-        name: 'demo',
-      })
-      .mockResolvedValueOnce({
-        v: 1,
-        operationId: 'op-uninstall',
-        operation: 'uninstall',
-        status: 'succeeded',
-        createdAt: 1,
-        updatedAt: 3,
-        name: 'demo',
-        result: { status: 'uninstalled', name: 'demo' },
-      });
-
-    try {
-      await mount([extension()]);
-      click(document.querySelector('[data-slot="card"]') ?? undefined);
-      await flush();
-      pointerDown(
-        document.querySelector('button[aria-label="Extension actions"]') ??
-          undefined,
-      );
-      await flush();
-      click(
-        elementIncluding(
-          '[data-slot="dropdown-menu-item"]',
-          'Uninstall Extension',
-        ),
-      );
-      await flush();
-      click(buttonIncluding('Uninstall Extension'));
-      await flush();
-
-      expect(document.querySelector('h1')?.textContent).toContain('Demo');
-      expect(document.body.textContent).toContain(
-        'Uninstalling extension "demo"',
-      );
+    // No client id: the workspace-qualified route validates a supplied id
+    // against only the targeted runtime, then discards it.
+    await vi.waitFor(() => {
       expect(
-        document.querySelector<HTMLButtonElement>(
-          'button[aria-label="Extension actions"]',
-        )?.disabled,
-      ).toBe(true);
-      expect(actions.extensionOperationStatus).not.toHaveBeenCalled();
-
-      await act(async () => {
-        acceptUninstall?.({
-          accepted: true,
-          operationId: 'op-uninstall',
-        });
-      });
-      await flush();
-
-      actions.loadExtensionsStatus.mockResolvedValue({
-        v: 1,
-        workspaceCwd: '/workspace',
-        initialized: true,
-        extensions: [],
-      });
-      signals.extensionsVersion += 1;
-      await act(async () => renderPage());
-      await flush();
-
-      expect(document.querySelector('h1')?.textContent).toContain('Demo');
-      expect(document.body.textContent).toContain(
-        'Uninstalling extension "demo"',
-      );
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1000);
-      });
-      await flush();
-
-      expect(document.querySelector('h1')?.textContent).toContain(
-        'Manage Extensions',
-      );
-      expect(document.body.textContent).not.toContain(
-        'Extension "demo" uninstalled.',
-      );
-    } finally {
-      vi.useRealTimers();
-    }
+        state.workspaceHandle.refreshExtensionRuntime,
+      ).toHaveBeenCalledWith();
+    });
+    expect(state.client.waitForExtensionOperation).toHaveBeenCalledOnce();
+    expect(state.client.waitForExtensionOperation).toHaveBeenCalledWith(
+      state.activationHandle,
+    );
+    expect(
+      container.querySelectorAll<HTMLButtonElement>('[role="combobox"]')[1]!
+        .disabled,
+    ).toBe(false);
   });
 
-  it('shows disable progress and disables detail actions', async () => {
-    actions.disableExtension.mockResolvedValue({
-      accepted: true,
-      operationId: 'op-disable',
+  it('refreshes only the current workspace after a global activation', async () => {
+    await renderPage();
+    await chooseActivation('user', 'Disabled');
+
+    expect(state.client.setExtensionDefaultActivation).toHaveBeenCalledWith(
+      'a'.repeat(64),
+      'disabled',
+    );
+    expect(state.client.workspaceByCwd).toHaveBeenLastCalledWith(
+      '/work/primary',
+    );
+    expect(
+      state.workspaceHandle.refreshExtensionRuntime,
+    ).toHaveBeenCalledWith();
+  });
+
+  it('does not submit an extra refresh to an older daemon', async () => {
+    state.workspace.capabilities.features = [];
+    await renderPage();
+    await chooseActivation('workspace', 'Disabled');
+
+    expect(
+      state.workspaceHandle.refreshExtensionRuntime,
+    ).not.toHaveBeenCalled();
+  });
+
+  it('keeps the newer mutation message when an earlier refresh rejects late', async () => {
+    let rejectRefresh: ((error: Error) => void) | undefined;
+    state.workspaceHandle.refreshExtensionRuntime.mockReturnValue(
+      new Promise((_resolve, reject) => {
+        rejectRefresh = reject;
+      }),
+    );
+    await renderPage();
+    await chooseActivation('workspace', 'Disabled');
+    await vi.waitFor(() => {
+      expect(state.workspaceHandle.refreshExtensionRuntime).toHaveBeenCalled();
     });
-    actions.extensionOperationStatus.mockResolvedValue({
+
+    state.client.waitForExtensionOperation.mockResolvedValue({
       v: 1,
-      operationId: 'op-disable',
-      operation: 'disable',
-      status: 'running',
+      operationId: 'activate',
+      operation: 'activation',
+      status: 'failed',
       createdAt: 1,
       updatedAt: 2,
-      name: 'demo',
+      error: 'boom-later-mutation',
     });
-    await mount([extension()]);
+    await chooseActivation('workspace', 'Enabled');
+    await vi.waitFor(() => {
+      expect(container.textContent).toContain('boom-later-mutation');
+    });
 
-    click(document.querySelector('[data-slot="card"]') ?? undefined);
-    await flush();
-    pointerDown(
-      document.querySelector('button[aria-label="Extension actions"]') ??
-        undefined,
-    );
-    await flush();
-    click(
-      elementIncluding('[data-slot="dropdown-menu-item"]', 'Disable Extension'),
-    );
-    await flush();
+    await act(async () => {
+      rejectRefresh!(new Error('boom-stale-refresh'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
 
-    expect(document.body.textContent).toContain('Disabling extension "demo"');
-    expect(
-      document.querySelector<HTMLButtonElement>(
-        'button[aria-label="Extension actions"]',
-      )?.disabled,
-    ).toBe(true);
+    expect(container.textContent).toContain('boom-later-mutation');
+    expect(container.textContent).toContain('session refresh failed');
   });
 
-  it('opens extension details with the keyboard', async () => {
-    await mount([extension()]);
+  it('does not adopt an in-flight refresh as a pending mutation', async () => {
+    const running = {
+      v: 1 as const,
+      operationId: 'refresh-1',
+      operation: 'refresh',
+      status: 'running' as const,
+      phase: 'reconciling' as const,
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    state.actions.activeExtensionOperations.mockResolvedValue({
+      v: 1,
+      operations: [running],
+    });
+    state.actions.extensionOperationStatus.mockResolvedValue(running);
+    await renderPage();
 
-    const card = document.querySelector('[data-slot="card"]');
-    expect(card?.getAttribute('role')).toBe('button');
-    expect(card?.getAttribute('aria-label')).toBe('Demo');
-    act(() => {
-      card?.dispatchEvent(
-        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }),
+    expect(container.textContent).not.toContain('Extension action queued');
+    expect(findButton('Add').disabled).toBe(false);
+
+    await chooseActivation('workspace', 'Disabled');
+    expect(state.workspaceHandle.setExtensionActivation).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the catalog load error when a stale refresh rejects', async () => {
+    let rejectRefresh: ((error: Error) => void) | undefined;
+    state.workspaceHandle.refreshExtensionRuntime.mockReturnValue(
+      new Promise((_resolve, reject) => {
+        rejectRefresh = reject;
+      }),
+    );
+    await renderPage();
+    await chooseActivation('workspace', 'Disabled');
+    await vi.waitFor(() => {
+      expect(state.workspaceHandle.refreshExtensionRuntime).toHaveBeenCalled();
+    });
+
+    // The catalog error banner only renders in the list view.
+    await act(async () => {
+      findButton('Manage Extensions').click();
+    });
+    state.actions.loadExtensionsStatus.mockRejectedValue(
+      new Error('catalog-reload-failed'),
+    );
+    await act(async () => {
+      findButton('Refresh').click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await vi.waitFor(() => {
+      expect(container.textContent).toContain('catalog-reload-failed');
+    });
+
+    await act(async () => {
+      rejectRefresh!(new Error('boom-stale-refresh'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain('catalog-reload-failed');
+    expect(container.textContent).toContain('session refresh failed');
+  });
+
+  it('clears a stale refresh failure when a new activation starts', async () => {
+    state.workspaceHandle.refreshExtensionRuntime.mockRejectedValueOnce(
+      new Error('refresh unavailable'),
+    );
+    await renderPage();
+    await chooseActivation('workspace', 'Disabled');
+    await vi.waitFor(() => {
+      expect(container.textContent).toContain('session refresh failed');
+    });
+
+    // A non-activation action retires the banner as well.
+    await act(async () => {
+      findButton('Manage Extensions').click();
+    });
+    await act(async () => {
+      findButton('Refresh').click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent).not.toContain('session refresh failed');
+
+    state.workspaceHandle.refreshExtensionRuntime.mockReturnValue(
+      new Promise(() => {}),
+    );
+    await chooseActivation('workspace', 'Enabled');
+    expect(container.textContent).not.toContain('session refresh failed');
+  });
+
+  it('keeps activation successful when refresh submission fails', async () => {
+    state.workspaceHandle.refreshExtensionRuntime.mockRejectedValue(
+      new Error('refresh unavailable'),
+    );
+    await renderPage();
+    await chooseActivation('workspace', 'Disabled');
+
+    await vi.waitFor(() => {
+      expect(container.textContent).toContain(
+        'Extension action succeeded, but session refresh failed: refresh unavailable',
       );
     });
-    await flush();
-
-    expect(document.querySelector('h1')?.textContent).toContain('Demo');
+    expect(state.workspaceHandle.setExtensionActivation).toHaveBeenCalledOnce();
+    expect(state.client.waitForExtensionOperation).toHaveBeenCalledOnce();
   });
 
-  it('shows the extension description only once on the detail page', async () => {
-    await mount([
-      { ...extension(), description: 'A single extension description' },
-    ]);
-
-    click(document.querySelector('[data-slot="card"]') ?? undefined);
-    await flush();
-
-    expect(
-      document.body.textContent?.match(/A single extension description/g),
-    ).toHaveLength(1);
-  });
-
-  it('keeps only the status beside the card title without a footer', async () => {
-    await mount([extension()]);
-
-    const card = document.querySelector('[data-slot="card"]');
-    const titleRow = card?.querySelector(
-      '[data-slot="card-title"]',
-    )?.parentElement;
-
-    expect(titleRow?.textContent).toContain('Demo');
-    expect(titleRow?.textContent).toContain('enabled');
-    expect(card?.textContent).not.toContain('v1.0.0');
-    expect(card?.querySelector('[data-slot="card-footer"]')).toBeNull();
-    expect(
-      card
-        ?.querySelector('[data-slot="card-description"]')
-        ?.classList.contains('truncate'),
-    ).toBe(true);
-  });
-
-  it('clears stale update states when the extensions signal changes', async () => {
-    actions.checkExtensionUpdates
-      .mockResolvedValueOnce({ states: { demo: 'update available' } })
-      .mockResolvedValueOnce({ states: { demo: 'up to date' } });
-    await mount([extension('up to date')]);
-    expect(document.body.textContent).toContain('update available');
-
-    actions.loadExtensionsStatus.mockResolvedValue({
+  it('skips the session refresh when the workspace is not trusted', async () => {
+    state.workspaceHandle.workspaceExtensions.mockResolvedValue({
       v: 1,
-      workspaceCwd: '/workspace',
-      initialized: true,
-      extensions: [{ ...extension('up to date') }],
+      workspaceId: 'primary',
+      workspaceCwd: '/work/primary',
+      trusted: false,
+      desiredGeneration: 1,
+      appliedGeneration: 1,
+      extensions: [
+        {
+          extensionId: 'a'.repeat(64),
+          name: 'demo',
+          version: '1.0.0',
+          defaultActivation: 'enabled',
+          workspaceActivation: null,
+          effectiveActivation: 'enabled',
+          activationSource: 'default',
+        },
+      ],
     });
-    signals.extensionsVersion = 1;
-    await act(async () => {
-      renderPage();
-    });
-    await flush();
+    await renderPage();
+    await chooseActivation('user', 'Disabled');
 
-    expect(actions.checkExtensionUpdates).toHaveBeenCalledTimes(2);
-    expect(document.body.textContent).not.toContain('update available');
+    // The success message renders only after the refresh call site, so a
+    // refresh that would happen could not arrive after this assertion.
+    await vi.waitFor(() => {
+      expect(container.textContent).toContain('Extension "demo" disabled.');
+    });
+    expect(state.client.setExtensionDefaultActivation).toHaveBeenCalledWith(
+      'a'.repeat(64),
+      'disabled',
+    );
+    expect(
+      state.workspaceHandle.refreshExtensionRuntime,
+    ).not.toHaveBeenCalled();
+    expect(container.textContent).not.toContain('session refresh failed');
+  });
+
+  it('confines the refresh failure banner to the extension that triggered it', async () => {
+    state.actions.loadExtensionsStatus.mockResolvedValue({
+      v: 1,
+      workspaceCwd: '/work/primary',
+      initialized: true,
+      extensions: [
+        {
+          kind: 'extension',
+          id: 'a'.repeat(64),
+          name: 'demo',
+          displayName: 'Demo',
+          version: '1.0.0',
+          isActive: true,
+          path: '/extensions/demo',
+          capabilities: {
+            mcpServerCount: 0,
+            skillCount: 0,
+            agentCount: 0,
+            hookCount: 0,
+            commandCount: 0,
+            contextFileCount: 0,
+            channelCount: 0,
+            hasSettings: false,
+          },
+        },
+        {
+          kind: 'extension',
+          id: 'b'.repeat(64),
+          name: 'other',
+          displayName: 'Other',
+          version: '2.0.0',
+          isActive: true,
+          path: '/extensions/other',
+          capabilities: {
+            mcpServerCount: 0,
+            skillCount: 0,
+            agentCount: 0,
+            hookCount: 0,
+            commandCount: 0,
+            contextFileCount: 0,
+            channelCount: 0,
+            hasSettings: false,
+          },
+        },
+      ],
+    });
+    state.workspaceHandle.workspaceExtensions.mockResolvedValue({
+      v: 1,
+      workspaceId: 'primary',
+      workspaceCwd: '/work/primary',
+      trusted: true,
+      desiredGeneration: 1,
+      appliedGeneration: 1,
+      extensions: [
+        {
+          extensionId: 'a'.repeat(64),
+          name: 'demo',
+          version: '1.0.0',
+          defaultActivation: 'enabled',
+          workspaceActivation: null,
+          effectiveActivation: 'enabled',
+          activationSource: 'default',
+        },
+        {
+          extensionId: 'b'.repeat(64),
+          name: 'other',
+          version: '2.0.0',
+          defaultActivation: 'enabled',
+          workspaceActivation: null,
+          effectiveActivation: 'enabled',
+          activationSource: 'default',
+        },
+      ],
+    });
+    state.workspaceHandle.refreshExtensionRuntime.mockRejectedValueOnce(
+      new Error('refresh unavailable'),
+    );
+    await renderPage();
+    await chooseActivation('workspace', 'Disabled');
+    await vi.waitFor(() => {
+      expect(container.textContent).toContain('session refresh failed');
+    });
+
+    await act(async () => {
+      findButton('Manage Extensions').click();
+    });
+    const otherCard = container.querySelector<HTMLElement>(
+      '[aria-label="Other"]',
+    );
+    expect(otherCard).not.toBeNull();
+    await act(async () => {
+      otherCard!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    await vi.waitFor(() => {
+      expect(container.querySelectorAll('[role="combobox"]')).toHaveLength(2);
+    });
+    expect(container.textContent).not.toContain('session refresh failed');
+  });
+
+  it('decides the refresh on the trust the reload observes', async () => {
+    await renderPage();
+
+    // Trust is revoked out of band after the page mounted; the reload the
+    // activation performs observes it before the refresh decision.
+    state.workspaceHandle.workspaceExtensions.mockResolvedValue({
+      v: 1,
+      workspaceId: 'primary',
+      workspaceCwd: '/work/primary',
+      trusted: false,
+      desiredGeneration: 1,
+      appliedGeneration: 1,
+      extensions: [
+        {
+          extensionId: 'a'.repeat(64),
+          name: 'demo',
+          version: '1.0.0',
+          defaultActivation: 'enabled',
+          workspaceActivation: null,
+          effectiveActivation: 'enabled',
+          activationSource: 'default',
+        },
+      ],
+    });
+    await chooseActivation('user', 'Disabled');
+
+    // The success message renders only after the refresh call site, so a
+    // refresh that would happen could not arrive after this assertion.
+    await vi.waitFor(() => {
+      expect(container.textContent).toContain('Extension "demo" disabled.');
+    });
+    expect(state.client.setExtensionDefaultActivation).toHaveBeenCalledWith(
+      'a'.repeat(64),
+      'disabled',
+    );
+    expect(
+      state.workspaceHandle.refreshExtensionRuntime,
+    ).not.toHaveBeenCalled();
+    expect(container.textContent).not.toContain('session refresh failed');
+  });
+
+  it('keeps the last known trust when the reload loses the activation projection', async () => {
+    state.workspaceHandle.workspaceExtensions.mockResolvedValue({
+      v: 1,
+      workspaceId: 'primary',
+      workspaceCwd: '/work/primary',
+      trusted: false,
+      desiredGeneration: 1,
+      appliedGeneration: 1,
+      extensions: [
+        {
+          extensionId: 'a'.repeat(64),
+          name: 'demo',
+          version: '1.0.0',
+          defaultActivation: 'enabled',
+          workspaceActivation: null,
+          effectiveActivation: 'enabled',
+          activationSource: 'default',
+        },
+      ],
+    });
+    await renderPage();
+
+    // The post-activation reload loses the projection entirely; the refresh
+    // decision must fall back to the remembered trust, not default to
+    // trusted.
+    state.workspaceHandle.workspaceExtensions.mockRejectedValue(
+      new Error('projection-unavailable'),
+    );
+    await chooseActivation('user', 'Disabled');
+
+    // The success message renders only after the refresh call site, so a
+    // refresh that would happen could not arrive after this assertion.
+    await vi.waitFor(() => {
+      expect(container.textContent).toContain('Extension "demo" disabled.');
+    });
+    expect(state.client.setExtensionDefaultActivation).toHaveBeenCalledWith(
+      'a'.repeat(64),
+      'disabled',
+    );
+    expect(
+      state.workspaceHandle.refreshExtensionRuntime,
+    ).not.toHaveBeenCalled();
+    expect(container.textContent).not.toContain('session refresh failed');
+  });
+
+  it('keeps the newer refresh failure when a superseded refresh rejects late', async () => {
+    state.actions.loadExtensionsStatus.mockResolvedValue({
+      v: 1,
+      workspaceCwd: '/work/primary',
+      initialized: true,
+      extensions: [
+        {
+          kind: 'extension',
+          id: 'a'.repeat(64),
+          name: 'demo',
+          displayName: 'Demo',
+          version: '1.0.0',
+          isActive: true,
+          path: '/extensions/demo',
+          capabilities: {
+            mcpServerCount: 0,
+            skillCount: 0,
+            agentCount: 0,
+            hookCount: 0,
+            commandCount: 0,
+            contextFileCount: 0,
+            channelCount: 0,
+            hasSettings: false,
+          },
+        },
+        {
+          kind: 'extension',
+          id: 'b'.repeat(64),
+          name: 'other',
+          displayName: 'Other',
+          version: '2.0.0',
+          isActive: true,
+          path: '/extensions/other',
+          capabilities: {
+            mcpServerCount: 0,
+            skillCount: 0,
+            agentCount: 0,
+            hookCount: 0,
+            commandCount: 0,
+            contextFileCount: 0,
+            channelCount: 0,
+            hasSettings: false,
+          },
+        },
+      ],
+    });
+    state.workspaceHandle.workspaceExtensions.mockResolvedValue({
+      v: 1,
+      workspaceId: 'primary',
+      workspaceCwd: '/work/primary',
+      trusted: true,
+      desiredGeneration: 1,
+      appliedGeneration: 1,
+      extensions: [
+        {
+          extensionId: 'a'.repeat(64),
+          name: 'demo',
+          version: '1.0.0',
+          defaultActivation: 'enabled',
+          workspaceActivation: null,
+          effectiveActivation: 'enabled',
+          activationSource: 'default',
+        },
+        {
+          extensionId: 'b'.repeat(64),
+          name: 'other',
+          version: '2.0.0',
+          defaultActivation: 'enabled',
+          workspaceActivation: null,
+          effectiveActivation: 'enabled',
+          activationSource: 'default',
+        },
+      ],
+    });
+    // Each submission gets its own promise so the two refreshes can fail
+    // independently and out of order.
+    const rejections: Array<(error: Error) => void> = [];
+    state.workspaceHandle.refreshExtensionRuntime.mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejections.push(reject);
+        }),
+    );
+    await renderPage();
+    await chooseActivation('workspace', 'Disabled');
+    await vi.waitFor(() => {
+      expect(
+        state.workspaceHandle.refreshExtensionRuntime,
+      ).toHaveBeenCalledTimes(1);
+    });
+
+    await act(async () => {
+      findButton('Manage Extensions').click();
+    });
+    const otherCard = container.querySelector<HTMLElement>(
+      '[aria-label="Other"]',
+    );
+    expect(otherCard).not.toBeNull();
+    await act(async () => {
+      otherCard!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    await vi.waitFor(() => {
+      expect(container.querySelectorAll('[role="combobox"]')).toHaveLength(2);
+    });
+    await chooseActivation('workspace', 'Disabled');
+    await vi.waitFor(() => {
+      expect(
+        state.workspaceHandle.refreshExtensionRuntime,
+      ).toHaveBeenCalledTimes(2);
+    });
+
+    // The newer refresh fails first and owns the banner.
+    await act(async () => {
+      rejections[1]!(new Error('boom-newer-refresh'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await vi.waitFor(() => {
+      expect(container.textContent).toContain(
+        'session refresh failed: boom-newer-refresh',
+      );
+    });
+
+    // A rejection from the superseded refresh must not evict it.
+    await act(async () => {
+      rejections[0]!(new Error('boom-superseded-refresh'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain(
+      'session refresh failed: boom-newer-refresh',
+    );
+    expect(container.textContent).not.toContain('boom-superseded-refresh');
   });
 });

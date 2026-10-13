@@ -10,9 +10,10 @@ import { Box, Text } from 'ink';
 import { theme } from '../semantic-colors.js';
 import type { LoadedSettings, Settings } from '../../config/settings.js';
 import { SettingScope } from '../../config/settings.js';
-import { getScopeMessageForSetting } from '../../utils/dialogScopeUtils.js';
+import { getScopeMessageForSetting } from '../../config/dialogScopeUtils.js';
 import { ScopeSelector } from './shared/ScopeSelector.js';
 import { t } from '../../i18n/index.js';
+import { ICON } from '../constants.js';
 import {
   getDialogSettingKeys,
   setPendingSettingValue,
@@ -26,14 +27,19 @@ import {
   setPendingSettingValueAny,
   getNestedValue,
   getEffectiveValue,
+  nextBooleanSettingValue,
   validateSettingValue,
-} from '../../utils/settingsUtils.js';
-import { writeOutputLanguageAndRegisterPath } from '../../utils/languageUtils.js';
+} from '../../config/settingsUtils.js';
+import {
+  isAutoLanguage,
+  writeOutputLanguageAndRegisterPath,
+} from '../../i18n/languageUtils.js';
 import {
   useVimModeState,
   useVimModeActions,
 } from '../contexts/VimModeContext.js';
-import { createDebugLogger, type Config } from '@qwen-code/qwen-code-core';
+import type { Config } from '@qwen-code/qwen-code-core/config/config.js';
+import { createDebugLogger } from '@qwen-code/qwen-code-core/utils/debugLogger.js';
 import { useKeypress } from '../hooks/useKeypress.js';
 import {
   isDeletionKey,
@@ -44,6 +50,7 @@ import { keyMatchers, Command } from '../keyMatchers.js';
 import { cpSlice, cpLen, stripUnsafeCharacters } from '../utils/textUtils.js';
 import { renderSoftwareCursor } from '../utils/software-cursor.js';
 import {
+  isNumericSettingType,
   type SettingsValue,
   TOGGLE_TYPES,
 } from '../../config/settingsSchema.js';
@@ -52,7 +59,7 @@ import { StatsDialog } from './StatsDialog.js';
 import {
   getExtendedSystemInfo,
   type ExtendedSystemInfo,
-} from '../../utils/systemInfo.js';
+} from '../systemInfo.js';
 
 interface SettingsDialogProps {
   settings: LoadedSettings;
@@ -177,7 +184,7 @@ export function SettingsDialog({
   );
 
   // Preserve pending changes across scope switches
-  type PendingValue = boolean | number | string;
+  type PendingValue = boolean | number | string | undefined;
   const [globalPendingChanges, setGlobalPendingChanges] = useState<
     Map<string, PendingValue>
   >(new Map());
@@ -196,10 +203,12 @@ export function SettingsDialog({
     const newModified = new Set<string>();
     for (const [key, value] of globalPendingChanges.entries()) {
       const def = getSettingDefinition(key);
-      if (def?.type === 'boolean' && typeof value === 'boolean') {
+      if (value === undefined) {
+        updated = setPendingSettingValueAny(key, value, updated);
+      } else if (def?.type === 'boolean' && typeof value === 'boolean') {
         updated = setPendingSettingValue(key, value, updated);
       } else if (
-        (def?.type === 'number' && typeof value === 'number') ||
+        (isNumericSettingType(def?.type) && typeof value === 'number') ||
         (def?.type === 'string' && typeof value === 'string') ||
         (def?.type === 'enum' &&
           (typeof value === 'string' || typeof value === 'number'))
@@ -213,7 +222,15 @@ export function SettingsDialog({
   }, [selectedScope, settings, globalPendingChanges]);
 
   const generateSettingsItems = () => {
-    const settingKeys = getDialogSettingKeys();
+    // Workspace-restricted settings are stripped before the merge, so offering
+    // them under Workspace scope is a trap: the dialog renders from the raw
+    // scope file, so a toggle here would keep displaying the value it wrote
+    // while the feature stayed at its merged value, leaving a dead entry in
+    // the repo's .qwen/settings.json. They stay listed under the scopes that
+    // do honor them.
+    const settingKeys = getDialogSettingKeys({
+      excludeWorkspaceRestricted: selectedScope === SettingScope.Workspace,
+    });
 
     return settingKeys.map((key: string) => {
       const definition = getSettingDefinition(key);
@@ -234,7 +251,10 @@ export function SettingsDialog({
           const currentValue = getEffectiveValue(key, pendingSettings, {});
           let newValue: SettingsValue;
           if (definition?.type === 'boolean') {
-            newValue = !(currentValue as boolean);
+            newValue = nextBooleanSettingValue(
+              currentValue,
+              definition.default,
+            );
             setPendingSettings((prev) =>
               setPendingSettingValue(key, newValue as boolean, prev),
             );
@@ -463,7 +483,7 @@ export function SettingsDialog({
     const definition = getSettingDefinition(key);
     const type = definition?.type;
 
-    if (editBuffer.trim() === '' && type === 'number') {
+    if (editBuffer.trim() === '' && isNumericSettingType(type)) {
       // Nothing entered for a number; cancel edit
       setEditingKey(null);
       setEditBuffer('');
@@ -472,7 +492,7 @@ export function SettingsDialog({
     }
 
     let parsed: string | number | undefined;
-    if (type === 'number') {
+    if (isNumericSettingType(type)) {
       const numParsed = Number(editBuffer.trim());
       if (Number.isNaN(numParsed)) {
         // Invalid number; cancel edit
@@ -790,7 +810,7 @@ export function SettingsDialog({
 
           if (key.paste && key.sequence) {
             let pasted = key.sequence;
-            if (type === 'number') {
+            if (isNumericSettingType(type)) {
               pasted = key.sequence.replace(/[^0-9\-+.]/g, '');
             }
             if (pasted) {
@@ -832,7 +852,7 @@ export function SettingsDialog({
 
           let ch = key.sequence;
           let isValidChar = false;
-          if (type === 'number') {
+          if (isNumericSettingType(type)) {
             // Allow digits, minus, plus, and dot.
             isValidChar = /[0-9\-+.]/.test(ch);
           } else {
@@ -932,7 +952,7 @@ export function SettingsDialog({
             return;
           }
           if (
-            currentItem?.type === 'number' ||
+            isNumericSettingType(currentItem?.type) ||
             currentItem?.type === 'string'
           ) {
             startEditing(currentItem.value);
@@ -952,7 +972,7 @@ export function SettingsDialog({
           }
         } else if (/^[0-9]$/.test(key.sequence || '') && !editingKey) {
           const currentItem = items[activeSettingIndex];
-          if (currentItem?.type === 'number') {
+          if (isNumericSettingType(currentItem?.type)) {
             startEditing(currentItem.value, key.sequence);
           } else {
             // Non-number setting: route the digit into the search box instead
@@ -966,18 +986,16 @@ export function SettingsDialog({
           if (currentSetting) {
             const defaultValue = getDefaultValue(currentSetting.value);
             const defType = currentSetting.type;
-            if (defType === 'boolean') {
-              const booleanDefaultValue =
-                typeof defaultValue === 'boolean' ? defaultValue : false;
+            if (defType === 'boolean' || defaultValue === undefined) {
               setPendingSettings((prev) =>
-                setPendingSettingValue(
+                setPendingSettingValueAny(
                   currentSetting.value,
-                  booleanDefaultValue,
+                  defaultValue,
                   prev,
                 ),
               );
             } else if (
-              defType === 'number' ||
+              isNumericSettingType(defType) ||
               defType === 'string' ||
               defType === 'enum'
             ) {
@@ -995,28 +1013,34 @@ export function SettingsDialog({
               }
             }
 
-            // Remove from modified settings since it's now at default
+            const scopeSettings = settings.forScope(selectedScope).settings;
+            const resetChangesValue =
+              !isDefaultValue(currentSetting.value, scopeSettings) &&
+              getEffectiveValue(currentSetting.value, scopeSettings, {}) !==
+                defaultValue;
             setModifiedSettings((prev) => {
               const updated = new Set(prev);
-              updated.delete(currentSetting.value);
+              if (resetChangesValue) updated.add(currentSetting.value);
+              else updated.delete(currentSetting.value);
               return updated;
             });
 
-            // Remove from restart-required settings if it was there
             setRestartRequiredSettings((prev) => {
               const updated = new Set(prev);
-              updated.delete(currentSetting.value);
+              if (resetChangesValue && requiresRestart(currentSetting.value)) {
+                updated.add(currentSetting.value);
+              } else {
+                updated.delete(currentSetting.value);
+              }
               return updated;
             });
 
             // If this setting doesn't require restart, save it immediately
-            if (!requiresRestart(currentSetting.value)) {
+            if (resetChangesValue && !requiresRestart(currentSetting.value)) {
               const immediateSettings = new Set([currentSetting.value]);
               const toSaveValue =
                 currentSetting.type === 'boolean'
-                  ? typeof defaultValue === 'boolean'
-                    ? defaultValue
-                    : false
+                  ? defaultValue
                   : typeof defaultValue === 'number' ||
                       typeof defaultValue === 'string'
                     ? defaultValue
@@ -1059,25 +1083,23 @@ export function SettingsDialog({
                 next.delete(currentSetting.value);
                 return next;
               });
-            } else {
+            } else if (
+              resetChangesValue &&
+              requiresRestart(currentSetting.value)
+            ) {
               // Track default reset as a pending change if restart required
-              if (
-                (currentSetting.type === 'boolean' &&
-                  typeof defaultValue === 'boolean') ||
-                (currentSetting.type === 'number' &&
-                  typeof defaultValue === 'number') ||
-                (currentSetting.type === 'string' &&
-                  typeof defaultValue === 'string')
-              ) {
-                setGlobalPendingChanges((prev) => {
-                  const next = new Map(prev);
-                  next.set(currentSetting.value, defaultValue as PendingValue);
-                  return next;
-                });
-              }
-              setRestartRequiredSettings((prev) =>
-                new Set(prev).add(currentSetting.value),
-              );
+              setGlobalPendingChanges((prev) => {
+                const next = new Map(prev);
+                next.set(currentSetting.value, defaultValue as PendingValue);
+                return next;
+              });
+            } else {
+              setGlobalPendingChanges((prev) => {
+                if (!prev.has(currentSetting.value)) return prev;
+                const next = new Map(prev);
+                next.delete(currentSetting.value);
+                return next;
+              });
             }
           }
         } else if (isDeletionKey(key) && searchQuery.length > 0) {
@@ -1245,7 +1267,10 @@ export function SettingsDialog({
                 // Cursor not visible
                 displayValue = editBuffer;
               }
-            } else if (item.type === 'number' || item.type === 'string') {
+            } else if (
+              isNumericSettingType(item.type) ||
+              item.type === 'string'
+            ) {
               // Settings that open a sub-dialog on Enter
               const isSubDialogSetting =
                 item.value === 'ui.theme' ||
@@ -1259,21 +1284,29 @@ export function SettingsDialog({
 
               const defaultValue = getDefaultValue(item.value);
 
-              if (currentValue !== undefined && currentValue !== null) {
-                displayValue = String(currentValue);
-              } else {
-                displayValue =
-                  defaultValue !== undefined && defaultValue !== null
-                    ? String(defaultValue)
-                    : '';
-              }
-
-              // Add * if value differs from default OR if currently being modified
-              const isModified = modifiedSettings.has(item.value);
               const effectiveCurrentValue =
                 currentValue !== undefined && currentValue !== null
                   ? currentValue
                   : defaultValue;
+
+              if (
+                item.value === 'general.outputLanguage' &&
+                isAutoLanguage(
+                  effectiveCurrentValue as string | null | undefined,
+                )
+              ) {
+                displayValue = t('Auto (follow user input)');
+              } else if (
+                effectiveCurrentValue !== undefined &&
+                effectiveCurrentValue !== null
+              ) {
+                displayValue = String(effectiveCurrentValue);
+              } else {
+                displayValue = '';
+              }
+
+              // Add * if value differs from default OR if currently being modified
+              const isModified = modifiedSettings.has(item.value);
               const isDifferentFromDefault =
                 effectiveCurrentValue !== defaultValue;
 
@@ -1312,7 +1345,7 @@ export function SettingsDialog({
                       isActive ? theme.status.success : theme.text.secondary
                     }
                   >
-                    {isActive ? '●' : ''}
+                    {isActive ? ICON.CIRCLE_FILLED : ''}
                   </Text>
                 </Box>
                 <Box flexGrow={1} flexShrink={1}>

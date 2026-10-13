@@ -11,10 +11,21 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   WorkspaceRegistrationStore,
   WorkspaceRegistrationStoreError,
+  WorkspaceRegistrationStoreTooLargeError,
+  WorkspaceDisplayNameValidationError,
   getWorkspaceRegistrationStorePath,
+  normalizeWorkspaceDisplayName,
   workspaceRegistrationId,
   workspaceRegistrationScopeHash,
 } from './workspace-registration-store.js';
+
+// The ecs-qwen pool runs several jobs at once; under that contention these
+// tests pass alone in milliseconds but blow the 15s ceiling without any
+// real hang. Give that pool the raised budget its other suites already use.
+const timeoutMs = process.env['RUNNER_NAME']?.startsWith('ecs-qwen-')
+  ? 60_000
+  : 15_000;
+vi.setConfig({ testTimeout: timeoutMs, hookTimeout: timeoutMs });
 
 const cleanup: string[] = [];
 
@@ -33,6 +44,134 @@ afterEach(async () => {
 });
 
 describe('WorkspaceRegistrationStore', () => {
+  it('reads 255 named records independently of admission and preserves them on rejected add', async () => {
+    const store = new WorkspaceRegistrationStore(
+      '/work/primary',
+      await tempHome(),
+    );
+    const workspaces = Array.from(
+      { length: 255 },
+      (_, index) => `/work/${index}`,
+    );
+    const displayNames = Object.fromEntries(
+      workspaces.map((cwd, index) => [
+        workspaceRegistrationId(cwd),
+        `Workspace ${index}`,
+      ]),
+    );
+    await fs.mkdir(path.dirname(store.filePath), { recursive: true });
+    const bytes = JSON.stringify({
+      schemaVersion: 1,
+      primaryWorkspace: '/work/primary',
+      workspaces,
+      displayNames,
+    });
+    await fs.writeFile(store.filePath, bytes);
+    expect((await store.read()).workspaces).toHaveLength(255);
+    await expect(store.add('/work/overflow')).rejects.toThrow(/limit of 255/);
+    await expect(store.add('/work/overflow', undefined, 2)).rejects.toThrow(
+      /limit of 1/,
+    );
+    expect(await fs.readFile(store.filePath, 'utf8')).toBe(bytes);
+    await store.setDisplayNameByIds(
+      [workspaceRegistrationId(workspaces[0]!)],
+      'Renamed',
+    );
+    await store.removeById(workspaceRegistrationId(workspaces[0]!));
+    await store.add('/work/replacement', 'Replacement');
+    expect((await store.read()).workspaces).toHaveLength(255);
+  });
+
+  it('round-trips maximum-length escaped paths and names within the structural byte budget', async () => {
+    const prefix = path.parse(path.resolve('/')).root;
+    const primary = prefix + '\ud800'.repeat(4096 - prefix.length);
+    const store = new WorkspaceRegistrationStore(primary, await tempHome());
+    const workspaces = Array.from(
+      { length: 255 },
+      (_, index) =>
+        prefix +
+        index.toString().padStart(3, '0') +
+        '\ud800'.repeat(4096 - prefix.length - 3),
+    );
+    const displayNames = Object.fromEntries(
+      workspaces.map((cwd) => [
+        workspaceRegistrationId(cwd),
+        '\ud800'.repeat(256),
+      ]),
+    );
+    await fs.mkdir(path.dirname(store.filePath), { recursive: true });
+    const snapshot = {
+      schemaVersion: 1 as const,
+      primaryWorkspace: primary,
+      workspaces,
+      displayNames,
+    };
+    const bytes = JSON.stringify(snapshot, null, 2) + '\n';
+    expect(Buffer.byteLength(bytes)).toBeGreaterThan(6 * 1024 * 1024);
+    expect(Buffer.byteLength(bytes)).toBeLessThan(8 * 1024 * 1024);
+    await fs.writeFile(store.filePath, bytes);
+    expect(await store.read()).toEqual(snapshot);
+    const id = workspaceRegistrationId(workspaces[0]!);
+    await store.setDisplayNameByIds([id], 'Updated');
+    expect((await store.read()).displayNames?.[id]).toBe('Updated');
+  });
+
+  it('rejects more than 255 structural records without permitting a mutation', async () => {
+    const store = new WorkspaceRegistrationStore(
+      '/work/primary',
+      await tempHome(),
+    );
+    await fs.mkdir(path.dirname(store.filePath), { recursive: true });
+    const bytes = JSON.stringify({
+      schemaVersion: 1,
+      primaryWorkspace: '/work/primary',
+      workspaces: Array.from({ length: 256 }, (_, index) => `/work/${index}`),
+    });
+    await fs.writeFile(store.filePath, bytes);
+    await expect(store.read()).rejects.toThrow(/exceeds 255 entries/);
+    await expect(
+      store.removeById(workspaceRegistrationId('/work/0')),
+    ).rejects.toThrow(/exceeds 255 entries/);
+    expect(await fs.readFile(store.filePath, 'utf8')).toBe(bytes);
+  });
+
+  it('admits only one concurrent writer into the final configured slot', async () => {
+    const store = new WorkspaceRegistrationStore(
+      '/work/primary',
+      await tempHome(),
+    );
+    const other = new WorkspaceRegistrationStore(
+      '/work/primary',
+      path.dirname(path.dirname(path.dirname(store.filePath))),
+    );
+    const results = await Promise.allSettled([
+      store.add('/work/a', undefined, 2),
+      other.add('/work/b', undefined, 2),
+    ]);
+    expect(
+      results.filter((result) => result.status === 'fulfilled'),
+    ).toHaveLength(1);
+    expect((await store.read()).workspaces).toHaveLength(1);
+  });
+
+  it('rejects an oversized serialized update before replacing the file', async () => {
+    const store = new WorkspaceRegistrationStore(
+      '/work/primary',
+      await tempHome(),
+    );
+    await store.add('/work/existing');
+    const before = await fs.readFile(store.filePath);
+    const original = await store.read();
+    vi.spyOn(store, 'read').mockResolvedValue({
+      ...original,
+      displayNames: { large: 'x'.repeat(8 * 1024 * 1024) },
+    });
+    await expect(store.add('/work/new')).rejects.toBeInstanceOf(
+      WorkspaceRegistrationStoreTooLargeError,
+    );
+    expect(await fs.readFile(store.filePath)).toEqual(before);
+  });
+
   it('uses a full stable scope hash and returns an empty missing store', async () => {
     const home = await tempHome();
     const hash = workspaceRegistrationScopeHash('/work/primary');
@@ -63,6 +202,126 @@ describe('WorkspaceRegistrationStore', () => {
     const id = workspaceRegistrationId('/work/secondary');
     await expect(store.removeById(id)).resolves.toBe(true);
     await expect(store.read()).resolves.toMatchObject({ workspaces: [] });
+  });
+
+  it('reads legacy snapshots without display names', async () => {
+    const home = await tempHome();
+    const store = new WorkspaceRegistrationStore('/work/primary', home);
+    await fs.mkdir(path.dirname(store.filePath), { recursive: true });
+    await fs.writeFile(
+      store.filePath,
+      JSON.stringify({
+        schemaVersion: 1,
+        primaryWorkspace: '/work/primary',
+        workspaces: ['/work/secondary'],
+      }),
+    );
+
+    await expect(store.read()).resolves.toEqual({
+      schemaVersion: 1,
+      primaryWorkspace: '/work/primary',
+      workspaces: ['/work/secondary'],
+    });
+  });
+
+  it('stores a display name when adding a registration', async () => {
+    const home = await tempHome();
+    const store = new WorkspaceRegistrationStore('/work/primary', home);
+    const id = workspaceRegistrationId('/work/secondary');
+
+    await expect(store.add('/work/secondary', 'Secondary')).resolves.toBe(true);
+    await expect(store.read()).resolves.toMatchObject({
+      workspaces: ['/work/secondary'],
+      displayNames: { [id]: 'Secondary' },
+    });
+
+    await expect(store.add('/work/secondary', 'Renamed')).resolves.toBe(false);
+    await expect(store.add('/work/secondary')).resolves.toBe(false);
+    await expect(store.add('/work/secondary', '')).resolves.toBe(false);
+    await expect(store.read()).resolves.toMatchObject({
+      displayNames: { [id]: 'Secondary' },
+    });
+  });
+
+  it('removes display names with their registrations', async () => {
+    const home = await tempHome();
+    const store = new WorkspaceRegistrationStore('/work/primary', home);
+    const firstId = workspaceRegistrationId('/work/secondary-a');
+    const secondId = workspaceRegistrationId('/work/secondary-b');
+    await store.add('/work/secondary-a', 'First');
+    await store.add('/work/secondary-b', 'Second');
+
+    await expect(store.removeById(firstId)).resolves.toBe(true);
+    await expect(store.read()).resolves.toMatchObject({
+      workspaces: ['/work/secondary-b'],
+      displayNames: { [secondId]: 'Second' },
+    });
+    await expect(store.removeById(secondId)).resolves.toBe(true);
+    await expect(store.read()).resolves.toEqual({
+      schemaVersion: 1,
+      primaryWorkspace: '/work/primary',
+      workspaces: [],
+    });
+  });
+
+  it('sets and clears display names for every matching registration id', async () => {
+    const home = await tempHome();
+    const store = new WorkspaceRegistrationStore('/work/primary', home);
+    const firstId = workspaceRegistrationId('/work/secondary-a');
+    const secondId = workspaceRegistrationId('/work/secondary-b');
+    const otherId = workspaceRegistrationId('/work/other');
+    await store.add('/work/secondary-a', 'First');
+    await store.add('/work/secondary-b', 'Second');
+    await store.add('/work/other', 'Other');
+
+    await expect(
+      store.setDisplayNameByIds([firstId, secondId, 'missing'], 'Shared'),
+    ).resolves.toBe(2);
+    await expect(store.read()).resolves.toMatchObject({
+      displayNames: {
+        [firstId]: 'Shared',
+        [secondId]: 'Shared',
+        [otherId]: 'Other',
+      },
+    });
+
+    await expect(store.setDisplayNameByIds([firstId, secondId])).resolves.toBe(
+      2,
+    );
+    await expect(store.read()).resolves.toMatchObject({
+      displayNames: { [otherId]: 'Other' },
+    });
+    await expect(store.setDisplayNameByIds([otherId])).resolves.toBe(1);
+    await expect(store.read()).resolves.not.toHaveProperty('displayNames');
+    await expect(
+      store.setDisplayNameByIds(['missing'], 'Ignored'),
+    ).resolves.toBe(0);
+    await expect(store.read()).resolves.not.toHaveProperty('displayNames');
+  });
+
+  it('normalizes empty display names and rejects invalid values', () => {
+    expect(normalizeWorkspaceDisplayName('')).toBeUndefined();
+    expect(normalizeWorkspaceDisplayName('   ')).toBeUndefined();
+    expect(normalizeWorkspaceDisplayName('  Workspace  ')).toBe('Workspace');
+    expect(normalizeWorkspaceDisplayName('\tWorkspace\n')).toBe('Workspace');
+    expect(normalizeWorkspaceDisplayName('\t\r\n')).toBeUndefined();
+    expect(normalizeWorkspaceDisplayName('x'.repeat(256))).toBe(
+      'x'.repeat(256),
+    );
+    expect(normalizeWorkspaceDisplayName(`${'x'.repeat(256)} `)).toBe(
+      'x'.repeat(256),
+    );
+    for (const invalid of [
+      'x'.repeat(257),
+      'line\nbreak',
+      'nul\0byte',
+      `delete${String.fromCharCode(0x7f)}`,
+      42,
+    ]) {
+      expect(() => normalizeWorkspaceDisplayName(invalid)).toThrow(
+        WorkspaceDisplayNameValidationError,
+      );
+    }
   });
 
   it('returns false when removing a missing workspace id', async () => {
@@ -189,7 +448,54 @@ describe('WorkspaceRegistrationStore', () => {
     await expect(store.read()).rejects.toThrow(/duplicate paths/);
   });
 
-  it('rejects additions after reaching the secondary workspace limit', async () => {
+  it.each([
+    ['a non-object map', [], /displayNames must be an object/],
+    [
+      'an unknown registration id',
+      { missing: 'Name' },
+      /unknown registration id/,
+    ],
+    [
+      'an empty stored name',
+      { [workspaceRegistrationId('/work/secondary')]: '' },
+      /must not be empty/,
+    ],
+    [
+      'a non-string stored name',
+      { [workspaceRegistrationId('/work/secondary')]: 42 },
+      /must be a string/,
+    ],
+    [
+      'an oversized stored name',
+      { [workspaceRegistrationId('/work/secondary')]: 'x'.repeat(257) },
+      /exceeds 256 characters/,
+    ],
+    [
+      'a stored name with control characters',
+      { [workspaceRegistrationId('/work/secondary')]: 'line\nbreak' },
+      /control characters/,
+    ],
+  ])(
+    'rejects displayNames with %s',
+    async (_description, displayNames, error) => {
+      const home = await tempHome();
+      const store = new WorkspaceRegistrationStore('/work/primary', home);
+      await fs.mkdir(path.dirname(store.filePath), { recursive: true });
+      await fs.writeFile(
+        store.filePath,
+        JSON.stringify({
+          schemaVersion: 1,
+          primaryWorkspace: '/work/primary',
+          workspaces: ['/work/secondary'],
+          displayNames,
+        }),
+      );
+
+      await expect(store.read()).rejects.toThrow(error);
+    },
+  );
+
+  it('rejects additions after reaching an explicitly lowered secondary workspace limit', async () => {
     const home = await tempHome();
     const store = new WorkspaceRegistrationStore('/work/primary', home);
     await fs.mkdir(path.dirname(store.filePath), { recursive: true });
@@ -206,7 +512,7 @@ describe('WorkspaceRegistrationStore', () => {
       }),
     );
 
-    await expect(store.add('/work/overflow')).rejects.toThrow(
+    await expect(store.add('/work/overflow', undefined, 25)).rejects.toThrow(
       /limit of 24 reached/,
     );
     await expect(store.read()).resolves.toMatchObject({ workspaces });
@@ -222,12 +528,63 @@ describe('WorkspaceRegistrationStore', () => {
     await expect(store.read()).rejects.toThrow(/regular file/);
   });
 
+  it('reports an unverifiable store identity as a store error', async () => {
+    const home = await tempHome();
+    vi.resetModules();
+    vi.doMock('node:fs', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs')>();
+      const modifiedPromises = {
+        ...actual.promises,
+        lstat: vi.fn(
+          async (...args: Parameters<typeof actual.promises.lstat>) => {
+            const stats = await actual.promises.lstat(...args);
+            return new Proxy(stats, {
+              get: (target, property, receiver) =>
+                property === 'ino'
+                  ? 0
+                  : Reflect.get(target, property, receiver),
+            });
+          },
+        ),
+      };
+      const modified = {
+        ...actual,
+        constants: { ...actual.constants, O_NOFOLLOW: undefined },
+        promises: modifiedPromises,
+      };
+      return { ...modified, default: modified };
+    });
+    try {
+      const storeModule = await import('./workspace-registration-store.js');
+      const store = new storeModule.WorkspaceRegistrationStore(
+        '/work/primary',
+        home,
+      );
+      await fs.mkdir(path.dirname(store.filePath), { recursive: true });
+      await fs.writeFile(
+        store.filePath,
+        JSON.stringify({
+          schemaVersion: 1,
+          primaryWorkspace: '/work/primary',
+          workspaces: [],
+        }),
+      );
+
+      await expect(store.read()).rejects.toThrow(
+        /identity could not be verified/,
+      );
+    } finally {
+      vi.doUnmock('node:fs');
+      vi.resetModules();
+    }
+  });
+
   it('rejects an oversized store', async () => {
     const home = await tempHome();
     const store = new WorkspaceRegistrationStore('/work/primary', home);
     await fs.mkdir(path.dirname(store.filePath), { recursive: true });
-    await fs.writeFile(store.filePath, Buffer.alloc(256 * 1024 + 1));
-    await expect(store.read()).rejects.toThrow(/exceeds 262144 bytes/);
+    await fs.writeFile(store.filePath, Buffer.alloc(8 * 1024 * 1024 + 1));
+    await expect(store.read()).rejects.toThrow(/exceeds 8388608 bytes/);
   });
 
   it('recovers an orphaned stale lock', async () => {
@@ -265,6 +622,10 @@ describe('WorkspaceRegistrationStore', () => {
           schemaVersion: 1,
           primaryWorkspace: '/work/primary',
           workspaces: ['/work/secondary'],
+          displayNames: {
+            [storeModule.workspaceRegistrationId('/work/secondary')]:
+              'Secondary',
+          },
         }),
       );
 
@@ -278,6 +639,9 @@ describe('WorkspaceRegistrationStore', () => {
       expect(
         JSON.parse(await fs.readFile(store.filePath, 'utf8')),
       ).toMatchObject({ workspaces: [] });
+      expect(
+        JSON.parse(await fs.readFile(store.filePath, 'utf8')),
+      ).not.toHaveProperty('displayNames');
     } finally {
       vi.doUnmock('proper-lockfile');
       vi.resetModules();
@@ -296,9 +660,16 @@ describe('WorkspaceRegistrationStore', () => {
         }),
       },
     }));
-    vi.doMock('@qwen-code/qwen-code-core', () => ({
-      atomicWriteFile: vi.fn().mockRejectedValue(writeError),
-    }));
+    // The read path uses the leaf noFollowOpen export, so this barrel mock
+    // remains limited to the deferred write helper under test.
+    vi.doMock('@qwen-code/qwen-code-core', async (importOriginal) => {
+      const actual =
+        await importOriginal<typeof import('@qwen-code/qwen-code-core')>();
+      return {
+        ...actual,
+        atomicWriteFile: vi.fn().mockRejectedValue(writeError),
+      };
+    });
     try {
       const storeModule = await import('./workspace-registration-store.js');
       const store = new storeModule.WorkspaceRegistrationStore(

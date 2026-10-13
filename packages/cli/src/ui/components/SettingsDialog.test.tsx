@@ -33,8 +33,8 @@ import {
   getSettingDefinition,
   saveModifiedSettings,
   TEST_ONLY,
-} from '../../utils/settingsUtils.js';
-import { OUTPUT_LANGUAGE_AUTO } from '../../utils/languageUtils.js';
+} from '../../config/settingsUtils.js';
+import { OUTPUT_LANGUAGE_AUTO } from '../../i18n/languageUtils.js';
 
 // Mock the VimModeContext
 const mockToggleVimEnabled = vi.fn();
@@ -130,16 +130,16 @@ vi.mock('../contexts/VimModeContext.js', async () => {
   };
 });
 
-vi.mock('../../utils/settingsUtils.js', async () => {
-  const actual = await vi.importActual('../../utils/settingsUtils.js');
+vi.mock('../../config/settingsUtils.js', async () => {
+  const actual = await vi.importActual('../../config/settingsUtils.js');
   return {
     ...actual,
     saveModifiedSettings: vi.fn(),
   };
 });
 
-vi.mock('../../utils/languageUtils.js', async () => {
-  const actual = await vi.importActual('../../utils/languageUtils.js');
+vi.mock('../../i18n/languageUtils.js', async () => {
+  const actual = await vi.importActual('../../i18n/languageUtils.js');
   return {
     ...actual,
     updateOutputLanguageFile: vi.fn(),
@@ -307,7 +307,7 @@ describe('SettingsDialog', () => {
       const secondLabel = secondKey
         ? (getSettingDefinition(secondKey)?.label ?? secondKey)
         : '';
-      expect(lastFrame()).toContain(`● ${secondLabel}`);
+      expect(lastFrame()).toContain(`●\uFE0E ${secondLabel}`);
 
       // The active index should have changed (tested indirectly through behavior)
       unmount();
@@ -367,7 +367,7 @@ describe('SettingsDialog', () => {
         : '';
 
       // The first item is highlighted while the list is focused.
-      expect(lastFrame()).toContain(`● ${firstLabel}`);
+      expect(lastFrame()).toContain(`●\uFE0E ${firstLabel}`);
 
       // ↑ from the first item moves focus to the search box: the list highlight
       // disappears and the tab bar is not yet focused.
@@ -375,7 +375,7 @@ describe('SettingsDialog', () => {
         stdin.write(TerminalKeys.UP_ARROW);
       });
       await wait();
-      expect(lastFrame()).not.toContain(`● ${firstLabel}`);
+      expect(lastFrame()).not.toContain(`●\uFE0E ${firstLabel}`);
       expect(lastFrame()).not.toContain('↓ to return');
 
       // ↑ again moves up to the tab bar (which shows its focused hint).
@@ -390,6 +390,127 @@ describe('SettingsDialog', () => {
   });
 
   describe('Settings Toggling', () => {
+    it('toggles an unset WebSearch setting off and resets it to auto', async () => {
+      vi.mocked(saveModifiedSettings).mockClear();
+      const settings = createMockSettings();
+      const onSelect = vi.fn();
+      const { stdin, unmount, lastFrame } = render(
+        <KeypressProvider kittyProtocolEnabled={false}>
+          <SettingsDialog settings={settings} onSelect={onSelect} />
+        </KeypressProvider>,
+      );
+      const targetIndex = getDialogSettingKeys().indexOf(
+        'tools.webSearch.enabled',
+      );
+      expect(targetIndex).toBeGreaterThan(0);
+      for (let i = 0; i < targetIndex; i++) {
+        act(() => stdin.write(TerminalKeys.DOWN_ARROW));
+        await wait();
+      }
+      await waitFor(() => {
+        expect(lastFrame()).toContain('●\uFE0E Enable WebSearch');
+        expect(lastFrame()).toContain('(not set)');
+      });
+
+      act(() => stdin.write(TerminalKeys.ENTER));
+      await waitFor(() => {
+        const activeRow = lastFrame()
+          ?.split('\n')
+          .find((line) => line.includes('●\uFE0E Enable WebSearch'));
+        expect(activeRow).toContain('false*');
+      });
+
+      act(() => stdin.write('\u0003'));
+      await waitFor(() => {
+        const activeRow = lastFrame()
+          ?.split('\n')
+          .find((line) => line.includes('●\uFE0E Enable WebSearch'));
+        expect(activeRow).toContain('(not set)');
+        expect(activeRow).not.toContain('(not set)*');
+      });
+      unmount();
+    });
+
+    it('persists resetting an explicit WebSearch setting to auto', async () => {
+      vi.mocked(saveModifiedSettings).mockClear();
+      const settings = createMockSettings({
+        tools: { webSearch: { enabled: true } },
+      });
+      const onRestartRequest = vi.fn();
+      const { stdin, unmount, lastFrame } = render(
+        <KeypressProvider kittyProtocolEnabled={false}>
+          <SettingsDialog
+            settings={settings}
+            onSelect={() => {}}
+            onRestartRequest={onRestartRequest}
+          />
+        </KeypressProvider>,
+      );
+      const targetIndex = getDialogSettingKeys().indexOf(
+        'tools.webSearch.enabled',
+      );
+      for (let i = 0; i < targetIndex; i++) {
+        act(() => stdin.write(TerminalKeys.DOWN_ARROW));
+        await wait();
+      }
+
+      act(() => stdin.write('\u0003'));
+      await waitFor(() => {
+        const activeRow = lastFrame()
+          ?.split('\n')
+          .find((line) => line.includes('●\uFE0E Enable WebSearch'));
+        expect(activeRow).toContain('(not set)*');
+      });
+
+      act(() => stdin.write('r'));
+      await waitFor(() => expect(onRestartRequest).toHaveBeenCalledOnce());
+      expect(saveModifiedSettings).toHaveBeenCalledWith(
+        new Set(['tools.webSearch.enabled']),
+        expect.objectContaining({
+          tools: expect.objectContaining({
+            webSearch: expect.objectContaining({ enabled: undefined }),
+          }),
+        }),
+        settings,
+        SettingScope.User,
+      );
+      unmount();
+    });
+
+    it('does not persist a reset when the stored value already equals the default', async () => {
+      vi.mocked(saveModifiedSettings).mockClear();
+      const settings = createMockSettings({
+        general: { preventSystemSleep: true },
+      });
+      const { stdin, unmount, lastFrame } = render(
+        <KeypressProvider kittyProtocolEnabled={false}>
+          <SettingsDialog settings={settings} onSelect={() => {}} />
+        </KeypressProvider>,
+      );
+      const targetIndex = getDialogSettingKeys().indexOf(
+        'general.preventSystemSleep',
+      );
+      for (let i = 0; i < targetIndex; i++) {
+        act(() => stdin.write(TerminalKeys.DOWN_ARROW));
+        await wait();
+      }
+      await waitFor(() => {
+        const activeRow = lastFrame()
+          ?.split('\n')
+          .find((line) => line.includes('●\uFE0E Prevent System Sleep'));
+        expect(activeRow).toContain('true*');
+      });
+
+      act(() => stdin.write('\u0003'));
+      await wait();
+
+      expect(saveModifiedSettings).not.toHaveBeenCalled();
+      expect(lastFrame()).not.toContain(
+        'To see changes, Qwen Code must be restarted',
+      );
+      unmount();
+    });
+
     it('should toggle setting with Enter key', async () => {
       vi.mocked(saveModifiedSettings).mockClear();
 
@@ -405,7 +526,7 @@ describe('SettingsDialog', () => {
 
       // Wait for initial render and verify we're on Tool Approval Mode (first setting)
       await waitFor(() => {
-        expect(lastFrame()).toContain('● Tool Approval Mode');
+        expect(lastFrame()).toContain('●\uFE0E Tool Approval Mode');
       });
 
       const dialogKeys = getDialogSettingKeys();
@@ -420,7 +541,7 @@ describe('SettingsDialog', () => {
         await wait();
       }
       await waitFor(() => {
-        expect(lastFrame()).toContain('● Vim Mode');
+        expect(lastFrame()).toContain('●\uFE0E Vim Mode');
       });
 
       // Toggle the setting
@@ -503,6 +624,60 @@ describe('SettingsDialog', () => {
       unmount();
     });
 
+    describe('integer settings', () => {
+      const editMaxPerSession = async (typed: string) => {
+        vi.mocked(saveModifiedSettings).mockClear();
+        const settings = createMockSettings();
+        const { stdin, unmount, lastFrame } = render(
+          <KeypressProvider kittyProtocolEnabled={false}>
+            <SettingsDialog settings={settings} onSelect={vi.fn()} />
+          </KeypressProvider>,
+        );
+        await waitFor(() => {
+          expect(lastFrame()).toContain('Settings');
+        });
+
+        const index = getDialogSettingKeys().indexOf(
+          'tools.webSearch.maxPerSession',
+        );
+        expect(index).toBeGreaterThanOrEqual(0);
+
+        const press = async (key: string) => {
+          act(() => {
+            stdin.write(key);
+          });
+          await wait();
+        };
+        for (let i = 0; i < index; i++) {
+          await press(TerminalKeys.DOWN_ARROW as string);
+        }
+        await press(TerminalKeys.ENTER as string);
+        for (const ch of typed) {
+          await press(ch);
+        }
+        await press(TerminalKeys.ENTER as string);
+        await wait();
+
+        unmount();
+        return vi
+          .mocked(saveModifiedSettings)
+          .mock.calls.find((call) =>
+            (call[0] as Set<string>).has('tools.webSearch.maxPerSession'),
+          );
+      };
+
+      it('edits an integer setting on Enter and saves the typed number', async () => {
+        const call = await editMaxPerSession('5');
+        expect(call?.[1]).toEqual({
+          tools: { webSearch: { maxPerSession: 5 } },
+        });
+      });
+
+      it('does not save a fractional value for an integer setting', async () => {
+        expect(await editMaxPerSession('1.5')).toBeUndefined();
+      });
+    });
+
     describe('enum values', () => {
       it('toggles enum values with the enter key', async () => {
         vi.mocked(saveModifiedSettings).mockClear();
@@ -520,7 +695,7 @@ describe('SettingsDialog', () => {
 
         // Verify we're on Tool Approval Mode (first setting, an enum)
         await waitFor(() => {
-          expect(lastFrame()).toContain('● Tool Approval Mode');
+          expect(lastFrame()).toContain('●\uFE0E Tool Approval Mode');
         });
 
         // Press Enter to cycle the enum value
@@ -566,7 +741,7 @@ describe('SettingsDialog', () => {
 
         // Verify we're on Tool Approval Mode (first setting)
         await waitFor(() => {
-          expect(lastFrame()).toContain('● Tool Approval Mode');
+          expect(lastFrame()).toContain('●\uFE0E Tool Approval Mode');
         });
 
         // Press Enter to cycle - should loop back to first value (Plan)
@@ -669,7 +844,7 @@ describe('SettingsDialog', () => {
       });
 
       // The UI should show settings mode is active (scope is in separate view)
-      expect(lastFrame()).toContain('● Tool Approval Mode'); // Settings section active
+      expect(lastFrame()).toContain('●\uFE0E Tool Approval Mode'); // Settings section active
       expect(lastFrame()).not.toContain('Apply To'); // Scope is in a separate view
 
       // This test validates the initial state - scope selection is now
@@ -1137,7 +1312,7 @@ describe('SettingsDialog', () => {
       });
 
       // Verify initial state: settings mode active (scope is in separate view)
-      expect(lastFrame()).toContain('● Tool Approval Mode'); // Settings mode active
+      expect(lastFrame()).toContain('●\uFE0E Tool Approval Mode'); // Settings mode active
       expect(lastFrame()).not.toContain('Apply To'); // Scope is in a separate view
 
       // This test validates the rendered UI structure for tab navigation
@@ -1200,7 +1375,7 @@ describe('SettingsDialog', () => {
 
       // Verify the complete UI is rendered (scope is in separate view)
       expect(lastFrame()).toContain('Settings'); // Title
-      expect(lastFrame()).toContain('● Tool Approval Mode'); // Active setting
+      expect(lastFrame()).toContain('●\uFE0E Tool Approval Mode'); // Active setting
       expect(lastFrame()).not.toContain('Apply To'); // Scope is in a separate view (Tab to access)
       expect(lastFrame()).toContain(
         '(Use Enter to select, Tab to configure scope)',
@@ -1296,7 +1471,7 @@ describe('SettingsDialog', () => {
 
   describe('String Settings Editing', () => {
     it('should allow editing and committing a string setting', async () => {
-      let settings = createMockSettings({ 'a.string.setting': 'initial' });
+      let settings = createMockSettings({ advisorModel: 'initial' });
       const onSelect = vi.fn();
 
       const { stdin, unmount, rerender } = render(
@@ -1308,8 +1483,9 @@ describe('SettingsDialog', () => {
       // Wait for the dialog to render
       await wait();
 
-      // Navigate to the last setting
-      for (let i = 0; i < 20; i++) {
+      const stringSettingIndex = getDialogSettingKeys().indexOf('advisorModel');
+      expect(stringSettingIndex).toBeGreaterThanOrEqual(0);
+      for (let i = 0; i < stringSettingIndex; i++) {
         stdin.write('j'); // Down
         await wait(10);
       }
@@ -1326,11 +1502,7 @@ describe('SettingsDialog', () => {
       stdin.write('\r');
       await wait();
 
-      settings = createMockSettings(
-        { 'a.string.setting': 'new value' },
-        {},
-        {},
-      );
+      settings = createMockSettings({ advisorModel: 'new value' }, {}, {});
       rerender(
         <KeypressProvider kittyProtocolEnabled={false}>
           <SettingsDialog settings={settings} onSelect={onSelect} />
@@ -1340,9 +1512,16 @@ describe('SettingsDialog', () => {
 
       // Press Escape to exit
       stdin.write('\u001B');
-      await wait();
-
-      expect(onSelect).toHaveBeenCalledWith(undefined, 'User');
+      await waitFor(
+        () => {
+          expect(onSelect).toHaveBeenCalledWith(undefined, 'User');
+        },
+        {
+          timeout: process.env['RUNNER_NAME']?.startsWith('ecs-qwen-')
+            ? 10_000
+            : 1_000,
+        },
+      );
 
       unmount();
     });

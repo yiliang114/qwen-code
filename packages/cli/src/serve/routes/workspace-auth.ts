@@ -5,7 +5,7 @@
  */
 
 import type { Application, RequestHandler } from 'express';
-import { ALL_PROVIDERS } from '@qwen-code/qwen-code-core';
+import { ALL_PROVIDERS, ProviderInstallError } from '@qwen-code/qwen-code-core';
 import { writeStderrLine } from '../../utils/stdioHelpers.js';
 import {
   TooManyActiveDeviceFlowsError,
@@ -22,9 +22,11 @@ import {
 } from '../server/auth-provider-helpers.js';
 import type { SendBridgeError } from '../server/error-response.js';
 import { parseClientIdHeader, safeBody } from '../server/request-helpers.js';
+import { sendGenerationClosedError } from '../workspace-route-runtime.js';
 import type {
   ServeAuthProviderInstallRequest,
   ServeAuthProviderInstallResult,
+  ServeModelProviderRuntimeSyncResult,
 } from '../types.js';
 
 interface RegisterWorkspaceAuthRoutesDeps {
@@ -36,7 +38,10 @@ interface RegisterWorkspaceAuthRoutesDeps {
   allowPrivateAuthBaseUrl: boolean;
   installAuthProvider?: (
     req: ServeAuthProviderInstallRequest,
+    assertGenerationOpen?: () => void,
   ) => Promise<ServeAuthProviderInstallResult>;
+  syncModelProvidersRuntime?: () => Promise<ServeModelProviderRuntimeSyncResult>;
+  captureGenerationAssertion?: () => (() => void) | undefined;
 }
 
 /**
@@ -139,6 +144,8 @@ export function registerWorkspaceAuthRoutes(
     boundWorkspace,
     allowPrivateAuthBaseUrl,
     installAuthProvider,
+    syncModelProvidersRuntime,
+    captureGenerationAssertion,
   } = deps;
 
   app.post(
@@ -335,8 +342,39 @@ export function registerWorkspaceAuthRoutes(
         }
       }
       try {
-        res.status(200).json(await installAuthProvider(installRequest));
+        const assertGenerationOpen = captureGenerationAssertion?.();
+        assertGenerationOpen?.();
+        const result = assertGenerationOpen
+          ? await installAuthProvider(installRequest, assertGenerationOpen)
+          : await installAuthProvider(installRequest);
+        assertGenerationOpen?.();
+        let runtimeSync: ServeModelProviderRuntimeSyncResult | undefined;
+        if (syncModelProvidersRuntime) {
+          try {
+            runtimeSync = await syncModelProvidersRuntime();
+          } catch (syncError) {
+            if (sendGenerationClosedError(res, syncError)) return;
+            writeStderrLine(
+              'qwen serve: POST /workspace/auth/provider runtime sync failed after persistence',
+            );
+            runtimeSync = { status: 'failed' };
+          }
+        }
+        assertGenerationOpen?.();
+        res.status(200).json({
+          ...result,
+          ...(runtimeSync ? { runtimeSync } : {}),
+        });
       } catch (err) {
+        if (
+          err instanceof ProviderInstallError &&
+          err.step === 'modelPurpose'
+        ) {
+          res
+            .status(400)
+            .json({ error: err.message, code: 'model_purpose_conflict' });
+          return;
+        }
         sendBridgeError(res, err, {
           route: 'POST /workspace/auth/provider',
           providerId: installRequest.providerId,

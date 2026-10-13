@@ -5,6 +5,7 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
+import { Text } from 'ink';
 import { HistoryItemDisplay } from './HistoryItemDisplay.js';
 import { type HistoryItem, ToolCallStatus } from '../types.js';
 import { MessageType } from '../types.js';
@@ -18,16 +19,38 @@ import { renderWithProviders } from '../../test-utils/render.js';
 import { LoadedSettings } from '../../config/settings.js';
 import { ConfigContext } from '../contexts/ConfigContext.js';
 import { ThoughtExpandedProvider } from '../contexts/ThoughtExpandedContext.js';
+import { VirtualViewportContext } from '../contexts/VirtualViewportContext.js';
+import type { MouseEvent } from '../utils/mouse.js';
+import {
+  layoutRowForEvent,
+  measureElementPosition,
+} from '../utils/measure-element-position.js';
 
 // Mock child components
 vi.mock('./messages/ToolGroupMessage.js', () => ({
   ToolGroupMessage: vi.fn(() => <div />),
 }));
 
+vi.mock('./TerminalImage.js', () => ({
+  TerminalImage: ({ image }: { image: { mimeType: string } }) => (
+    <Text>MockTerminalImage:{image.mimeType}</Text>
+  ),
+}));
+
 vi.mock('../hooks/useMouseEvents.js', () => ({
   useMouseEvents: vi.fn(),
 }));
 
+vi.mock('../utils/measure-element-position.js', () => ({
+  layoutRowForEvent: vi.fn(),
+  measureElementPosition: vi.fn(),
+}));
+
+vi.mock('../utils/hyperlink-at.js', () => ({
+  hyperlinkAtCell: vi.fn(),
+}));
+
+import { hyperlinkAtCell } from '../utils/hyperlink-at.js';
 import { useMouseEvents } from '../hooks/useMouseEvents.js';
 
 import { toggleKeyHint } from './messages/ConversationMessages.js';
@@ -80,8 +103,31 @@ describe('<HistoryItemDisplay />', () => {
 
     const output = lastFrame() ?? '';
     expect(output.startsWith('\n')).toBe(true);
-    expect(output).toContain('◆ Hello');
+    expect(output).toContain('◆\uFE0E Hello');
   });
+
+  it.each(['gemini', 'gemini_content'] as const)(
+    'passes images from a %s history item to the assistant renderer',
+    (type) => {
+      const item: HistoryItem = {
+        id: 1,
+        type,
+        text: '',
+        images: [{ data: 'aW1hZ2U=', mimeType: 'image/png' }],
+        omittedImageCount: 2,
+      };
+      const { lastFrame } = renderWithProviders(
+        <HistoryItemDisplay
+          item={item}
+          terminalWidth={100}
+          isPending={false}
+        />,
+      );
+
+      expect(lastFrame()).toContain('MockTerminalImage:image/png');
+      expect(lastFrame()).toContain('[+2 more images]');
+    },
+  );
 
   it('renders tool summaries without a leading spacer row', () => {
     const item: HistoryItem = {
@@ -111,6 +157,55 @@ describe('<HistoryItemDisplay />', () => {
     const output = lastFrame() ?? '';
     expect(output).toContain('◎');
     expect(output).toContain('Converted 1 image(s) to text via vm.');
+  });
+
+  it('renders AdvisorMessage for "advisor" type', () => {
+    const item: HistoryItem = {
+      ...baseItem,
+      type: MessageType.ADVISOR,
+      text: 'review body',
+      model: 'qwen3-max',
+    };
+    const { lastFrame } = renderWithProviders(
+      <HistoryItemDisplay {...baseItem} item={item} />,
+    );
+    const output = lastFrame() ?? '';
+    expect(output).toContain('/advisor · qwen3-max');
+    expect(output).toContain('review body');
+  });
+
+  it('renders v2 goal_state history items through the lifecycle card', () => {
+    const item: HistoryItem = {
+      id: 1,
+      type: MessageType.GOAL_STATE,
+      snapshot: {
+        v: 2,
+        activity: 'idle',
+        goal: {
+          goalId: 'goal-1',
+          revision: 1,
+          objective: 'ship the release',
+          status: 'blocked',
+          evidenceCursor: { recordId: 'record-1' },
+          turnCount: 2,
+          activeTimeMs: 4_000,
+          tokensUsed: 0,
+          createdAt: 1_000,
+          updatedAt: 5_000,
+          lastReason: 'waiting for approval',
+        },
+      },
+    };
+
+    const { lastFrame } = renderWithProviders(
+      <HistoryItemDisplay item={item} terminalWidth={80} isPending={false} />,
+    );
+
+    const output = lastFrame();
+    expect(output).toContain('Goal blocked');
+    expect(output).toContain('Goal: ship the release');
+    expect(output).toContain('2 turns');
+    expect(output).toContain('Reason: waiting for approval');
   });
 
   it('renders StatsDisplay for "stats" type', () => {
@@ -299,7 +394,7 @@ describe('<HistoryItemDisplay />', () => {
     expect(lastFrame()).toMatchSnapshot();
   });
 
-  it('should render a full gemini item when using availableTerminalHeightGemini', () => {
+  it('should render a full gemini item when using availableTerminalHeightLlm', () => {
     const item: HistoryItem = {
       id: 1,
       type: 'gemini',
@@ -311,7 +406,7 @@ describe('<HistoryItemDisplay />', () => {
         isPending={false}
         terminalWidth={80}
         availableTerminalHeight={10}
-        availableTerminalHeightGemini={Number.MAX_SAFE_INTEGER}
+        availableTerminalHeightLlm={Number.MAX_SAFE_INTEGER}
       />,
     );
 
@@ -336,7 +431,7 @@ describe('<HistoryItemDisplay />', () => {
     expect(lastFrame()).toMatchSnapshot();
   });
 
-  it('should render a full gemini_content item when using availableTerminalHeightGemini', () => {
+  it('should render a full gemini_content item when using availableTerminalHeightLlm', () => {
     const item: HistoryItem = {
       id: 1,
       type: 'gemini_content',
@@ -348,7 +443,7 @@ describe('<HistoryItemDisplay />', () => {
         isPending={false}
         terminalWidth={80}
         availableTerminalHeight={10}
-        availableTerminalHeightGemini={Number.MAX_SAFE_INTEGER}
+        availableTerminalHeightLlm={Number.MAX_SAFE_INTEGER}
       />,
     );
 
@@ -576,6 +671,56 @@ describe('<HistoryItemDisplay />', () => {
       durationMs: 1200,
     };
 
+    const settingsWithVp = (enabled: boolean) =>
+      new LoadedSettings(
+        { path: '', settings: {}, originalSettings: {} },
+        { path: '', settings: {}, originalSettings: {} },
+        {
+          path: '',
+          settings: { ui: { useTerminalBuffer: enabled } },
+          originalSettings: {},
+        },
+        { path: '', settings: {}, originalSettings: {} },
+        true,
+        new Set(),
+      );
+
+    const mouseEvent = (name: MouseEvent['name'], col: number): MouseEvent => ({
+      name,
+      col,
+      row: 1,
+      shift: false,
+      meta: false,
+      ctrl: false,
+      button: 'left',
+    });
+
+    const renderThoughtWithToggle = (toggle: (headId: number) => void) => {
+      vi.mocked(measureElementPosition).mockReturnValue({
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 3,
+      });
+      vi.mocked(layoutRowForEvent).mockImplementation((_node, row) => row - 1);
+      renderWithProviders(
+        <ThoughtExpandedProvider
+          value={{
+            allExpanded: false,
+            expandedHeadIds: new Set<number>(),
+            toggle,
+          }}
+        >
+          <HistoryItemDisplay
+            item={thoughtItem}
+            terminalWidth={100}
+            isPending={false}
+          />
+        </ThoughtExpandedProvider>,
+      );
+      return vi.mocked(useMouseEvents).mock.calls.at(-1)?.[0];
+    };
+
     it('subscribes the click handler without bypassVpGate (stays VP-gated)', () => {
       vi.mocked(useMouseEvents).mockClear();
       renderWithProviders(
@@ -591,6 +736,92 @@ describe('<HistoryItemDisplay />', () => {
       // VP gate, so useMouseEvents only arms it in VP mode.
       expect(opts?.isActive).toBe(true);
       expect(opts?.bypassVpGate ?? false).toBe(false);
+    });
+
+    it('shows the click hint when raw settings are unset but startup VP is enabled', () => {
+      const { lastFrame } = renderWithProviders(
+        <VirtualViewportContext.Provider value={true}>
+          <HistoryItemDisplay
+            item={thoughtItem}
+            terminalWidth={100}
+            isPending={false}
+          />
+        </VirtualViewportContext.Provider>,
+      );
+
+      expect(lastFrame()).toContain(`click or ${toggleKeyHint} to expand`);
+    });
+
+    it('hides the click hint when startup VP overrides an enabled setting', () => {
+      const { lastFrame } = renderWithProviders(
+        <VirtualViewportContext.Provider value={false}>
+          <HistoryItemDisplay
+            item={thoughtItem}
+            terminalWidth={100}
+            isPending={false}
+          />
+        </VirtualViewportContext.Provider>,
+        { settings: settingsWithVp(true) },
+      );
+
+      expect(lastFrame()).not.toContain(`click or ${toggleKeyHint} to expand`);
+    });
+
+    it('toggles on a complete click', () => {
+      const toggle = vi.fn();
+      const handler = renderThoughtWithToggle(toggle);
+
+      handler?.(mouseEvent('left-press', 5));
+      expect(toggle).not.toHaveBeenCalled();
+      handler?.(mouseEvent('left-release', 5));
+      expect(toggle).toHaveBeenCalledWith(thoughtItem.id);
+    });
+
+    it('does not toggle when selecting text by dragging', () => {
+      const toggle = vi.fn();
+      const handler = renderThoughtWithToggle(toggle);
+
+      handler?.(mouseEvent('left-press', 5));
+      handler?.(mouseEvent('move', 20));
+      handler?.(mouseEvent('left-release', 20));
+
+      expect(toggle).not.toHaveBeenCalled();
+    });
+
+    it('does not toggle on a plain click over an OSC 8 hyperlink (reserved for the link gesture)', () => {
+      vi.mocked(hyperlinkAtCell).mockReturnValue('https://example.com');
+      const toggle = vi.fn();
+      const handler = renderThoughtWithToggle(toggle);
+
+      handler?.(mouseEvent('left-press', 5));
+      handler?.(mouseEvent('left-release', 5));
+
+      expect(toggle).not.toHaveBeenCalled();
+    });
+
+    it('hides the click hint when ui.mouseTracking is false despite VP being on', () => {
+      const settingsNoMouse = new LoadedSettings(
+        { path: '', settings: {}, originalSettings: {} },
+        { path: '', settings: {}, originalSettings: {} },
+        {
+          path: '',
+          settings: { ui: { useTerminalBuffer: true, mouseTracking: false } },
+          originalSettings: {},
+        },
+        { path: '', settings: {}, originalSettings: {} },
+        true,
+        new Set(),
+      );
+      const { lastFrame } = renderWithProviders(
+        <HistoryItemDisplay
+          item={thoughtItem}
+          terminalWidth={100}
+          isPending={false}
+        />,
+        { settings: settingsNoMouse },
+      );
+
+      expect(lastFrame()).not.toContain(`click or ${toggleKeyHint} to expand`);
     });
   });
 });

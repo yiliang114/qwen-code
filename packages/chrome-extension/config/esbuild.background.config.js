@@ -16,7 +16,10 @@ const projectRoot = path.resolve(__dirname, '..');
 
 const isWatch = process.argv.includes('--watch');
 const isProduction = process.argv.includes('--production');
-const outDir = process.env.EXTENSION_OUT_DIR || 'dist/extension';
+const outDir = path.resolve(
+  projectRoot,
+  process.env.EXTENSION_OUT_DIR || 'dist/extension',
+);
 
 // Resolve an entry point, preferring .ts when present (fallback to .js)
 function resolveEntry(relativePathWithoutExt) {
@@ -67,13 +70,13 @@ async function build() {
         projectRoot,
         '../sdk-typescript/src/daemon/index.ts',
       ),
+      '@qwen-code/web-shell/daemon-react-sdk': path.resolve(
+        projectRoot,
+        '../web-shell/client/daemon-react-sdk.ts',
+      ),
       '@qwen-code/web-shell': path.resolve(
         projectRoot,
         '../web-shell/client/index.tsx',
-      ),
-      '@qwen-code/webui/daemon-react-sdk': path.resolve(
-        projectRoot,
-        '../webui/src/daemon-react-sdk.ts',
       ),
     },
     loader: {

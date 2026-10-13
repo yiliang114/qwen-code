@@ -187,6 +187,7 @@ describe('getExtensionSuggestions', () => {
     expect(suggestions[0]!.sourceBadge).toBe('Extension');
     expect(suggestions[0]!.description).toBe('Test description');
     expect(suggestions[0]!.isDirectory).toBe(false);
+    expect(suggestions[0]!.category).toBe('extension');
   });
 
   it('returns empty when folder is not trusted', () => {
@@ -281,7 +282,7 @@ describe('buildExtensionContextText', () => {
     });
     const text = buildExtensionContextText(ext);
     expect(text).toContain('Available capabilities');
-    expect(text).toContain('Skills: skill-a, skill-b');
+    expect(text).toContain('Skills: full:skill-a, full:skill-b');
     expect(text).toContain('MCP Servers: server-1, server-2');
     expect(text).toContain('Agents: agent-x');
   });

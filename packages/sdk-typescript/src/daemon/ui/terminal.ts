@@ -24,7 +24,7 @@ export function daemonUiEventToTerminalText(event: DaemonUiEvent): string {
     case 'tool.update':
       return terminalLine(
         `tool ${event.status}`,
-        `${event.title}${event.details ? ` ${event.details}` : ''}`,
+        `${event.title ?? event.toolName ?? event.toolKind ?? 'Tool'}${event.details ? ` ${event.details}` : ''}`,
         '38;5;75',
       );
     case 'shell.output':
@@ -58,6 +58,8 @@ export function daemonUiEventToTerminalText(event: DaemonUiEvent): string {
         `metadata: ${event.displayName ?? '(no display name)'}`,
         '36',
       );
+    case 'session.source.changed':
+      return '';
     case 'session.artifact.changed':
       return terminalLine(
         'artifact',
@@ -240,6 +242,8 @@ export function daemonUiEventToTerminalText(event: DaemonUiEvent): string {
       return '';
     case 'user.image.delta':
       return `[image: ${sanitizeTerminalText(event.mimeType)}]`;
+    case 'user.file.delta':
+      return `[file: ${sanitizeTerminalText(event.name)}]`;
     default:
       return assertNever(event);
   }

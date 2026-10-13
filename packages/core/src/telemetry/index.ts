@@ -32,14 +32,17 @@ export {
 } from './config.js';
 export {
   logStartSession,
+  logSessionEnd,
   logUserPrompt,
   logUserRetry,
   logToolCall,
+  logRepeatedToolFailureGuard,
   logApiRequest,
   logApiError,
   logApiCancel,
   logApiResponse,
   logFlashFallback,
+  logGoalState,
   logSlashCommand,
   logConversationFinishedEvent,
   logKittySequenceOverflow,
@@ -51,6 +54,7 @@ export {
   logExtensionDisable,
   logExtensionUpdateEvent,
   logRipgrepFallback,
+  logRipgrepRuntimeRecovery,
   logNextSpeakerCheck,
   logAuth,
   logSkillLaunch,
@@ -62,8 +66,14 @@ export {
   logMemoryExtract,
   logMemoryDream,
   logMemoryRecall,
+  logMemoryRecallDelivery,
 } from './loggers.js';
-export type { SlashCommandEvent, ChatCompressionEvent } from './types.js';
+export type {
+  SlashCommandEvent,
+  ChatCompressionEvent,
+  GoalStateEvent,
+  GoalStateEventCause,
+} from './types.js';
 export {
   SlashCommandStatus,
   EndSessionEvent,
@@ -80,6 +90,7 @@ export {
   KittySequenceOverflowEvent,
   ToolOutputTruncatedEvent,
   RipgrepFallbackEvent,
+  RipgrepRuntimeRecoveryEvent,
   NextSpeakerCheckEvent,
   AuthEvent,
   SkillLaunchEvent,
@@ -91,8 +102,19 @@ export {
   MemoryExtractEvent,
   MemoryDreamEvent,
   MemoryRecallEvent,
+  MemoryRecallDeliveryEvent,
+  RepeatedToolFailureGuardEvent,
 } from './types.js';
-export { makeSlashCommandEvent, makeChatCompressionEvent } from './types.js';
+export {
+  makeSlashCommandEvent,
+  makeChatCompressionEvent,
+  makeGoalStateEvent,
+  GOAL_STATE_EVENT_CAUSES,
+} from './types.js';
+export {
+  goalStateEventFromSnapshot,
+  isGoalStateEventCause,
+} from './goal-events.js';
 export type {
   ArenaSessionStartedEvent,
   ArenaAgentCompletedEvent,
@@ -108,6 +130,8 @@ export * from './api-activity-tracker.js';
 export {
   // Core metrics functions
   recordToolCallMetrics,
+  recordToolExecutionMetrics,
+  recordRepeatedToolFailureGuardMetrics,
   recordTokenUsageMetrics,
   recordApiResponseMetrics,
   recordApiErrorMetrics,
@@ -132,10 +156,13 @@ export {
   recordArenaSessionStartedMetrics,
   recordArenaAgentCompletedMetrics,
   recordArenaSessionEndedMetrics,
+  recordGoalStateMetrics,
   // Auto-Memory metrics functions
   recordMemoryExtractMetrics,
   recordMemoryDreamMetrics,
   recordMemoryRecallMetrics,
+  recordChannelMemoryRecallMetrics,
+  recordMemoryRecallDeliveryMetrics,
   // Performance monitoring types
   PerformanceMetricType,
   MemoryMetricType,
@@ -164,10 +191,12 @@ export {
   endSubagentSpan,
   runInSubagentSpanContext,
   getActiveInteractionSpan,
+  recordInteractionActivity,
   truncateSpanError,
 } from './session-tracing.js';
 export type {
   StartInteractionOptions,
+  StartLLMRequestSpanOptions,
   EndInteractionOptions,
   InteractionSpanResultStatus,
   LLMRequestMetadata,
@@ -190,7 +219,9 @@ export {
   captureDaemonTelemetryContext,
   createDaemonBridgeTelemetry,
   emitDaemonLog,
+  extractDaemonHttpTraceContext,
   extractDaemonTraceContext,
+  extractInboundTraceId,
   hashDaemonWorkspace,
   injectDaemonTraceContext,
   recordDaemonError,
@@ -200,6 +231,7 @@ export {
   withDaemonRequestSpan,
   withDaemonSpan,
   type DaemonBridgeTelemetryMetrics,
+  type DaemonRequestSpanOptions,
 } from './daemon-tracing.js';
 export {
   initializeDaemonMetrics,
@@ -228,12 +260,17 @@ export {
   registerAcpEventLoopLagGauge,
 } from './event-loop-lag-metrics.js';
 export {
+  addAgentInputMessageAttributes,
+  addAgentOutputMessageAttributes,
+  AgentOutputMessageCapture,
   addUserPromptAttributes,
   addSystemPromptAttributes,
   addToolSchemaAttributes,
   addModelOutputAttributes,
   addToolInputAttributes,
   addToolResultAttributes,
+  addToolArgumentsAttributes,
+  addToolCallResultAttributes,
   areSensitiveSpanAttributesEnabled,
   truncateContent,
 } from './detailed-span-attributes.js';

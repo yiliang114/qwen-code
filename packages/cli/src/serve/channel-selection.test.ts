@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   channelSelectionNames,
+  isAllChannelSelectionName,
   normalizeServeChannelSelection,
 } from './channel-selection.js';
 
@@ -19,8 +20,8 @@ describe('normalizeServeChannelSelection', () => {
     });
   });
 
-  it('parses all as a dedicated selection mode', () => {
-    expect(normalizeServeChannelSelection(['all'])).toEqual({ mode: 'all' });
+  it('parses trimmed all as a dedicated selection mode', () => {
+    expect(normalizeServeChannelSelection([' all '])).toEqual({ mode: 'all' });
   });
 
   it('rejects empty channel values', () => {
@@ -29,10 +30,23 @@ describe('normalizeServeChannelSelection', () => {
     );
   });
 
+  it('identifies invalid persisted selections without changing CLI errors', () => {
+    expect(() =>
+      normalizeServeChannelSelection(['all', 'bot'], 'serve.channels'),
+    ).toThrow('serve.channels all cannot be combined with channel names.');
+  });
+
   it('rejects all mixed with explicit channel names', () => {
     expect(() => normalizeServeChannelSelection(['all', 'telegram'])).toThrow(
       '--channel all cannot be combined with channel names.',
     );
+  });
+});
+
+describe('isAllChannelSelectionName', () => {
+  it('recognizes the trimmed all sentinel only', () => {
+    expect(isAllChannelSelectionName(' all ')).toBe(true);
+    expect(isAllChannelSelectionName('allx')).toBe(false);
   });
 });
 

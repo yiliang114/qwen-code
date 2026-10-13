@@ -145,6 +145,7 @@ export default {
   'from {{marketplace}}': '來自 {{marketplace}}',
   installed: '已安裝',
   '{{count}} Agents': '{{count}} 個智能體',
+  '{{count}} Workflows': '{{count}} 個工作流程',
   '{{count}} Commands': '{{count}} 個命令',
   '{{count}} MCP': '{{count}} 個 MCP',
   '{{count}} Skills': '{{count}} 個技能',
@@ -168,18 +169,26 @@ export default {
   // via `localizeToolDisplayName`. A product name (e.g. `Notebook`) is kept
   // verbatim inside an otherwise-translated label.
   // ============================================================================
+  'toolDisplayName.Exec': '執行程式碼',
   'toolDisplayName.Edit': '編輯',
   'toolDisplayName.WriteFile': '寫入檔案',
   'toolDisplayName.ReadFile': '讀取檔案',
+  'toolDisplayName.ZoomImage': '縮放圖像',
   'toolDisplayName.Grep': 'Grep',
   'toolDisplayName.Glob': 'Glob',
   'toolDisplayName.Shell': '運行命令',
   'toolDisplayName.Shell Command': 'Shell 命令',
   'toolDisplayName.TodoList': '任務清單',
+  'toolDisplayName.Goal': '目標',
+  'toolDisplayName.UpdateGoal': '更新目標',
+  'toolDisplayName.ProposeGoal': '提議目標',
   'toolDisplayName.SaveMemory': '儲存記憶',
   'toolDisplayName.Agent': 'Agent',
   'toolDisplayName.Artifact': '製品',
   'toolDisplayName.RecordArtifact': '記錄製品',
+  'toolDisplayName.RecordSource': '記錄來源',
+  'toolDisplayName.ReportFindings': '上報評審發現',
+  'toolDisplayName.DisplayImage': '顯示圖片',
   'toolDisplayName.Skill': '技能',
   'toolDisplayName.EnterPlanMode': '進入計畫模式',
   'toolDisplayName.ExitPlanMode': '退出計畫模式',
@@ -193,6 +202,7 @@ export default {
   'toolDisplayName.CronDelete': '刪除定時任務',
   'toolDisplayName.LoopWakeup': '循環喚醒',
   'toolDisplayName.CreateSubSession': '建立子會話',
+  'toolDisplayName.ListAgents': '列出 Agent',
   'toolDisplayName.TaskCreate': '建立任務',
   'toolDisplayName.TaskUpdate': '更新任務',
   'toolDisplayName.TaskList': '任務列表',
@@ -201,6 +211,7 @@ export default {
   'toolDisplayName.TeamDelete': '刪除團隊',
   'toolDisplayName.TeamPlanApproval': '團隊計畫審批',
   'toolDisplayName.SendMessage': '傳送訊息',
+  'toolDisplayName.RequestShutdown': '請求下線',
   'toolDisplayName.StructuredOutput': '結構化輸出',
   'toolDisplayName.Monitor': '監控',
   'toolDisplayName.NotebookEdit': '編輯 Notebook',
@@ -209,6 +220,24 @@ export default {
   'toolDisplayName.ExitWorktree': '退出 Worktree',
   'toolDisplayName.Workflow': '工作流程',
   'toolDisplayName.ReadMcpResource': '讀取 MCP 資源',
+  'toolDisplayName.ImageGen': '圖像生成',
+  'toolDisplayName.DownsampleImage': '降採樣圖像',
+  'toolDisplayName.DownscaleVideo': '降採樣影片',
+  'toolDisplayName.DownsampleAudio': '降採樣音訊',
+  'toolDisplayName.ExtractKeyframes': '擷取關鍵影格',
+  'toolDisplayName.ExtractAudio': '擷取音軌',
+  'toolDisplayName.ClipVideo': '剪輯影片',
+  'toolDisplayName.ClipImage': '裁剪圖像',
+  'toolDisplayName.ClipAudio': '剪輯音訊',
+  'toolDisplayName.CaptionImage': '描述圖像',
+  'toolDisplayName.CaptionAudio': '描述音訊',
+  'toolDisplayName.OcrImage': '識別圖像文字',
+  'toolDisplayName.UnderstandVideoSegments': '分段理解影片',
+  'toolDisplayName.ConvertImage': '轉換圖像',
+  'toolDisplayName.TranscribeAudio': '轉寫音訊',
+  'toolDisplayName.RecallMediaMemory': '召回媒體記憶',
+  '[fixed-only: runs via media policies, not the model]':
+    '［僅固定策略：由媒體策略調用，不開放給模型］',
 
   '↑ to manage attachments': '↑ 管理附件',
   '← → select, Delete to remove, ↓ to exit': '← → 選擇，Delete 刪除，↓ 退出',
@@ -256,7 +285,7 @@ export default {
   'to search history': '搜索歷史',
   'to paste images': '粘貼圖片',
   'for external editor': '外部編輯器',
-  'to view transcript': '檢視完整記錄',
+  'to expand details': '展開詳情',
   'Jump through words in the input': '在輸入中按單詞跳轉',
   'Close dialogs, cancel requests, or quit application':
     '關閉對話框、取消請求或退出應用程序',
@@ -271,6 +300,7 @@ export default {
     '正在連接到 MCP servers... ({{connected}}/{{total}})',
   'Type your message or @path/to/file': '輸入您的消息或 @ 檔案路徑',
   '? for shortcuts': '按 ? 查看快捷鍵',
+  'Pasting…': '正在貼上…',
   "Press 'i' for INSERT mode and 'Esc' for NORMAL mode.":
     "按 'i' 進入插入模式，按 'Esc' 進入普通模式",
   'Cancel operation / Clear input (double press)':
@@ -325,11 +355,10 @@ export default {
   'Search:': '搜尋：',
   'type to filter…': '輸入以篩選…',
   'No skills are currently available.': '目前沒有可用的技能。',
-  'All available skills are locked at a higher scope (see below).':
-    '所有可用技能都被更高範圍鎖定（詳見下方）。',
   'No skills match the search.': '沒有符合搜尋條件的技能。',
-  'Locked by higher-scope settings (cannot toggle here):':
-    '被更高範圍設定鎖定（此處無法切換）：',
+  'Locked by settings entries you cannot toggle here:':
+    '被無法在此切換的設定條目鎖定：',
+  '{{count}} locked not shown': '{{count}} 個已鎖定技能未顯示',
   'higher scope': '更高範圍',
   '  {{name}} {{description}}  [locked: {{scope}}]':
     '  {{name}} {{description}}  [已鎖定：{{scope}}]',
@@ -443,6 +472,12 @@ export default {
   'Create a new subagent with guided setup.': '通過引導式設置創建新的子智能體',
   'Create a reusable skill from a knowledge source (file, URL, conversation, or text).':
     '從知識源（檔案、URL、對話或文字）建立可重複使用的技能。',
+  'The current model or provider does not support native video input for /learn. Switch to a video-capable model on an OpenAI-compatible provider and try again.':
+    '目前模型或供應商不支援 /learn 的原生影片輸入。請切換到 OpenAI 相容供應商上的影片模型後再試一次。',
+  'YouTube page URLs cannot be sent as native video input. Download the video into your workspace and pass the local video file path to /learn.':
+    'YouTube 頁面連結不能作為原生影片輸入傳送。請將影片下載到工作區內，再將本機影片檔案路徑傳給 /learn。',
+  'The local video could not be attached for /learn.':
+    '無法為 /learn 附加本機影片。',
   Agents: '智能體',
   'Choose Action': '選擇操作',
   'Edit {{name}}': '編輯 {{name}}',
@@ -452,9 +487,6 @@ export default {
   'Unknown Step': '未知步驟',
   'Esc to close': '按 Esc 關閉',
   Transcript: '完整記錄',
-  'to close': '關閉',
-  'to scroll': '捲動',
-  'Failed to render transcript.': '無法呈現完整記錄。',
   'Read {{count}} file': '讀取了 {{count}} 個檔案',
   'Read {{count}} files': '讀取了 {{count}} 個檔案',
   'Reading {{count}} file': '正在讀取 {{count}} 個檔案',
@@ -668,6 +700,7 @@ export default {
   Settings: '設置',
   'To see changes, Qwen Code must be restarted. Press r to exit and apply changes now.':
     '要查看更改，必須重啟 Qwen Code。按 r 退出並立即應用更改。',
+  'Code Mode Only (Experimental)': '僅程式碼模式（實驗性）',
   'Vim Mode': 'Vim 模式',
   'Attribution: commit': '署名：提交',
   'Terminal Bell Notification': '終端響鈴通知',
@@ -682,6 +715,7 @@ export default {
   'Hide Window Title': '隱藏窗口標題',
   'Show Status in Title': '在標題中顯示狀態',
   'Hide Tips': '隱藏提示',
+  'Show Tool Call Arguments': '顯示工具呼叫參數',
   'Show Line Numbers in Code': '在代碼中顯示行號',
   'Show Citations': '顯示引用',
   'Custom Witty Phrases': '自定義詼諧短語',
@@ -714,7 +748,9 @@ export default {
   'Tool Output Truncation Lines': '工具輸出截斷行數',
   'Folder Trust': '檔案夾信任',
   'Tool Schema Compliance': 'Tool Schema 兼容性',
+  Unset: '未設定',
   'Auto (detect from system)': '自動（從系統檢測）',
+  'Auto (follow user input)': '自動（跟隨使用者輸入）',
   'Auto (detect terminal theme)': '自動（檢測終端主題）',
   Auto: '自動',
   Text: '文本',
@@ -833,6 +869,10 @@ export default {
   'This extension will install the following skills:': '此擴展將安裝以下技能：',
   'This extension will install the following subagents:':
     '此擴展將安裝以下子智能體：',
+  'This extension will install the following workflows (JavaScript scripts that can start subagents):':
+    '此擴展將安裝以下工作流程（可啟動子智能體的 JavaScript 腳本）：',
+  'These workflow scripts changed since the installed version: {{names}}.':
+    '以下工作流程腳本與已安裝版本相比有變更：{{names}}。',
   'Installation cancelled for "{{name}}".': '已取消安裝 "{{name}}"。',
   'You are installing an extension from {{originSource}}. Some features may not work perfectly with Qwen Code.':
     '您正在安裝來自 {{originSource}} 的擴展。某些功能可能無法完美兼容 Qwen Code。',
@@ -867,7 +907,7 @@ export default {
     '請將要卸載的擴展名稱作為位置參數。',
   'Enables an extension.': '啟用擴展。',
   'The name of the extension to enable.': '要啟用的擴展名稱。',
-  'The scope to enable the extenison in. If not set, will be enabled in all scopes.':
+  'The scope to enable the extension in. If not set, will be enabled in all scopes.':
     '啟用擴展的作用域。如果未設置，將在所有作用域中啟用。',
   'Extension "{{name}}" successfully enabled for scope "{{scope}}".':
     '擴展 "{{name}}" 已在作用域 "{{scope}}" 中啟用。',
@@ -877,7 +917,7 @@ export default {
     '無效的作用域：{{scope}}。請使用 {{scopes}} 之一。',
   'Disables an extension.': '禁用擴展。',
   'The name of the extension to disable.': '要禁用的擴展名稱。',
-  'The scope to disable the extenison in.': '禁用擴展的作用域。',
+  'The scope to disable the extension in.': '禁用擴展的作用域。',
   'Extension "{{name}}" successfully disabled for scope "{{scope}}".':
     '擴展 "{{name}}" 已在作用域 "{{scope}}" 中禁用。',
   'Extension "{{name}}" successfully updated: {{oldVersion}} → {{newVersion}}.':
@@ -904,6 +944,7 @@ export default {
   'Context files:': '上下文檔案：',
   'Skills:': '技能：',
   'Agents:': '智能體：',
+  'Workflows:': '工作流程：',
   'MCP servers:': 'MCP servers：',
   'Link extension failed to install.': '連結擴展安裝失敗。',
   'Extension "{{name}}" linked successfully and enabled.':
@@ -989,6 +1030,12 @@ export default {
   '{{count}} hooks configured': '{{count}} 個 Hook 已配置',
   'This menu is read-only. To add or modify hooks, edit settings.json directly or ask Qwen Code.':
     '此選單為只讀。要添加或修改 Hook，請直接編輯 settings.json 或詢問 Qwen Code。',
+  'Reopen this menu to reload hook definitions.':
+    '重新開啟此選單可重新載入 Hook 定義。',
+  'Hook controls and HTTP security settings require a restart.':
+    'Hook 控制項與 HTTP 安全設定需要重新啟動後生效。',
+  'Failed to reload hook definitions: {{error}}':
+    '重新載入 Hook 定義失敗：{{error}}',
   'Enter to select · Esc to cancel': 'Enter 選擇 · Esc 取消',
   'Exit codes:': '退出碼：',
   'Configured hooks:': '已配置的 Hook：',
@@ -1003,6 +1050,20 @@ export default {
   'No hook config selected': '未選擇 Hook 配置',
   'To modify or remove this hook, edit settings.json directly or ask Qwen to help.':
     '要修改或刪除此 Hook，請直接編輯 settings.json 或詢問 Qwen。',
+  'Safe mode is on, so no hooks run in this session.':
+    '安全模式已開啟，本會話不會執行任何 Hook。',
+  'Bare mode is on, so no hooks run in this session.':
+    '精簡模式已開啟，本會話不會執行任何 Hook。',
+  'All hooks are disabled by the disableAllHooks setting.':
+    '所有 Hook 已被 disableAllHooks 設定停用。',
+  'Timeout:': '逾時：',
+  'Status message:': '狀態訊息：',
+  'Condition:': '條件：',
+  'Options:': '選項：',
+  'Skill:': '技能：',
+  'runs in background': '在背景執行',
+  'runs once': '只執行一次',
+  sequential: '依序執行',
   'Hook Configuration - Disabled': 'Hook 配置 - 已禁用',
   'All hooks are currently disabled. You have {{count}} that are not running.':
     '所有 Hook 當前已禁用。您有 {{count}} 未運行。',
@@ -1047,8 +1108,8 @@ export default {
     '命令輸入為包含 tool_name、tool_input、tool_use_id、error、error_type、is_interrupt 和 is_timeout 的 JSON。',
   'Input to command is JSON with notification message and type.':
     '命令輸入為包含通知消息和類型的 JSON。',
-  'Input to command is JSON with original user prompt text.':
-    '命令輸入為包含原始用戶提示文本的 JSON。',
+  'Input to command is JSON with "prompt" (the current model-bound prompt) and optional "submitted_prompt" (the text projection captured at a supported submission boundary).':
+    '命令輸入為 JSON，其中包含 "prompt"（目前模型側提示）以及選用的 "submitted_prompt"（在受支援的提交邊界擷取的文字投影）。',
   'Input to command is JSON with command_name, command_args, and expanded prompt text.':
     '命令輸入為包含 command_name、command_args 和展開後提示文本的 JSON。',
   'Input to command is JSON with session start source.':
@@ -1289,6 +1350,13 @@ export default {
   'Already generating summary, wait for previous request to complete':
     '正在生成摘要，請等待上一個請求完成',
   'No conversation found to summarize.': '未找到要總結的對話',
+  'Summary path already exists and is not a generated summary: {{path}}':
+    '摘要路徑已存在且非產生的摘要：{{path}}',
+  'Summary path must be within the project root.': '摘要路徑必須在專案根目錄內',
+  'Summary path resolves to an existing directory: {{path}}':
+    '摘要路徑解析為一個已存在的目錄：{{path}}',
+  'Summary path ends with a separator but is an existing file: {{path}}':
+    '摘要路徑以分隔符結尾，但是一個已存在的檔案：{{path}}',
   'Failed to generate project context summary: {{error}}':
     '生成項目上下文摘要失敗：{{error}}',
   'Saved project summary to {{filePathForDisplay}}.':
@@ -1307,6 +1375,8 @@ export default {
     '切換此會話的模型（--fast 可設置建議模型，--voice 可設置語音轉寫模型，[model-id] 可立即切換）',
   'Switch the model for this session (--fast for suggestion model, --voice for voice transcription model, --vision for the vision bridge model, --project to persist to project settings, --global to persist to user settings, [model-id] to switch immediately, or [model-id] [prompt] to run a one-off prompt on another model; the inline prompt is sent verbatim without @file expansion).':
     '切換此會話的模型（--fast 建議模型，--voice 語音轉寫模型，--vision 視覺橋接模型，--project 持久化到專案設定，--global 持久化到使用者設定，[model-id] 立即切換，或用 [model-id] [prompt] 在另一個模型上執行一次性提示；內聯提示按原文發送，不展開 @file）',
+  'Switch the model for this session (--fast for suggestion model, --voice for voice transcription model, --vision for the vision bridge model, --compaction for chat compression model, --image for the image generation model, --project to persist to project settings, --global to persist to user settings, [model-id] to switch immediately, or [model-id] [prompt] to run a one-off prompt on another model; the inline prompt is sent verbatim without @file expansion).':
+    '切換此會話的模型（--fast 建議模型，--voice 語音轉寫模型，--vision 視覺橋接模型，--compaction 聊天壓縮模型，--image 圖像生成模型，--project 持久化到專案設定，--global 持久化到使用者設定，[model-id] 立即切換，或用 [model-id] [prompt] 在另一個模型上執行一次性提示；內聯提示按原文發送，不展開 @file）',
   "Inline one-shot override isn't supported in this mode — run '/model {{model}}' first, then send your prompt.":
     "此模式不支援內聯一次性覆寫——請先執行 '/model {{model}}'，再發送你的提示。",
   "Inline one-shot override can't switch providers. '{{model}}' belongs to a different provider — run '/model {{model}}' first, then send your prompt.":
@@ -1319,16 +1389,27 @@ export default {
   'Set the model for voice transcription': '設定語音轉寫模型',
   'Set the image-capable model used to transcribe images for a text-only main model':
     '設定用於為純文字主模型轉寫圖像的圖像能力模型',
+  'Set the model used to generate images': '設置用於生成圖像的模型',
+  'Set the model used for chat compression (auto-compaction)':
+    '設置用於聊天壓縮（自動壓縮）的模型',
   'Persist the model selection to the project settings (workspace scope)':
     '將模型選擇持久化到專案設定（工作區）',
   'Persist the model selection to the user settings (global scope)':
     '將模型選擇持久化到使用者設定（全域）',
   'Select Fast Model': '選擇快速模型',
   'Select Vision Model': '選擇視覺模型',
+  'Select Image Model': '選擇圖像模型',
+  'Select Compaction Model': '選擇壓縮模型',
   'Select Voice Model': '選擇語音模型',
   'Vision Model': '視覺模型',
+  'Image Model': '圖像模型',
+  'Compaction Model': '壓縮模型',
   'Voice Model': '語音模型',
+  'Selected compaction model is unavailable.': '所選壓縮模型不可用。',
+  'Configure models in settings.modelProviders and ensure the required environment variables are set. In interactive mode, run /auth to configure or switch providers, or run /model --compaction without a model to choose from configured models.':
+    '在 settings.modelProviders 中配置模型並確保設置了所需的環境變量。在交互模式下，運行 /auth 配置或切換 provider，或運行 /model --compaction（不帶模型參數）從已配置的模型中選擇。',
   'Selected voice model is unavailable.': '所選語音模型不可用。',
+  'Selected image model is unavailable.': '所選圖像模型不可用。',
   "Voice model '{{model}}' is configured more than once. Remove duplicate model ids before selecting it for voice transcription.":
     "語音模型 '{{model}}' 被配置了多次。請先移除重複的模型 ID，再將其選為語音轉寫模型。",
   'Voice dictation: {{status}} (mode: {{mode}}, {{modelText}}).':
@@ -1390,6 +1471,12 @@ export default {
     '聊天歷史壓縮未能減小大小。這可能表明壓縮提示存在問題。',
   'Could not compress chat history due to a token counting error.':
     '由於 token 計數錯誤，無法壓縮聊天歷史。',
+  'Could not compress chat history because the compression summary was empty.':
+    '由於壓縮摘要為空，無法壓縮聊天歷史。',
+  'Could not compress chat history because the compression summary was truncated.':
+    '由於壓縮摘要被截斷，無法壓縮聊天歷史。',
+  'Could not compress chat history due to an API error.':
+    '由於 API 錯誤，無法壓縮聊天歷史。',
   'Configuration is not available.': '配置不可用。',
   'Please provide at least one path to add.': '請提供至少一個要添加的路徑。',
   'The /directory add command is not supported in restrictive sandbox profiles. Please use --include-directories when starting the session instead.':
@@ -1530,12 +1617,24 @@ export default {
   audio: '音頻',
   video: '視頻',
   'not set': '未設置',
+  'not set (falls back to the main model)': '未設置（回退到主模型）',
   'Current voice model: {{voiceModel}}\nUse "/model --voice <model-id>" to set voice model.':
     '當前語音模型：{{voiceModel}}\n使用 "/model --voice <model-id>" 設置語音模型。',
   'Current vision model: {{visionModel}}\nUse "/model --vision <model-id>" to set the vision bridge model.':
     '當前視覺模型：{{visionModel}}\n使用 "/model --vision <model-id>" 設置視覺橋接模型。',
+  'Current image model: {{imageModel}}\nUse "/model --image <model-id>" to set the image generation model.':
+    '當前圖像模型：{{imageModel}}\n使用 "/model --image <model-id>" 設置圖像生成模型。',
+  'Compaction model override cleared': '壓縮模型覆蓋已清除',
+  'Current compaction model: {{compactionModel}}\nUse "/model --compaction <model-id>" to set compaction model, or "/model --compaction clear" to clear the override.':
+    '當前壓縮模型：{{compactionModel}}\n使用 "/model --compaction <model-id>" 設置壓縮模型，或使用 "/model --compaction clear" 清除覆蓋設置。',
   "Voice model '{{modelName}}' is ambiguous. Configure a unique model id before using /model --voice.":
     "語音模型 '{{modelName}}' 不唯一。請先配置唯一的模型 ID，再使用 /model --voice。",
+  "Image model '{{modelName}}' matches multiple configured endpoints. Run /model --image without an argument and choose the exact endpoint.":
+    "圖像模型 '{{modelName}}' 匹配了多個已配置的端點。請執行 /model --image（不帶參數）並選擇確切的端點。",
+  "Image model '{{modelName}}' must declare a valid HTTPS baseUrl and credential environment variable.":
+    "圖像模型 '{{modelName}}' 必須宣告有效的 HTTPS baseUrl 和憑據環境變數。",
+  "'{{model}}' must declare a valid HTTPS baseUrl and credential environment variable.":
+    "'{{model}}' 必須宣告有效的 HTTPS baseUrl 和憑據環境變數。",
   none: '無',
   unknown: '未知',
   'Manage folder trust settings': '管理檔案夾信任設置',
@@ -1613,7 +1712,12 @@ export default {
   'Press Ctrl+C again to exit.': '再次按 Ctrl+C 退出',
   'Press Ctrl+D again to exit.': '再次按 Ctrl+D 退出',
   'Press Esc again to clear.': '再次按 Esc 清除',
-  'Press ↑ to edit queued messages': '按 ↑ 編輯排隊消息',
+  'Ctrl+Q to queue · ↑ to edit queued messages':
+    'Ctrl+Q 排到下一輪 · ↑ 編輯排隊消息',
+  'Enter to steer · Ctrl+Q to queue':
+    'Enter 追加到目前任務 · Ctrl+Q 排到下一輪',
+  '{{count}} queued': '{{count}} 條已排隊',
+  'Queue message for the next turn': '將消息排到下一輪',
   'No MCP servers configured.': '未配置 MCP servers',
   '◌ MCP servers are starting up ({{count}} initializing)...':
     '◌ MCP servers 正在啟動（{{count}} 個正在初始化）...',
@@ -1690,6 +1794,11 @@ export default {
   reviewed: '已審覈',
   'Code Changes:': '代碼變更：',
   Performance: '性能',
+  'Generation Metrics': '生成指標',
+  'Latest Request': '最近請求',
+  'Generation Time': '生成時間',
+  'Average TTFT': '平均 TTFT',
+  'Session TPS': '工作階段 TPS',
   'Wall Time:': '總耗時：',
   'Agent Active:': '智能體活躍時間：',
   'API Time:': 'API 時間：',
@@ -1825,6 +1934,7 @@ export default {
   'Press Ctrl+Y to retry': '按 Ctrl+Y 重試。',
   'No failed request to retry.': '沒有可重試的失敗請求。',
   'to retry last request': '重試上一次請求',
+  'to queue for the next turn': '排到下一輪',
   'API key cannot be empty.': 'API Key 不能為空。',
   'Invalid API key. Coding Plan API keys start with "sk-sp-". Please check.':
     '無效的 API Key，Coding Plan API Key 均以 "sk-sp-" 開頭，請檢查',
@@ -1963,8 +2073,11 @@ export default {
   'Switch to plan mode or exit plan mode': '切換到計劃模式或退出計劃模式',
   'Set how hard reasoning-capable models think ({{tiers}}); mapped and clamped per provider.':
     '設定具備推理能力的模型思考的強度（{{tiers}}）；依各供應商進行映射與鉗制。',
-  'Set a goal — keep working until the condition is met':
-    '設定目標 — 持續工作直到條件滿足',
+  'Choose the output style that shapes how responses are written ({{styles}}, or a custom style name).':
+    '選擇用於塑造回答表達方式的輸出風格（{{styles}}，或自訂風格名稱）。',
+  'It is saved but does not apply while this workspace is untrusted.':
+    '已儲存，但此工作區不受信任時不會生效。',
+  'Set or control a session goal': '設定或控制工作階段目標',
   'Exited plan mode. Previous approval mode restored.':
     '已退出計劃模式，已恢復之前的審批模式。',
   'Enabled plan mode. The agent will analyze and plan without executing tools.':
@@ -2005,6 +2118,17 @@ export default {
   'Save a durable memory to the memory system.': '將持久記憶保存到記憶系統。',
   'Ask a quick side question without affecting the main conversation':
     '在不影響主對話的情況下快速提問旁支問題',
+  'Get a second opinion on the current conversation from a reviewer model':
+    '讓審查模型對目前對話給出第二意見',
+  'Consulting advisor...': '正在諮詢審查模型...',
+  'Advisor review failed: {{error}}': '審查失敗：{{error}}',
+  'No conversation context available for /advisor':
+    '沒有可供 /advisor 使用的對話上下文',
+  'Focus too long (max {{max}} chars)': '關注點過長（最多 {{max}} 個字元）',
+  'Another operation is in progress, wait for it to complete before running /advisor':
+    '另一個操作正在進行中，請等待其完成後再執行 /advisor',
+  'No response received.': '未收到回覆。',
+  'No model configured.': '未設定模型。',
   'Manage Arena sessions': '管理 Arena 會話',
   'Start an Arena session with multiple models competing on the same task':
     '啟動一個 Arena 會話，讓多個模型在同一任務上競爭',
@@ -2058,11 +2182,26 @@ export default {
   'No tasks currently running': '目前沒有正在執行的任務',
   'No entry to show.': '沒有可顯示的項目。',
   'needs approval': '待審批',
+  'Large workflow': '大型工作流程',
+  'Large workflow: {{agents}} agents scheduled (warning threshold {{cap}}).':
+    '大型工作流程：已排定 {{agents}} 個 agent（警示門檻 {{cap}}）。',
+  'Large workflow: ~{{tokens}} output tokens projected (warning threshold {{cap}}).':
+    '大型工作流程：預計輸出 ~{{tokens}} 個 token（警示門檻 {{cap}}）。',
   'rejected — edit config to re-approve': '已拒絕 — 編輯設定以重新審批',
   'Background agent needs approval': '背景 agent 等待審批',
   'Approve or deny the request above': '請核准或拒絕上方的請求',
+  'from nested agent': '來自嵌套 agent',
   Running: '執行中',
+  Pausing: '暫停中',
   Paused: '已暫停',
+  'Pause is cooperative; in-flight work may finish before the workflow is paused. An agent call waiting on a tool approval keeps the run in this state and still counts against the active-time limit until the approval is answered.':
+    '暫停是協作式的；在工作流暫停之前，進行中的工作可能會先完成。等待工具審批的 agent 呼叫會讓執行保持在此狀態，且在審批得到回應前仍會計入活躍時間上限。',
+  'Paused: no new agents will start; script code between agent calls keeps running. Press p to resume. /clear, /branch, and switching sessions cancel paused runs.':
+    '已暫停：不會啟動新的 agent；agent 呼叫之間的指令碼會繼續執行。按 p 恢復。/clear、/branch 以及切換會話會取消已暫停的執行。',
+  'Pause/resume was rejected; the workflow state changed. Try again.':
+    '暫停/恢復被拒絕；工作流狀態已變更。請重試。',
+  'Tip: use `/workflows p <runId>` or Background tasks + p to cooperatively pause/resume; use `/workflows <runId>` for details.':
+    '提示：使用 `/workflows p <runId>`，或在背景任務中按 p 協作暫停/恢復；使用 `/workflows <runId>` 檢視詳情。',
   Completed: '已完成',
   Failed: '失敗',
   Stopped: '已停止',
@@ -2191,8 +2330,14 @@ export default {
   'A new version of Qwen Code is available! {{current}} → {{latest}}':
     'Qwen Code 有新版本可用！{{current}} → {{latest}}',
   'Qwen Code {{version}} is up to date!': 'Qwen Code {{version}} 已是最新！',
-  'Failed to check for updates. Please check your network or registry configuration.':
-    '檢查更新失敗。請檢查網路或 registry 設定。',
+  'Failed to check for updates ({{reason}}). Please check your network or registry configuration.':
+    '檢查更新失敗（{{reason}}）。請檢查網路或 registry 設定。',
+  'Update check skipped ({{reason}}) — run /update to retry.':
+    '已略過更新檢查（{{reason}}）— 可執行 /update 重試。',
+  'registry did not respond within {{seconds}}s':
+    'registry 在 {{seconds}} 秒內未回應',
+  'registry unreachable': 'registry 無法連線',
+  'registry error': 'registry 錯誤',
   'Unable to check for updates: {{reason}}': '無法檢查更新：{{reason}}',
   'Update successful! The new version will be used on your next run.':
     '更新成功！新版本將在下次執行時生效。',
@@ -2250,6 +2395,8 @@ export default {
   '{{count}} skills': '{{count}} 個技能',
   '{{count}} agent': '{{count}} 個代理',
   '{{count}} agents': '{{count}} 個代理',
+  '{{count}} workflow': '{{count}} 個工作流程',
+  '{{count}} workflows': '{{count}} 個工作流程',
   '{{count}} hook': '{{count}} 個鉤子',
   '{{count}} hooks': '{{count}} 個鉤子',
   '{{count}} extension MCP server': '{{count}} 個擴充 MCP 伺服器',
@@ -2285,4 +2432,58 @@ export default {
     '工作階段錄製因寫入失敗而停止。受影響工作階段中的新訊息將不會被儲存。請檢查磁碟空間和權限，然後建立新的工作階段以恢復錄製。詳細資訊請查看偵錯日誌。',
   'Session recording stopped after a write failure. New messages for the affected session will not be saved. Check disk space and permissions, then run `/clear` to start a new recorded session. See the debug log for details.':
     '工作階段錄製因寫入失敗而停止。受影響工作階段中的新訊息將不會被儲存。請檢查磁碟空間和權限，然後執行 `/clear` 建立新的可錄製工作階段。詳細資訊請查看偵錯日誌。',
+  'Maintain project auto-skills based on recent use.':
+    '根據最近的使用情況維護專案自動技能。',
+  'Show project auto-skill lifecycle status.':
+    '顯示專案自動技能的生命週期狀態。',
+  'Run project auto-skill lifecycle maintenance.':
+    '執行專案自動技能的生命週期維護。',
+  'Restore an archived project auto-skill.': '還原已封存的專案自動技能。',
+  'Auto-skill curator': '自動技能管理器',
+  'Last run: {{time}}': '上次執行：{{time}}',
+  'Active: {{count}}': '使用中：{{count}}',
+  'Stale: {{count}}': '陳舊：{{count}}',
+  'Archived: {{count}}': '已封存：{{count}}',
+  'Stale skills:': '陳舊技能：',
+  'Pinned skills:': '固定技能：',
+  'Archived skills:': '已封存技能：',
+  'Dry run complete.': '試執行完成。',
+  'Curator run complete.': '維護執行完成。',
+  'Checked: {{count}}': '已檢查：{{count}}',
+  'First observed: {{count}}': '首次發現：{{count}}',
+  'Marked stale: {{count}}': '已標記為陳舊：{{count}}',
+  'Reactivated: {{count}}': '已重新啟用：{{count}}',
+  'Skipped archive collisions: {{count}}': '已略過封存衝突：{{count}}',
+  'Archive candidates:': '待封存技能：',
+  'Skipped archive collisions:': '已略過的封存衝突：',
+  'Skipped rename errors: {{count}}': '已略過重新命名錯誤：{{count}}',
+  'Skipped rename errors:': '已略過的重新命名錯誤：',
+  '{{verb}}: {{count}}': '{{verb}}：{{count}}',
+  'Would archive': '將封存',
+  Archived: '已封存',
+  'Failed to read auto-skill curator status: {{message}}':
+    '讀取自動技能管理器狀態失敗：{{message}}',
+  'Usage: /curator run [--dry-run]': '用法：/curator run [--dry-run]',
+  'Failed to run auto-skill curator: {{message}}':
+    '執行自動技能管理器失敗：{{message}}',
+  'Usage: /curator restore <directory>': '用法：/curator restore <directory>',
+  'Restored auto-skill: {{name}}': '已還原自動技能：{{name}}',
+  'Failed to restore auto-skill: {{message}}': '還原自動技能失敗：{{message}}',
+  'Exclude an auto-skill from automatic maintenance.':
+    '將自動技能排除於自動維護之外。',
+  'Return a pinned auto-skill to automatic maintenance.':
+    '讓固定的自動技能重新接受自動維護。',
+  'Usage: /curator pin <directory>': '用法：/curator pin <directory>',
+  'Usage: /curator unpin <directory>': '用法：/curator unpin <directory>',
+  'Pinned auto-skill: {{name}}': '已固定自動技能：{{name}}',
+  'Unpinned auto-skill: {{name}}': '已取消固定自動技能：{{name}}',
+  'Failed to update auto-skill pin: {{message}}':
+    '更新自動技能固定狀態失敗：{{message}}',
+  'Auto-skill curator changes are disabled in safe mode.':
+    '安全模式下禁止變更自動技能管理器。',
+  'Auto-skill curator changes are only available in trusted workspaces. Trust this folder via `/trust` and try again.':
+    '只有受信任的工作區可以變更自動技能管理器。請透過 `/trust` 信任此資料夾後再試一次。',
+  'Kept model as {{model}}': '模型保持為 {{model}}',
+  'Review messages held from other Qwen Code sessions (accept | deny), and manage trusted controllers (controllers | revoke)':
+    '檢視其他 Qwen Code 工作階段傳來的待處理訊息（accept | deny），並管理受信任控制器（controllers | revoke）',
 };

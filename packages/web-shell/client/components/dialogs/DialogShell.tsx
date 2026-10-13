@@ -6,7 +6,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from 'react';
-import { Maximize2Icon, Minimize2Icon, XIcon } from 'lucide-react';
+import { ExpandIcon, ShrinkIcon, XIcon } from 'lucide-react';
 import { useI18n } from '../../i18n';
 import { useTheme, WebShellThemeId } from '../../themeContext';
 import { Button } from '../ui/button';
@@ -20,13 +20,14 @@ import {
 } from '../ui/dialog';
 import styles from './DialogShell.module.css';
 
-type DialogSize = 'sm' | 'md' | 'lg' | 'xl';
+type DialogSize = 'sm' | 'md' | 'lg' | 'xl' | 'auto';
 
 interface DialogShellProps {
   title: string;
   subtitle?: string;
   size?: DialogSize;
   allowFullscreen?: boolean;
+  dismissible?: boolean;
   onClose: () => void;
   children: ReactNode;
 }
@@ -36,6 +37,18 @@ const sizeClass: Record<DialogSize, string> = {
   md: 'sm:max-w-[560px]',
   lg: 'sm:max-w-[720px]',
   xl: 'sm:max-w-[900px]',
+  // Width follows the content instead of a fixed step, for bodies holding
+  // something with a real intrinsic width — the plan DAG lays out fixed 240px
+  // lanes, so a fixed panel scrolls it sideways while the screen still has
+  // room. `w-max` wins over DialogContent's base `w-full` through
+  // tailwind-merge. The floor keeps small graphs from collapsing to a narrow
+  // panel; the ceiling keeps large ones from spanning a wide monitor.
+  // The floor uses the same 2rem gutter the base ceiling
+  // (`max-w-[calc(100%-2rem)]`) reserves: twMerge keeps both classes, and
+  // below `sm:` a bare `min(100%,560px)` floor outranks that ceiling, so the
+  // panel rendered flush to both screen edges on a phone while every fixed
+  // size kept its gutter.
+  auto: 'w-max min-w-[min(calc(100%-2rem),560px)] sm:max-w-[min(calc(100vw-2rem),1120px)]',
 };
 
 const FOCUSABLE_SELECTOR = [
@@ -68,6 +81,7 @@ export function DialogShell({
   subtitle,
   size = 'md',
   allowFullscreen = false,
+  dismissible = true,
   onClose,
   children,
 }: DialogShellProps) {
@@ -152,7 +166,7 @@ export function DialogShell({
       event.target === event.currentTarget;
     backdropPressStartedRef.current = false;
     backdropPressEndedRef.current = false;
-    if (shouldClose) onClose();
+    if (shouldClose && dismissible) onClose();
   };
 
   const themeClass =
@@ -162,7 +176,7 @@ export function DialogShell({
     <Dialog
       open
       onOpenChange={(open) => {
-        if (!open) onClose();
+        if (!open && dismissible) onClose();
       }}
     >
       <DialogShellIdContext.Provider value={shellIdRef.current}>
@@ -195,7 +209,7 @@ export function DialogShell({
               return;
             }
             event.preventDefault();
-            onCloseRef.current();
+            if (dismissible) onCloseRef.current();
           }}
           onOpenAutoFocus={(event) => {
             event.preventDefault();
@@ -229,21 +243,23 @@ export function DialogShell({
                   fullscreen ? 'common.exitFullscreen' : 'common.fullscreen',
                 )}
               >
-                {fullscreen ? <Minimize2Icon /> : <Maximize2Icon />}
+                {fullscreen ? <ShrinkIcon /> : <ExpandIcon />}
               </Button>
             )}
-            <DialogClose asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                aria-label={t('common.close')}
-                title={t('common.close')}
-                data-dialog-close
-              >
-                <XIcon />
-              </Button>
-            </DialogClose>
+            {dismissible && (
+              <DialogClose asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={t('common.close')}
+                  title={t('common.close')}
+                  data-dialog-close
+                >
+                  <XIcon />
+                </Button>
+              </DialogClose>
+            )}
           </DialogHeader>
           <div
             className="flex min-h-0 flex-1 flex-col overflow-y-auto p-4"

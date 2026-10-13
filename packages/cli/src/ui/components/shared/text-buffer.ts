@@ -161,7 +161,7 @@ export function __resetWordSegmenter(): void {
  * Returns an array of { start, end } where end is exclusive.
  * @param codePoints - Optional pre-computed code points array to avoid redundant toCodePoints calls.
  */
-function getWordBoundaries(
+export function getWordBoundaries(
   line: string,
   codePoints?: string[],
 ): Array<{ start: number; end: number }> {
@@ -299,7 +299,7 @@ function binarySearchCpIndex(cpToStrIdx: number[], target: number): number {
  * - Cursor inside a word → jump to that word's start
  * - Cursor exactly at a word's start → jump to previous word's start
  */
-function findPrevWordStart(
+export function findPrevWordStart(
   boundaries: Array<{ start: number; end: number }>,
   col: number,
 ): number | null {
@@ -1168,7 +1168,12 @@ export const pushUndo = (currentState: TextBufferState): TextBufferState => {
 };
 
 export type TextBufferAction =
-  | { type: 'set_text'; payload: string; pushToUndo?: boolean }
+  | {
+      type: 'set_text';
+      payload: string;
+      pushToUndo?: boolean;
+      clearUndoHistory?: boolean;
+    }
   | { type: 'insert'; payload: string }
   | { type: 'backspace' }
   | {
@@ -1257,8 +1262,10 @@ function textBufferReducerLogic(
 
   switch (action.type) {
     case 'set_text': {
-      let nextState = state;
-      if (action.pushToUndo !== false) {
+      let nextState = action.clearUndoHistory
+        ? { ...state, undoStack: [], redoStack: [] }
+        : state;
+      if (!action.clearUndoHistory && action.pushToUndo !== false) {
         nextState = pushUndoLocal(state);
       }
       const newContentLines = action.payload
@@ -2165,6 +2172,8 @@ export function useTextBuffer({
   const [visualScrollRow, setVisualScrollRow] = useState<number>(0);
 
   useEffect(() => {
+    // Keep change notification post-render: InputPrompt clears this buffer
+    // before its synchronous submit callback consumes restored provenance.
     if (onChange) {
       onChange(text);
     }
@@ -2277,8 +2286,12 @@ export function useTextBuffer({
   }, [dispatch]);
 
   const setText = useCallback(
-    (newText: string): void => {
-      dispatch({ type: 'set_text', payload: newText });
+    (newText: string, options?: { clearUndoHistory?: boolean }): void => {
+      dispatch({
+        type: 'set_text',
+        payload: newText,
+        clearUndoHistory: options?.clearUndoHistory,
+      });
     },
     [dispatch],
   );
@@ -2919,9 +2932,9 @@ export interface TextBuffer {
 
   /**
    * Replaces the entire buffer content with the provided text.
-   * The operation is undoable.
+   * The operation is undoable unless `clearUndoHistory` is set.
    */
-  setText: (text: string) => void;
+  setText: (text: string, options?: { clearUndoHistory?: boolean }) => void;
   /**
    * Insert a single character or string without newlines.
    */
