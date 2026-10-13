@@ -21,16 +21,20 @@ export interface MultiSelectProps<T> {
   items: Array<MultiSelectItem<T>>;
   initialIndex?: number;
   selectedKeys?: string[];
-  onConfirm: (selectedValues: T[]) => void;
+  onConfirm: (selectedValues: T[], activeValue: T) => void;
   onChange?: (selectedValues: T[]) => void;
   onSelectedKeysChange?: (selectedKeys: string[]) => void;
   onHighlight?: (value: T) => void;
   isFocused?: boolean;
+  /** Suppress j/k vim-nav while keeping arrows/Enter/space active. */
+  disableVimNav?: boolean;
   showNumbers?: boolean;
   showScrollArrows?: boolean;
   maxItemsToShow?: number;
   checkedText?: string;
+  uncheckedText?: string;
   showActiveMarker?: boolean;
+  truncateLabels?: boolean;
 }
 
 const EMPTY_SELECTED_KEYS: string[] = [];
@@ -53,11 +57,14 @@ export function MultiSelect<T>({
   onSelectedKeysChange,
   onHighlight,
   isFocused = true,
+  disableVimNav = false,
   showNumbers = true,
   showScrollArrows = false,
   maxItemsToShow = 10,
   checkedText = '[✓]',
+  uncheckedText = '[ ]',
   showActiveMarker = false,
+  truncateLabels = false,
 }: MultiSelectProps<T>): React.JSX.Element {
   const [scrollOffset, setScrollOffset] = useState(0);
   const selectedKeySet = useMemo(() => new Set(selectedKeys), [selectedKeys]);
@@ -66,14 +73,15 @@ export function MultiSelect<T>({
     items,
     initialIndex,
     isFocused,
+    disableVimNav,
     // Disable numeric quick-select in useSelectionList — in a multi-select
     // context, onSelect triggers onConfirm (submit), so numeric keys would
     // accidentally submit the dialog instead of toggling checkboxes.
     // Numbers are still rendered visually via the showNumbers prop below.
     showNumbers: false,
     onHighlight,
-    onSelect: () => {
-      onConfirm(getSelectedValues(items, selectedKeySet));
+    onSelect: (activeValue) => {
+      onConfirm(getSelectedValues(items, selectedKeySet), activeValue);
     },
   });
 
@@ -139,7 +147,7 @@ export function MultiSelect<T>({
 
       {visibleItems.map((item, index) => {
         const itemIndex = scrollOffset + index;
-        const isActive = activeIndex === itemIndex;
+        const isActive = isFocused && activeIndex === itemIndex;
         const isChecked = selectedKeySet.has(item.key);
         const activeMarker = isActive ? '›' : ' ';
 
@@ -150,7 +158,7 @@ export function MultiSelect<T>({
           ? '[x]'
           : isChecked
             ? checkedText
-            : '[ ]';
+            : uncheckedText;
 
         let textColor = theme.text.primary;
         if (item.disabled) {
@@ -173,7 +181,12 @@ export function MultiSelect<T>({
                 <Text> </Text>
               </Box>
               <Box flexGrow={1}>
-                <Text color={theme.text.secondary}>{item.label}</Text>
+                <Text
+                  color={theme.text.secondary}
+                  wrap={truncateLabels ? 'truncate' : 'wrap'}
+                >
+                  {item.label}
+                </Text>
               </Box>
             </Box>
           );
@@ -195,7 +208,12 @@ export function MultiSelect<T>({
               </Box>
             )}
             <Box flexGrow={1}>
-              <Text color={textColor}>{item.label}</Text>
+              <Text
+                color={textColor}
+                wrap={truncateLabels ? 'truncate' : 'wrap'}
+              >
+                {item.label}
+              </Text>
             </Box>
           </Box>
         );

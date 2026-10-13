@@ -23,6 +23,13 @@ vi.mock('../ui/commands/approvalModeCommand.js', () => ({
     kind: 'built-in',
   },
 }));
+vi.mock('../ui/commands/cdCommand.js', () => ({
+  cdCommand: {
+    name: 'cd',
+    description: 'Change directory command',
+    kind: 'built-in',
+  },
+}));
 
 vi.mock('../ui/commands/ideCommand.js', async () => {
   const { CommandKind } = await import('../ui/commands/types.js');
@@ -75,6 +82,7 @@ import type { Config } from '@qwen-code/qwen-code-core';
 import { CommandKind } from '../ui/commands/types.js';
 
 import { restoreCommand } from '../ui/commands/restoreCommand.js';
+import { ideCommand } from '../ui/commands/ideCommand.js';
 
 vi.mock('../ui/commands/authCommand.js', () => ({ authCommand: {} }));
 vi.mock('../ui/commands/bugCommand.js', () => ({ bugCommand: {} }));
@@ -124,8 +132,9 @@ describe('BuiltinCommandLoader', () => {
       getFolderTrust: vi.fn().mockReturnValue(true),
       getUseModelRouter: () => false,
       getDisableAllHooks: vi.fn().mockReturnValue(false),
-      getManagedAutoMemoryEnabled: vi.fn().mockReturnValue(true),
+      isManagedMemoryAvailable: vi.fn().mockReturnValue(true),
       isLspEnabled: vi.fn().mockReturnValue(false),
+      isWorkflowsEnabled: vi.fn().mockReturnValue(false),
     } as unknown as Config;
 
     restoreCommandMock.mockReturnValue({
@@ -135,6 +144,18 @@ describe('BuiltinCommandLoader', () => {
     });
   });
 
+  it('skips automatic IDE process detection in tool sandbox', async () => {
+    const { ideCommand } = await import('../ui/commands/ideCommand.js');
+    mockConfig.getShellExecutionSandbox = vi
+      .fn()
+      .mockReturnValue({ backend: 'bwrap' });
+    const commands = await new BuiltinCommandLoader(mockConfig).loadCommands(
+      new AbortController().signal,
+    );
+    expect(ideCommand).not.toHaveBeenCalled();
+    expect(commands.some((command) => command.name === 'ide')).toBe(false);
+  });
+
   it('should correctly pass the config object to restore command factory', async () => {
     const loader = new BuiltinCommandLoader(mockConfig);
     await loader.loadCommands(new AbortController().signal);
@@ -142,6 +163,16 @@ describe('BuiltinCommandLoader', () => {
     // ideCommand is now a constant, no longer needs config
     expect(restoreCommandMock).toHaveBeenCalledTimes(1);
     expect(restoreCommandMock).toHaveBeenCalledWith(mockConfig);
+  });
+
+  it('does not probe local IDE processes for an execution environment', async () => {
+    mockConfig.getExecutionEnvironment = vi.fn().mockReturnValue({});
+    const loader = new BuiltinCommandLoader(mockConfig);
+
+    const commands = await loader.loadCommands(new AbortController().signal);
+
+    expect(ideCommand).not.toHaveBeenCalled();
+    expect(commands.some((command) => command.name === 'ide')).toBe(false);
   });
 
   it('should filter out null command definitions returned by factories', async () => {
@@ -178,14 +209,24 @@ describe('BuiltinCommandLoader', () => {
     expect(approvalModeCmd).toBeDefined();
     expect(approvalModeCmd?.kind).toBe(CommandKind.BUILT_IN);
 
+    const cdCmd = commands.find((c) => c.name === 'cd');
+    expect(cdCmd).toBeDefined();
+    expect(cdCmd?.kind).toBe(CommandKind.BUILT_IN);
+
     const ideCmd = commands.find((c) => c.name === 'ide');
     expect(ideCmd).toBeDefined();
+
+    const importConfigCmd = commands.find((c) => c.name === 'import-config');
+    expect(importConfigCmd).toBeDefined();
 
     const mcpCmd = commands.find((c) => c.name === 'mcp');
     expect(mcpCmd).toBeDefined();
 
     const modelCmd = commands.find((c) => c.name === 'model');
     expect(modelCmd).toBeDefined();
+
+    const curatorCmd = commands.find((c) => c.name === 'curator');
+    expect(curatorCmd).toBeDefined();
   });
 
   it('should include trust command when folder trust is enabled', async () => {
@@ -211,6 +252,22 @@ describe('BuiltinCommandLoader', () => {
     expect(modelCmd?.name).toBe('model');
   });
 
+  it('should always register the /fork command', async () => {
+    const loader = new BuiltinCommandLoader(mockConfig);
+    const commands = await loader.loadCommands(new AbortController().signal);
+    const forkCmd = commands.find((c) => c.name === 'fork');
+    expect(forkCmd).toBeDefined();
+    expect(forkCmd?.kind).toBe(CommandKind.BUILT_IN);
+  });
+
+  it('should always register the /advisor command', async () => {
+    const loader = new BuiltinCommandLoader(mockConfig);
+    const commands = await loader.loadCommands(new AbortController().signal);
+    const advisorCmd = commands.find((c) => c.name === 'advisor');
+    expect(advisorCmd).toBeDefined();
+    expect(advisorCmd?.kind).toBe(CommandKind.BUILT_IN);
+  });
+
   it('should include lsp command only when LSP is enabled', async () => {
     const disabledLoader = new BuiltinCommandLoader(mockConfig);
     const disabledCommands = await disabledLoader.loadCommands(
@@ -225,6 +282,24 @@ describe('BuiltinCommandLoader', () => {
     );
 
     expect(enabledCommands.find((c) => c.name === 'lsp')).toBeDefined();
+  });
+
+  it('should include workflows command only when workflows are enabled', async () => {
+    const disabledLoader = new BuiltinCommandLoader(mockConfig);
+    const disabledCommands = await disabledLoader.loadCommands(
+      new AbortController().signal,
+    );
+    expect(
+      disabledCommands.find((c) => c.name === 'workflows'),
+    ).toBeUndefined();
+
+    (mockConfig.isWorkflowsEnabled as Mock).mockReturnValue(true);
+    const enabledLoader = new BuiltinCommandLoader(mockConfig);
+    const enabledCommands = await enabledLoader.loadCommands(
+      new AbortController().signal,
+    );
+
+    expect(enabledCommands.find((c) => c.name === 'workflows')).toBeDefined();
   });
 
   it('should still load all other commands when ideCommand() throws', async () => {
@@ -268,5 +343,15 @@ describe('BuiltinCommandLoader', () => {
     const commands2 = await loader2.loadCommands(new AbortController().signal);
     const hooksCmd2 = commands2.find((c) => c.name === 'hooks');
     expect(hooksCmd2).toBeDefined();
+  });
+
+  it('should register the /reload-plugins command', async () => {
+    const loader = new BuiltinCommandLoader(mockConfig);
+    const commands = await loader.loadCommands(new AbortController().signal);
+
+    const command = commands.find((c) => c.name === 'reload-plugins');
+
+    expect(command).toBeDefined();
+    expect(command?.kind).toBe(CommandKind.BUILT_IN);
   });
 });

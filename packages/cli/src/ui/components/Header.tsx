@@ -7,7 +7,10 @@
 import type React from 'react';
 import { Box, Text } from 'ink';
 import Gradient from 'ink-gradient';
-import { shortenPath, tildeifyPath } from '@qwen-code/qwen-code-core';
+import {
+  shortenPath,
+  tildeifyPath,
+} from '@qwen-code/qwen-code-core/utils/paths.js';
 import { theme } from '../semantic-colors.js';
 import { shortAsciiLogo } from './AsciiArt.js';
 import { getAsciiArtWidth, getCachedStringWidth } from '../utils/textUtils.js';
@@ -15,6 +18,7 @@ import { useTerminalSize } from '../hooks/useTerminalSize.js';
 import { getRenderableGradientColors } from '../utils/gradientUtils.js';
 import { pickAsciiArtTier } from '../utils/customBanner.js';
 import { t } from '../../i18n/index.js';
+import { formatVersionLabel } from '../../utils/version.js';
 
 /**
  * Auth display type for the Header component.
@@ -88,6 +92,7 @@ export const Header: React.FC<HeaderProps> = ({
   const { columns: terminalWidth } = useTerminalSize();
 
   const formattedAuthType = formatAuthDisplayType(authDisplayType);
+  const versionLabel = formatVersionLabel(version);
 
   // Calculate available space properly:
   // First determine if logo can be shown, then use remaining space for path
@@ -209,7 +214,7 @@ export const Header: React.FC<HeaderProps> = ({
           <Text bold color={theme.text.accent}>
             {customBannerTitle ? customBannerTitle : '>_ Qwen Code'}
           </Text>
-          <Text color={theme.text.secondary}> (v{version})</Text>
+          <Text color={theme.text.secondary}> ({versionLabel})</Text>
         </Text>
         {/* Subtitle (when set) replaces the blank spacer row. We always
             emit a row here so the auth/model line stays at the same

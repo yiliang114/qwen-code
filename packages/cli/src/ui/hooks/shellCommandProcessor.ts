@@ -13,18 +13,20 @@ import { useCallback, useState } from 'react';
 import type {
   AnsiOutput,
   Config,
-  GeminiClient,
+  LlmClient,
   ShellExecutionResult,
 } from '@qwen-code/qwen-code-core';
 import {
+  compactToolResultDisplayForHistory,
   createDebugLogger,
+  isSignalTermination,
   isBinary,
-  ShellExecutionService,
 } from '@qwen-code/qwen-code-core';
 import { type PartListUnion } from '@google/genai';
 import type { UseHistoryManagerReturn } from './useHistoryManager.js';
 import { SHELL_COMMAND_NAME } from '../constants.js';
 import { formatMemoryUsage } from '../utils/formatters.js';
+import { executeRuntimeShell } from '@qwen-code/qwen-code-core/sandbox/runtime-shell.js';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
@@ -35,17 +37,22 @@ export const OUTPUT_UPDATE_INTERVAL_MS = 1000;
 const MAX_OUTPUT_LENGTH = 10000;
 const debugLogger = createDebugLogger('SHELL_COMMAND_PROCESSOR');
 
-function addShellCommandToGeminiHistory(
-  geminiClient: GeminiClient,
+function copyString(value: string): string {
+  return value.split('').join('');
+}
+
+export function addShellCommandToLlmHistory(
+  llmClient: LlmClient,
   rawQuery: string,
   resultText: string,
 ) {
   const modelContent =
     resultText.length > MAX_OUTPUT_LENGTH
-      ? resultText.substring(0, MAX_OUTPUT_LENGTH) + '\n... (truncated)'
+      ? copyString(resultText.substring(0, MAX_OUTPUT_LENGTH)) +
+        '\n... (truncated)'
       : resultText;
 
-  geminiClient.addHistory({
+  llmClient.addHistory({
     role: 'user',
     parts: [
       {
@@ -75,7 +82,7 @@ export const useShellCommandProcessor = (
   onExec: (command: Promise<void>) => void,
   onDebugMessage: (message: string) => void,
   config: Config,
-  geminiClient: GeminiClient,
+  llmClient: LlmClient,
   setShellInputFocused: (value: boolean) => void,
   terminalWidth?: number,
   terminalHeight?: number,
@@ -100,15 +107,26 @@ export const useShellCommandProcessor = (
       let pwdFilePath: string | undefined;
 
       // On non-windows, wrap the command to capture the final working directory.
-      if (!isWindows) {
+      if (!isWindows && !config.getShellExecutionSandbox?.()) {
         let command = rawQuery.trim();
         const pwdFileName = `shell_pwd_${crypto.randomBytes(6).toString('hex')}.tmp`;
         pwdFilePath = path.join(os.tmpdir(), pwdFileName);
+        // A command ending in an odd run of backslashes leaves a dangling
+        // line continuation; the `;` appended below would be escaped into a
+        // literal argument (`ls \` would run `ls ';'`). Close the continuation
+        // first so the terminator ends the user's own command (R6-8).
+        const trailingBackslashes = /\\+$/.exec(command)?.[0].length ?? 0;
+        if (trailingBackslashes % 2 === 1) {
+          command += '\n';
+        }
         // Ensure command ends with a separator before adding our own.
         if (!command.endsWith(';') && !command.endsWith('&')) {
           command += ';';
         }
-        commandToExecute = `{ ${command} }; __code=$?; pwd > "${pwdFilePath}"; exit $__code`;
+        // The brace group closes on its own line: a one-line `{ ... #comment; };`
+        // lets a trailing comment swallow the wrapper tail and the shell dies
+        // on a syntax error before the user's command runs at all.
+        commandToExecute = `{ ${command}\n}; __code=$?; pwd > "${pwdFilePath}"; exit $__code`;
       }
 
       const executeCommand = async (
@@ -145,6 +163,16 @@ export const useShellCommandProcessor = (
 
         onDebugMessage(`Executing in ${targetDir}: ${commandToExecute}`);
 
+        const cleanupShellCommand = () => {
+          abortSignal.removeEventListener('abort', abortHandler);
+          if (pwdFilePath && fs.existsSync(pwdFilePath)) {
+            fs.unlinkSync(pwdFilePath);
+          }
+          setActiveShellPtyId(null);
+          setShellInputFocused(false);
+          resolve();
+        };
+
         try {
           const activeTheme = themeManager.getActiveTheme();
           const shellExecutionConfig = {
@@ -155,7 +183,8 @@ export const useShellCommandProcessor = (
             defaultBg: activeTheme.colors.Background,
           };
 
-          const { pid, result } = await ShellExecutionService.execute(
+          const { pid, result } = await executeRuntimeShell(
+            config,
             commandToExecute,
             targetDir,
             (event) => {
@@ -220,8 +249,12 @@ export const useShellCommandProcessor = (
                               ...tool,
                               resultDisplay:
                                 typeof currentDisplayOutput === 'string'
-                                  ? currentDisplayOutput
-                                  : { ansiOutput: currentDisplayOutput },
+                                  ? compactToolResultDisplayForHistory(
+                                      currentDisplayOutput,
+                                    )
+                                  : compactToolResultDisplayForHistory({
+                                      ansiOutput: currentDisplayOutput,
+                                    }),
                             }
                           : tool,
                       ),
@@ -278,7 +311,7 @@ export const useShellCommandProcessor = (
               } else if (result.aborted) {
                 finalStatus = ToolCallStatus.Canceled;
                 finalOutput = `Command was cancelled.\n${finalOutput}`;
-              } else if (result.signal) {
+              } else if (isSignalTermination(result.signal)) {
                 finalStatus = ToolCallStatus.Error;
                 finalOutput = `Command terminated by signal: ${result.signal}.\n${finalOutput}`;
               } else if (result.exitCode !== 0) {
@@ -297,10 +330,10 @@ export const useShellCommandProcessor = (
               const finalToolDisplay: IndividualToolCallDisplay = {
                 ...initialToolDisplay,
                 status: finalStatus,
-                resultDisplay: finalOutput,
+                resultDisplay: compactToolResultDisplayForHistory(finalOutput),
               };
 
-              // Add the complete, contextual result to the local UI history.
+              // Add the compacted, contextual result to the local UI history.
               addItemToHistory(
                 {
                   type: 'tool_group',
@@ -310,12 +343,8 @@ export const useShellCommandProcessor = (
                 userMessageTimestamp,
               );
 
-              // Add the same complete, contextual result to the LLM's history.
-              addShellCommandToGeminiHistory(
-                geminiClient,
-                rawQuery,
-                finalOutput,
-              );
+              // Keep the existing LLM history behavior unchanged.
+              addShellCommandToLlmHistory(llmClient, rawQuery, finalOutput);
             })
             .catch((err) => {
               setPendingHistoryItem(null);
@@ -330,13 +359,7 @@ export const useShellCommandProcessor = (
               );
             })
             .finally(() => {
-              abortSignal.removeEventListener('abort', abortHandler);
-              if (pwdFilePath && fs.existsSync(pwdFilePath)) {
-                fs.unlinkSync(pwdFilePath);
-              }
-              setActiveShellPtyId(null);
-              setShellInputFocused(false);
-              resolve();
+              cleanupShellCommand();
             });
         } catch (err) {
           // This block handles synchronous errors from `execute`
@@ -350,13 +373,7 @@ export const useShellCommandProcessor = (
             userMessageTimestamp,
           );
 
-          // Perform cleanup here as well
-          if (pwdFilePath && fs.existsSync(pwdFilePath)) {
-            fs.unlinkSync(pwdFilePath);
-          }
-          setActiveShellPtyId(null);
-          setShellInputFocused(false);
-          resolve(); // Resolve the promise to unblock `onExec`
+          cleanupShellCommand();
         }
       };
 
@@ -373,7 +390,7 @@ export const useShellCommandProcessor = (
       addItemToHistory,
       setPendingHistoryItem,
       onExec,
-      geminiClient,
+      llmClient,
       setShellInputFocused,
       terminalHeight,
       terminalWidth,

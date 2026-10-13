@@ -22,7 +22,7 @@
  *   config.getMemoryManager().forget(projectRoot, query, options)
  *   config.getMemoryManager().getStatus(projectRoot)
  *   config.getMemoryManager().drain(options?)
- *   config.getMemoryManager().appendToUserMemory(userMemory, projectRoot)
+ *   config.getMemoryManager().buildAutoMemoryPrompt(projectRoot)
  *
  * # Task records
  * Each scheduled operation is tracked as a lightweight MemoryTaskRecord.
@@ -39,14 +39,16 @@ import { randomUUID } from 'node:crypto';
 import type { Content, Part } from '@google/genai';
 import type { Config } from '../config/config.js';
 import { Storage } from '../config/storage.js';
+import { atomicWriteFile } from '../utils/atomicFileWrite.js';
 import { createDebugLogger } from '../utils/debugLogger.js';
+import { canonicalToolName, ToolNames } from '../tools/tool-names.js';
 import {
   logMemoryDream,
   logMemoryExtract,
   MemoryDreamEvent,
   MemoryExtractEvent,
 } from '../telemetry/index.js';
-import { isAutoMemPath } from './paths.js';
+import { isAnyAutoMemPath, isTeamAutoMemPath } from './paths.js';
 import {
   getAutoMemoryConsolidationLockPath,
   getAutoMemoryMetadataPath,
@@ -61,6 +63,7 @@ import {
   type AutoMemoryForgetMatch,
   type AutoMemoryForgetResult,
   type AutoMemoryForgetSelectionResult,
+  type AutoMemoryStorageScope,
 } from './forget.js';
 import {
   resolveRelevantAutoMemoryPromptForQuery,
@@ -68,10 +71,24 @@ import {
   type ResolveRelevantAutoMemoryPromptOptions,
 } from './recall.js';
 import { getManagedAutoMemoryStatus } from './status.js';
-import { appendManagedAutoMemoryToUserMemory } from './prompt.js';
+import {
+  buildManagedAutoMemoryPrompt,
+  type BuildMemoryPromptOptions,
+  type UserAutoMemorySection,
+  type TeamAutoMemorySection,
+} from './prompt.js';
 import { writeDreamManualRunToMetadata } from './dream.js';
 import { buildConsolidationTaskPrompt } from './dreamAgentPlanner.js';
-import { runSkillReviewByAgent } from './skillReviewAgentPlanner.js';
+import {
+  runSkillReviewByAgent,
+  listExistingSkillDirNames,
+} from './skillReviewAgentPlanner.js';
+import {
+  stageSkillDirs,
+  acceptPendingSkill,
+  rejectPendingSkill,
+  type PendingSkill,
+} from './pending-skills.js';
 import type { AutoMemoryMetadata } from './types.js';
 
 const debugLogger = createDebugLogger('AUTO_MEMORY_MANAGER');
@@ -134,6 +151,10 @@ export interface ScheduleSkillReviewParams {
   threshold?: number;
   maxTurns?: number;
   timeoutMs?: number;
+  /** When true, stage created skills for user confirmation instead of
+   * leaving them live in the skills root. Sourced from
+   * Config.getAutoSkillConfirmEnabled(). */
+  confirmBeforePersist?: boolean;
 }
 
 export interface SkillReviewScheduleResult {
@@ -143,7 +164,8 @@ export interface SkillReviewScheduleResult {
     | 'below_threshold'
     | 'skills_modified_in_session'
     | 'disabled'
-    | 'already_running';
+    | 'already_running'
+    | 'memory_pressure';
   promise?: Promise<MemoryTaskRecord>;
 }
 
@@ -171,7 +193,8 @@ export interface DreamScheduleResult {
     | 'min_sessions'
     | 'scan_throttled'
     | 'locked'
-    | 'running';
+    | 'running'
+    | 'memory_pressure';
   promise?: Promise<MemoryTaskRecord>;
 }
 
@@ -227,6 +250,11 @@ function makeTaskRecord(
   };
 }
 
+// INVARIANT: mutates `record` in place. `resolvePendingSkill`'s concurrency
+// safety (concurrent Keep-all/Discard-all each removing only their own entry)
+// relies on this — it re-reads `record.metadata.pendingSkills` after its await
+// and expects to see writes from sibling calls. A refactor to immutable
+// record updates would reintroduce the "all-but-one left behind" race.
 function updateRecord(
   record: MemoryTaskRecord,
   patch: Partial<
@@ -244,12 +272,51 @@ function updateRecord(
 }
 
 function partWritesToMemory(part: Part, projectRoot: string): boolean {
-  const name = part.functionCall?.name;
+  let name = part.functionCall?.name
+    ? canonicalToolName(part.functionCall.name)
+    : undefined;
+  let args = part.functionCall?.args as Record<string, unknown> | undefined;
+  if (name === ToolNames.TOOL_CALL) {
+    const targetName = args?.['name'];
+    const targetArgs = args?.['arguments'];
+    if (typeof targetName === 'string') {
+      name = canonicalToolName(targetName);
+      if (
+        typeof targetArgs === 'object' &&
+        targetArgs !== null &&
+        !Array.isArray(targetArgs)
+      ) {
+        args = targetArgs as Record<string, unknown>;
+      } else {
+        args = undefined;
+        if (typeof targetArgs === 'string') {
+          const trimmedArgs = targetArgs.trim();
+          if (trimmedArgs.startsWith('{') && trimmedArgs.endsWith('}')) {
+            try {
+              const parsedArgs: unknown = JSON.parse(trimmedArgs);
+              if (
+                typeof parsedArgs === 'object' &&
+                parsedArgs !== null &&
+                !Array.isArray(parsedArgs)
+              ) {
+                args = parsedArgs as Record<string, unknown>;
+              }
+            } catch {
+              // Invalid JSON cannot describe a memory-writing target.
+            }
+          }
+        }
+      }
+    }
+  }
   if (name && WRITE_TOOL_NAMES.has(name)) {
-    const args = part.functionCall?.args as Record<string, unknown> | undefined;
     const filePath =
       args?.['file_path'] ?? args?.['path'] ?? args?.['target_file'];
-    if (typeof filePath === 'string' && isAutoMemPath(filePath, projectRoot)) {
+    if (
+      typeof filePath === 'string' &&
+      (isAnyAutoMemPath(filePath, projectRoot) ||
+        isTeamAutoMemPath(filePath, projectRoot))
+    ) {
       return true;
     }
   }
@@ -288,10 +355,10 @@ async function writeDreamMetadata(
   projectRoot: string,
   metadata: AutoMemoryMetadata,
 ): Promise<void> {
-  await fs.writeFile(
+  await atomicWriteFile(
     getAutoMemoryMetadataPath(projectRoot),
     `${JSON.stringify(metadata, null, 2)}\n`,
-    'utf-8',
+    { encoding: 'utf-8' },
   );
 }
 
@@ -391,7 +458,7 @@ export class MemoryManager {
   // run on every UserQuery.
   private readonly subscribers = new Set<() => void>();
   private readonly subscribersByType = new Map<
-    'extract' | 'dream',
+    'extract' | 'dream' | 'skill-review',
     Set<() => void>
   >();
   // ── In-flight promises (for drain) ──────────────────────────────────────────
@@ -447,7 +514,7 @@ export class MemoryManager {
    */
   subscribe(
     listener: () => void,
-    opts?: { taskType?: 'extract' | 'dream' },
+    opts?: { taskType?: 'extract' | 'dream' | 'skill-review' },
   ): () => void {
     if (opts?.taskType) {
       const type = opts.taskType;
@@ -477,7 +544,7 @@ export class MemoryManager {
    */
   private notify(taskType?: 'extract' | 'dream' | 'skill-review'): void {
     for (const fn of this.subscribers) fn();
-    if (taskType && taskType !== 'skill-review') {
+    if (taskType) {
       const typed = this.subscribersByType.get(taskType);
       if (typed) for (const fn of typed) fn();
     }
@@ -551,7 +618,10 @@ export class MemoryManager {
 
   private track<T>(taskId: string, promise: Promise<T>): Promise<T> {
     this.inFlight.set(taskId, promise);
-    void promise.finally(() => this.inFlight.delete(taskId));
+    void promise.then(
+      () => this.inFlight.delete(taskId),
+      () => this.inFlight.delete(taskId),
+    );
     return promise;
   }
 
@@ -667,11 +737,26 @@ export class MemoryManager {
     return this.track(record.id, this.runExtract(record.id, params)) as never;
   }
 
+  /**
+   * True when the runtime is under hard or critical memory pressure, as
+   * reported by the shared MemoryPressureMonitor (#5147). The monitor is
+   * cgroup-aware and compares RSS/heap against their actual limits as a
+   * ratio, so this adapts to `--max-old-space-size`, containers, and large
+   * hosts alike — unlike an absolute megabyte threshold. Returns false when
+   * no monitor is wired (e.g. unit tests, headless), so extraction proceeds
+   * normally in those contexts.
+   */
+  private isUnderMemoryPressure(config?: Config): boolean {
+    const level = config?.getMemoryPressureMonitor?.()?.getPressureLevel?.();
+    return level === 'hard' || level === 'critical';
+  }
+
   private async runExtract(
     taskId: string,
     params: ScheduleExtractParams,
   ): Promise<Awaited<ReturnType<typeof runAutoMemoryExtract>>> {
     const record = this.tasks.get(taskId)!;
+
     this.extractCurrentTaskId.set(params.projectRoot, taskId);
     this.extractRunning.add(params.projectRoot);
     this.update(record, {
@@ -682,19 +767,56 @@ export class MemoryManager {
 
     const t0 = Date.now();
     try {
+      // Memory-pressure gate. Checked inside try so the finally block
+      // always runs — extractRunning/extractCurrentTaskId are cleaned up
+      // and startQueuedExtract is called regardless of the gate outcome.
+      if (this.isUnderMemoryPressure(params.config)) {
+        debugLogger.warn('Skipping extract: memory pressure too high.');
+        this.update(record, {
+          status: 'skipped',
+          progressText: 'Skipped: memory pressure too high for extraction.',
+          metadata: { skippedReason: 'memory_pressure' },
+        });
+        if (params.config) {
+          logMemoryExtract(
+            params.config,
+            new MemoryExtractEvent({
+              trigger: 'auto',
+              status: 'skipped',
+              skipped_reason: 'memory_pressure',
+              patches_count: 0,
+              touched_topics: [],
+              duration_ms: 0,
+            }),
+          );
+        }
+        return {
+          touchedTopics: [],
+          skippedReason: 'memory_pressure' as const,
+          cursor: {
+            sessionId: params.sessionId,
+            updatedAt: (params.now ?? new Date()).toISOString(),
+          },
+        };
+      }
+
       const result = await runAutoMemoryExtract(params);
       const durationMs = Date.now() - t0;
+      const skippedReason = result.skippedReason;
+      const status = skippedReason ? 'skipped' : 'completed';
       this.update(record, {
-        status: result.skippedReason ? 'skipped' : 'completed',
+        status,
         progressText:
           result.systemMessage ??
-          (result.touchedTopics.length > 0
-            ? `Managed auto-memory updated: ${result.touchedTopics.join(', ')}.`
-            : 'Managed auto-memory extraction completed without durable changes.'),
+          (skippedReason
+            ? `Skipped: ${skippedReason.replaceAll('_', ' ')}.`
+            : result.touchedTopics.length > 0
+              ? `Managed auto-memory updated: ${result.touchedTopics.join(', ')}.`
+              : 'Managed auto-memory extraction completed without durable changes.'),
         metadata: {
           touchedTopics: result.touchedTopics,
           processedOffset: result.cursor.processedOffset,
-          skippedReason: result.skippedReason,
+          skippedReason,
         },
       });
       if (params.config) {
@@ -702,7 +824,8 @@ export class MemoryManager {
           params.config,
           new MemoryExtractEvent({
             trigger: 'auto',
-            status: 'completed',
+            status,
+            ...(skippedReason ? { skipped_reason: skippedReason } : {}),
             patches_count: result.touchedTopics.length,
             touched_topics: result.touchedTopics,
             duration_ms: durationMs,
@@ -804,7 +927,27 @@ export class MemoryManager {
     params: ScheduleSkillReviewParams,
   ): Promise<MemoryTaskRecord> {
     this.skillReviewInFlightByProject.set(params.projectRoot, record.id);
+
     try {
+      // Memory-pressure gate — inside try so finally always cleans up
+      // the skillReviewInFlightByProject entry.
+      if (this.isUnderMemoryPressure(params.config)) {
+        this.update(record, {
+          status: 'skipped',
+          progressText: 'Skipped: memory pressure too high.',
+          metadata: { skippedReason: 'memory_pressure' },
+        });
+        debugLogger.warn('Skipping skill review: memory pressure too high.');
+        return record;
+      }
+
+      // Snapshot existing skill dirs BEFORE the agent runs so staging can tell
+      // newly-created skills from in-place edits of already-confirmed ones
+      // (only new skills should enter the confirmation flow).
+      const preExistingSkillDirs = params.confirmBeforePersist
+        ? new Set(await listExistingSkillDirNames(params.projectRoot))
+        : undefined;
+
       const result = await runSkillReviewByAgent({
         config: params.config!,
         projectRoot: params.projectRoot,
@@ -812,13 +955,35 @@ export class MemoryManager {
         maxTurns: params.maxTurns,
         timeoutMs: params.timeoutMs,
       });
-      this.update(record, {
-        status: 'completed',
-        progressText:
-          result.systemMessage ??
-          'Managed skill review completed without durable changes.',
-        metadata: { touchedSkillFiles: result.touchedSkillFiles },
-      });
+
+      if (params.confirmBeforePersist && result.touchedSkillFiles.length > 0) {
+        const pending = await stageSkillDirs(
+          result.touchedSkillFiles,
+          params.projectRoot,
+          preExistingSkillDirs,
+          record.id,
+        );
+        this.update(record, {
+          status: 'completed',
+          progressText:
+            pending.length > 0
+              ? `${pending.length} skill(s) awaiting review.`
+              : (result.systemMessage ??
+                'Managed skill review completed without durable changes.'),
+          metadata: {
+            touchedSkillFiles: result.touchedSkillFiles,
+            ...(pending.length > 0 ? { pendingSkills: pending } : {}),
+          },
+        });
+      } else {
+        this.update(record, {
+          status: 'completed',
+          progressText:
+            result.systemMessage ??
+            'Managed skill review completed without durable changes.',
+          metadata: { touchedSkillFiles: result.touchedSkillFiles },
+        });
+      }
     } catch (error) {
       this.update(record, {
         status: 'failed',
@@ -848,6 +1013,14 @@ export class MemoryManager {
     // failed dream entry in the bg-tasks dialog.
     if (!params.config || !params.config.getManagedAutoDreamEnabled()) {
       return { status: 'skipped', skippedReason: 'disabled' };
+    }
+
+    // Also skip dream under memory pressure — dream does its own
+    // structuredClone of full history, and shouldn't add extra pressure
+    // when the heap is already under hard/critical load.
+    if (this.isUnderMemoryPressure(params.config)) {
+      debugLogger.warn('Skipping dream: memory pressure too high.');
+      return { status: 'skipped', skippedReason: 'memory_pressure' };
     }
 
     const now = params.now ?? new Date();
@@ -960,6 +1133,66 @@ export class MemoryManager {
    */
   getTask(taskId: string): MemoryTaskRecord | undefined {
     return this.tasks.get(taskId);
+  }
+
+  /** Promote one staged skill (by dir name) for the given skill-review task. */
+  async acceptPendingSkillFromTask(
+    taskId: string,
+    skillName: string,
+  ): Promise<void> {
+    await this.resolvePendingSkill(taskId, skillName, 'accept');
+  }
+
+  /** Discard one staged skill (by dir name) for the given skill-review task. */
+  async rejectPendingSkillFromTask(
+    taskId: string,
+    skillName: string,
+  ): Promise<void> {
+    await this.resolvePendingSkill(taskId, skillName, 'reject');
+  }
+
+  private async resolvePendingSkill(
+    taskId: string,
+    skillName: string,
+    action: 'accept' | 'reject',
+  ): Promise<void> {
+    const record = this.tasks.get(taskId);
+    if (!record) {
+      debugLogger.warn(`Cannot resolve pending skill: no task ${taskId}.`);
+      return;
+    }
+    const target = (
+      (record.metadata?.['pendingSkills'] as PendingSkill[]) ?? []
+    ).find((p) => p.name === skillName);
+    if (!target) {
+      debugLogger.warn(
+        `Cannot resolve pending skill "${skillName}": not pending on task ${taskId}.`,
+      );
+      return;
+    }
+    try {
+      if (action === 'accept') {
+        await acceptPendingSkill(target);
+      } else {
+        await rejectPendingSkill(target);
+      }
+    } catch (error) {
+      // Leave the skill in pendingSkills so the user can retry, and surface the
+      // failure instead of silently dropping it.
+      debugLogger.warn(
+        `Failed to ${action} pending skill "${skillName}": ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      throw error;
+    }
+    // Re-read pendingSkills AFTER the await: concurrent Keep-all/Discard-all
+    // calls each remove only their own entry. read+filter+update runs with no
+    // intervening await, so it is atomic under the single-threaded event loop.
+    const remaining = (
+      (record.metadata?.['pendingSkills'] as PendingSkill[]) ?? []
+    ).filter((p) => p.name !== skillName);
+    this.update(record, { metadata: { pendingSkills: remaining } });
   }
 
   /**
@@ -1209,7 +1442,12 @@ export class MemoryManager {
   selectForgetCandidates(
     projectRoot: string,
     query: string,
-    options: { config?: Config; limit?: number } = {},
+    options: {
+      config?: Config;
+      limit?: number;
+      abortSignal?: AbortSignal;
+      scope?: AutoMemoryStorageScope;
+    } = {},
   ): Promise<AutoMemoryForgetSelectionResult> {
     return selectManagedAutoMemoryForgetCandidates(projectRoot, query, options);
   }
@@ -1219,15 +1457,20 @@ export class MemoryManager {
     projectRoot: string,
     matches: AutoMemoryForgetMatch[],
     now?: Date,
+    options: { abortSignal?: AbortSignal } = {},
   ): Promise<AutoMemoryForgetResult> {
-    return forgetManagedAutoMemoryMatches(projectRoot, matches, now);
+    return forgetManagedAutoMemoryMatches(projectRoot, matches, now, options);
   }
 
   /** Convenience: select + remove in a single call. */
   forget(
     projectRoot: string,
     query: string,
-    options: { config?: Config } = {},
+    options: {
+      config?: Config;
+      abortSignal?: AbortSignal;
+      scope?: AutoMemoryStorageScope;
+    } = {},
     now?: Date,
   ): Promise<AutoMemoryForgetResult> {
     return forgetManagedAutoMemoryEntries(projectRoot, query, options, now);
@@ -1240,18 +1483,29 @@ export class MemoryManager {
     return getManagedAutoMemoryStatus(projectRoot, this);
   }
 
-  // ─── Prompt append ────────────────────────────────────────────────────────────
+  // ─── Prompt build ─────────────────────────────────────────────────────────────
 
-  /** Append the managed auto-memory section to a user memory string. */
-  appendToUserMemory(
-    userMemory: string,
+  /**
+   * Build the managed auto-memory section of the system prompt. This is the
+   * volatile prompt layer — it is rewritten in-session on every memory save,
+   * so callers must keep it after the stable/context layers. When
+   * `userSection` is provided, the prompt teaches the model to route saves
+   * between the project dir and the user (cross-project) dir using the
+   * per-type scope guidance.
+   */
+  buildAutoMemoryPrompt(
     memoryDir: string,
     indexContent?: string | null,
+    userSection?: UserAutoMemorySection,
+    teamSection?: TeamAutoMemorySection,
+    options?: BuildMemoryPromptOptions,
   ): string {
-    return appendManagedAutoMemoryToUserMemory(
-      userMemory,
+    return buildManagedAutoMemoryPrompt(
       memoryDir,
       indexContent,
+      userSection,
+      teamSection,
+      options,
     );
   }
 

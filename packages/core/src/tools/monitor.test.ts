@@ -9,8 +9,28 @@ import { EventEmitter } from 'node:events';
 import type { Readable } from 'node:stream';
 import type { ChildProcess } from 'node:child_process';
 
+const mockOsPlatform = vi.hoisted(() =>
+  vi.fn<() => NodeJS.Platform>(() => 'linux'),
+);
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+
+  return {
+    ...actual,
+    default: {
+      ...actual,
+      platform: mockOsPlatform,
+    },
+    platform: mockOsPlatform,
+  };
+});
+
 // Mock child_process.spawn
 const mockSpawn = vi.hoisted(() => vi.fn());
+const mockRuntimeShell = vi.hoisted(() => vi.fn());
+vi.mock('../sandbox/runtime-shell.js', () => ({
+  executeRuntimeShell: mockRuntimeShell,
+}));
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
 
@@ -118,12 +138,16 @@ vi.mock('../utils/shell-utils.js', async (importOriginal) => {
 const mockIsShellCommandReadOnlyAST = vi.hoisted(() => vi.fn());
 const mockExtractCommandRules = vi.hoisted(() => vi.fn());
 vi.mock('../utils/shellAstParser.js', () => ({
-  isShellCommandReadOnlyAST: mockIsShellCommandReadOnlyAST,
+  isShellCommandReadOnlyASTInDirectory: mockIsShellCommandReadOnlyAST,
   extractCommandRules: mockExtractCommandRules,
 }));
 
 import { MonitorTool, sanitizeMonitorLine } from './monitor.js';
 import type { Config } from '../config/config.js';
+import type {
+  ShellExecutionResult,
+  ShellOutputEvent,
+} from '../services/shellExecutionService.js';
 import { MonitorRegistry } from '../services/monitorRegistry.js';
 import type { ToolCallConfirmationDetails } from './tools.js';
 import { runWithAgentContext } from '../agents/runtime/agent-context.js';
@@ -175,9 +199,18 @@ describe('MonitorTool', () => {
   let monitorRegistry: MonitorRegistry;
   let mockChild: ReturnType<typeof createMockChild>;
   let mockIsPathWithinWorkspace: ReturnType<typeof vi.fn>;
+  let originalPager: string | undefined;
+  let originalGitPager: string | undefined;
 
   beforeEach(() => {
+    originalPager = process.env['PAGER'];
+    originalGitPager = process.env['GIT_PAGER'];
+    delete process.env['PAGER'];
+    delete process.env['GIT_PAGER'];
+
     vi.clearAllMocks();
+    mockRuntimeShell.mockReset();
+    mockOsPlatform.mockReturnValue('linux');
 
     monitorRegistry = new MonitorRegistry();
     mockIsPathWithinWorkspace = vi.fn().mockReturnValue(true);
@@ -189,12 +222,14 @@ describe('MonitorTool', () => {
 
     mockConfig = {
       getTargetDir: vi.fn().mockReturnValue('/test/dir'),
+      getShellExecutionSandbox: vi.fn().mockReturnValue(undefined),
       getMonitorRegistry: vi.fn().mockReturnValue(monitorRegistry),
       getPermissionManager: vi.fn().mockReturnValue(undefined),
       getWorkspaceContext: vi.fn().mockReturnValue({
         isPathWithinWorkspace: mockIsPathWithinWorkspace,
       }),
       getSessionId: vi.fn().mockReturnValue('test-session-id'),
+      getShellExecutionConfig: vi.fn().mockReturnValue({}),
       storage: {
         getUserSkillsDirs: vi
           .fn()
@@ -211,6 +246,18 @@ describe('MonitorTool', () => {
 
   afterEach(() => {
     monitorRegistry.abortAll();
+
+    if (originalPager === undefined) {
+      delete process.env['PAGER'];
+    } else {
+      process.env['PAGER'] = originalPager;
+    }
+
+    if (originalGitPager === undefined) {
+      delete process.env['GIT_PAGER'];
+    } else {
+      process.env['GIT_PAGER'] = originalGitPager;
+    }
   });
 
   // Helper to access protected validateToolParamValues
@@ -237,6 +284,138 @@ describe('MonitorTool', () => {
         };
       }
     ).createInvocation(params);
+
+  describe('tool execution sandbox', () => {
+    beforeEach(() => {
+      vi.mocked(mockConfig.getShellExecutionSandbox).mockReturnValue(
+        {} as NonNullable<ReturnType<Config['getShellExecutionSandbox']>>,
+      );
+    });
+
+    it('streams stdout and stderr independently and settles the existing registry', async () => {
+      let output!: (event: ShellOutputEvent) => void;
+      let signal!: AbortSignal;
+      let finish!: (result: ShellExecutionResult) => void;
+      const result = new Promise<ShellExecutionResult>((resolve) => {
+        finish = resolve;
+      });
+      mockRuntimeShell.mockImplementation(
+        async (_config, _command, _cwd, onOutput, abortSignal) => {
+          output = onOutput;
+          signal = abortSignal;
+          return { pid: 9876, result };
+        },
+      );
+      const emit = vi.spyOn(monitorRegistry, 'emitEvent');
+      const turn = new AbortController();
+      await createInvocation({ command: 'watch command' }).execute(turn.signal);
+      expect(mockSpawn).not.toHaveBeenCalled();
+      expect(mockRuntimeShell).toHaveBeenCalledWith(
+        mockConfig,
+        'watch command',
+        '/test/dir',
+        expect.any(Function),
+        expect.any(AbortSignal),
+        false,
+        { maxBufferedOutputBytes: 4096 },
+        { streamStdout: true },
+      );
+      const entry = monitorRegistry.getRunning()[0]!;
+      expect(entry.pid).toBe(9876);
+      turn.abort();
+      expect(signal.aborted).toBe(false);
+      output({ type: 'data', chunk: 'out', stream: 'stdout' });
+      output({ type: 'data', chunk: 'err\n', stream: 'stderr' });
+      output({ type: 'data', chunk: 'put\nlast', stream: 'stdout' });
+      finish({ exitCode: 0, signal: null } as ShellExecutionResult);
+      await result;
+      await Promise.resolve();
+      expect(emit.mock.calls.map((call) => call[1])).toEqual([
+        'err',
+        'output',
+        'last',
+      ]);
+      expect(entry.status).toBe('completed');
+    });
+
+    it('fails and stops a sandboxed monitor after binary output', async () => {
+      let output!: (event: ShellOutputEvent) => void;
+      let signal!: AbortSignal;
+      mockRuntimeShell.mockImplementation(
+        async (_config, _command, _cwd, onOutput, abortSignal) => {
+          output = onOutput;
+          signal = abortSignal;
+          return { result: new Promise(() => {}) };
+        },
+      );
+      await createInvocation({ command: 'watch command' }).execute(
+        new AbortController().signal,
+      );
+      const entry = monitorRegistry.getRunning()[0]!;
+      output({ type: 'binary_detected' });
+      expect(entry.status).toBe('failed');
+      expect(signal.aborted).toBe(true);
+    });
+
+    it('fails an unconfirmed sandbox completion', async () => {
+      mockRuntimeShell.mockResolvedValue({
+        result: Promise.resolve({
+          error: new Error('Sandbox termination is unconfirmed'),
+          exitCode: 0,
+          signal: null,
+        }),
+      });
+      await createInvocation({ command: 'watch command' }).execute(
+        new AbortController().signal,
+      );
+      await Promise.resolve();
+      expect(monitorRegistry.getAll()[0]?.status).toBe('failed');
+    });
+
+    it('stops through the monitor abort controller without replaying on the host', async () => {
+      let signal!: AbortSignal;
+      mockRuntimeShell.mockImplementation(
+        async (_config, _command, _cwd, _output, abortSignal) => {
+          signal = abortSignal;
+          return { result: new Promise(() => {}) };
+        },
+      );
+      await createInvocation({ command: 'watch command' }).execute(
+        new AbortController().signal,
+      );
+      monitorRegistry.cancel(monitorRegistry.getRunning()[0]!.monitorId);
+      expect(signal.aborted).toBe(true);
+      expect(mockSpawn).not.toHaveBeenCalled();
+    });
+
+    it('fails setup without falling back to a host process', async () => {
+      mockRuntimeShell.mockRejectedValue(new Error('sandbox unavailable'));
+      const result = await createInvocation({
+        command: 'watch command',
+      }).execute(new AbortController().signal);
+      expect(result.llmContent).toContain('sandbox unavailable');
+      expect(monitorRegistry.getRunning()).toEqual([]);
+      expect(mockSpawn).not.toHaveBeenCalled();
+    });
+
+    it('does not run host AST permission probes', async () => {
+      const invocation = createInvocation({ command: 'git status' });
+      expect(await invocation.getDefaultPermission()).toBe('ask');
+      await invocation.getConfirmationDetails(new AbortController().signal);
+      expect(mockIsShellCommandReadOnlyAST).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('schema', () => {
+    it('declares monitor limits as integers', () => {
+      const schema = monitorTool.schema.parametersJsonSchema as {
+        properties?: Record<string, { type?: string }>;
+      };
+
+      expect(schema.properties?.['max_events']?.type).toBe('integer');
+      expect(schema.properties?.['idle_timeout_ms']?.type).toBe('integer');
+    });
+  });
 
   describe('confirmation details', () => {
     it('includes command-scoped permission rules for monitor commands', async () => {
@@ -416,44 +595,49 @@ describe('MonitorTool', () => {
   });
 
   describe('getDefaultPermission', () => {
-    it('denies command substitution before confirmation', async () => {
+    // Command substitution previously returned 'deny' here. Per #4093 it
+    // now falls through to 'ask' (matching ShellToolInvocation and
+    // PermissionManager.resolveDefaultPermission); the substitution
+    // warning is surfaced via getConfirmationDetails. YOLO mode can now
+    // override the prompt; before this change it could not.
+    it('asks for command substitution before confirmation', async () => {
       const invocation = createInvocation({
         command: 'echo $(cat secret.txt)',
       });
 
-      await expect(invocation.getDefaultPermission()).resolves.toBe('deny');
+      await expect(invocation.getDefaultPermission()).resolves.toBe('ask');
     });
 
-    it('denies command substitution inside explicit shell wrappers', async () => {
+    it('asks for command substitution inside explicit shell wrappers', async () => {
       const invocation = createInvocation({
         command: `/bin/bash -c 'echo $(cat secret.txt)'`,
       });
 
-      await expect(invocation.getDefaultPermission()).resolves.toBe('deny');
+      await expect(invocation.getDefaultPermission()).resolves.toBe('ask');
     });
 
-    it('denies command substitution inside wrapped scripts with argv suffixes', async () => {
+    it('asks for command substitution inside wrapped scripts with argv suffixes', async () => {
       const invocation = createInvocation({
         command: `/bin/bash -c 'echo $(cat secret.txt)' ignored`,
       });
 
-      await expect(invocation.getDefaultPermission()).resolves.toBe('deny');
+      await expect(invocation.getDefaultPermission()).resolves.toBe('ask');
     });
 
-    it('denies command substitution inside quoted env-prefixed wrappers', async () => {
+    it('asks for command substitution inside quoted env-prefixed wrappers', async () => {
       const invocation = createInvocation({
         command: `FOO="bar baz" /bin/bash -c 'echo $(cat secret.txt)'`,
       });
 
-      await expect(invocation.getDefaultPermission()).resolves.toBe('deny');
+      await expect(invocation.getDefaultPermission()).resolves.toBe('ask');
     });
 
-    it('denies command substitution inside env-prefix assignments', async () => {
+    it('asks for command substitution inside env-prefix assignments', async () => {
       const invocation = createInvocation({
         command: `FOO=$(cat secret.txt) /bin/bash -c 'echo ok'`,
       });
 
-      await expect(invocation.getDefaultPermission()).resolves.toBe('deny');
+      await expect(invocation.getDefaultPermission()).resolves.toBe('ask');
     });
 
     it('allows read-only monitor commands by default', async () => {
@@ -463,6 +647,17 @@ describe('MonitorTool', () => {
       });
 
       await expect(invocation.getDefaultPermission()).resolves.toBe('allow');
+    });
+
+    it('surfaces a command-substitution warning via getConfirmationDetails (issue #4093)', async () => {
+      const invocation = createInvocation({
+        command: 'echo $(cat secret.txt)',
+      });
+      const details = (await invocation.getConfirmationDetails(
+        new AbortController().signal,
+      )) as { warnings?: string[] };
+
+      expect(details.warnings?.[0]).toMatch(/command substitution/i);
     });
   });
 
@@ -483,6 +678,12 @@ describe('MonitorTool', () => {
       );
     });
 
+    it('rejects fractional max_events', () => {
+      expect(validate({ command: 'tail -f log', max_events: 1.5 })).toBe(
+        'max_events must be a positive integer.',
+      );
+    });
+
     it('rejects max_events over limit', () => {
       expect(validate({ command: 'tail -f log', max_events: 20000 })).toBe(
         'max_events cannot exceed 10000.',
@@ -491,6 +692,12 @@ describe('MonitorTool', () => {
 
     it('rejects invalid idle_timeout_ms', () => {
       expect(validate({ command: 'tail -f log', idle_timeout_ms: -100 })).toBe(
+        'idle_timeout_ms must be a positive integer.',
+      );
+    });
+
+    it('rejects fractional idle_timeout_ms', () => {
+      expect(validate({ command: 'tail -f log', idle_timeout_ms: 500.5 })).toBe(
         'idle_timeout_ms must be a positive integer.',
       );
     });
@@ -614,6 +821,92 @@ describe('MonitorTool', () => {
       expect(result.llmContent).toContain('Monitor started');
       expect(result.llmContent).toContain('mon_');
       expect(result.returnDisplay).toContain('watch app logs');
+    });
+
+    it('uses default pager env for spawned processes when pager is unset', async () => {
+      const invocation = createInvocation({
+        command: 'tail -f /var/log/app.log',
+      });
+
+      await invocation.execute(new AbortController().signal);
+
+      const spawnOptions = mockSpawn.mock.calls[0][2];
+      expect(spawnOptions.env['PAGER']).toBe('cat');
+      expect(spawnOptions.env['GIT_PAGER']).toBeUndefined();
+    });
+
+    it('preserves inherited git pager values for spawned processes', async () => {
+      process.env['GIT_PAGER'] = 'delta';
+      const invocation = createInvocation({
+        command: 'git log --oneline',
+      });
+
+      await invocation.execute(new AbortController().signal);
+
+      const spawnOptions = mockSpawn.mock.calls[0][2];
+      expect(spawnOptions.env['PAGER']).toBe('cat');
+      expect(spawnOptions.env['GIT_PAGER']).toBe('delta');
+    });
+
+    it('does not inject Unix pager defaults into Windows monitor env when unset', async () => {
+      mockOsPlatform.mockReturnValue('win32');
+      const invocation = createInvocation({
+        command: 'tail -f /var/log/app.log',
+      });
+
+      await invocation.execute(new AbortController().signal);
+
+      const spawnOptions = mockSpawn.mock.calls[0][2];
+      expect(spawnOptions.env['PAGER']).toBe('');
+      expect(spawnOptions.env['GIT_PAGER']).toBeUndefined();
+    });
+
+    it('propagates explicit pager configuration to spawned processes', async () => {
+      vi.mocked(mockConfig.getShellExecutionConfig).mockReturnValue({
+        pager: 'more',
+      });
+      const invocation = createInvocation({
+        command: 'tail -f /var/log/app.log',
+      });
+
+      await invocation.execute(new AbortController().signal);
+
+      const spawnOptions = mockSpawn.mock.calls[0][2];
+      expect(spawnOptions.env['PAGER']).toBe('more');
+      expect(spawnOptions.env['GIT_PAGER']).toBeUndefined();
+    });
+
+    it('strips Qwen-internal daemon secrets from the monitor child env (#6601)', async () => {
+      const originalServerToken = process.env['QWEN_SERVER_TOKEN'];
+      const originalDaemonToken = process.env['QWEN_DAEMON_TOKEN'];
+      process.env['QWEN_SERVER_TOKEN'] = 'serve-secret';
+      process.env['QWEN_DAEMON_TOKEN'] = 'daemon-secret';
+      try {
+        const invocation = createInvocation({
+          command: 'tail -f /var/log/app.log',
+        });
+
+        await invocation.execute(new AbortController().signal);
+
+        const spawnOptions = mockSpawn.mock.calls[0][2];
+        // Internal daemon secrets must not leak into an agent-run monitor.
+        expect(spawnOptions.env['QWEN_SERVER_TOKEN']).toBeUndefined();
+        expect(spawnOptions.env['QWEN_DAEMON_TOKEN']).toBeUndefined();
+        // Benign inherited env is preserved and the monitor marker still applied.
+        expect(spawnOptions.env['PATH']).toBeDefined();
+        expect(spawnOptions.env['QWEN_CODE']).toBe('1');
+      } finally {
+        if (originalServerToken === undefined) {
+          delete process.env['QWEN_SERVER_TOKEN'];
+        } else {
+          process.env['QWEN_SERVER_TOKEN'] = originalServerToken;
+        }
+        if (originalDaemonToken === undefined) {
+          delete process.env['QWEN_DAEMON_TOKEN'];
+        } else {
+          process.env['QWEN_DAEMON_TOKEN'] = originalDaemonToken;
+        }
+      }
     });
 
     it('does not spawn when the turn signal is already aborted', async () => {

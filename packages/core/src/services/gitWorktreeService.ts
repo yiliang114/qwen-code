@@ -4,18 +4,24 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import nodeFs from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes, randomInt } from 'node:crypto';
-import { execSync } from 'node:child_process';
-import { simpleGit, CheckRepoActions } from 'simple-git';
+import { execFile, execSync } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 import type { SimpleGit } from 'simple-git';
 import { Storage } from '../config/storage.js';
 import { isCommandAvailable } from '../utils/shell-utils.js';
 import { isNodeError } from '../utils/errors.js';
 import { createDebugLogger } from '../utils/debugLogger.js';
-import { fileExists } from '../utils/fileUtils.js';
+import { fileExists, isWithinRoot } from '../utils/fileUtils.js';
+import { NO_EXEC_CONFIG } from '../utils/gitUtils.js';
+import { loadSimpleGit } from '../utils/load-simple-git.js';
 import { initRepositoryWithMainBranch } from './gitInit.js';
+import { atomicWriteFile } from '../utils/atomicFileWrite.js';
 
 const debugLogger = createDebugLogger('GIT_WORKTREE_SERVICE');
 
@@ -31,10 +37,80 @@ export function worktreeBranchForSlug(slug: string): string {
  * Filename of the in-worktree session marker. Created at worktree
  * provisioning time and consulted by `exit_worktree` to decide
  * whether the current session is allowed to drop the worktree. The
- * file lives outside the working tree (it is .gitignored as part of
- * `.qwen/worktrees/.gitignore`) so it cannot leak into commits.
+ * file is kept out of commits via the repository's common
+ * `.git/info/exclude` (see `addWorktreeSessionMarkerExclude`).
  */
 export const WORKTREE_SESSION_FILE = '.qwen-session';
+
+const WORKTREE_SESSION_MARKER_MAX_BYTES = 512;
+
+/**
+ * Diff flags that stop the tree being diffed from choosing the program that
+ * renders it.
+ *
+ * A `.gitattributes` binding a `diff=<name>` driver travels with a tree
+ * obtained as files, and the `diff.<name>.textconv` or `diff.external` that
+ * goes with it was measured running through these very calls. They also keep
+ * the patch appliable, since a converted blob is no longer the pre-image
+ * `git apply` expects. `core.fsmonitor` is handled for every client in
+ * `loadSimpleGit`.
+ */
+const NO_EXEC_DIFF_FLAGS = ['--no-ext-diff', '--no-textconv'] as const;
+
+export type StrictWorktreeSessionMarker =
+  | { state: 'missing' }
+  | {
+      state: 'valid';
+      sessionId: string;
+      /**
+       * Owning uid of the marker inode, or null when the process cannot
+       * compare uids (no `geteuid`, e.g. Windows). Ownership-transfer
+       * flows refuse a foreign-uid marker where the identity is available
+       * instead of riding the ownership-preserving in-place write path.
+       */
+      uid: number | null;
+      /** Inode identity pinned across the no-follow read. */
+      dev: number;
+      ino: number;
+    }
+  | { state: 'invalid'; reason: string };
+
+async function addWorktreeSessionMarkerExclude(
+  worktreePath: string,
+): Promise<void> {
+  try {
+    const { simpleGit } = await loadSimpleGit();
+    const wtGit = simpleGit(worktreePath);
+    const commonDir = (await wtGit.revparse(['--git-common-dir'])).trim();
+    const excludePath = path.isAbsolute(commonDir)
+      ? path.join(commonDir, 'info', 'exclude')
+      : path.join(worktreePath, commonDir, 'info', 'exclude');
+    await fs.mkdir(path.dirname(excludePath), { recursive: true });
+    let existing = '';
+    try {
+      existing = await fs.readFile(excludePath, 'utf8');
+    } catch {
+      // File missing — fall through to fresh write.
+    }
+    // The second rule covers the sibling temp file `atomicWriteFile` stages
+    // next to the marker during an ownership transfer
+    // (`<worktree>/.qwen-session.<hex>.tmp`). It lands in the main checkout's
+    // shared exclude too — accepted: the pattern is name-scoped.
+    const rules = [WORKTREE_SESSION_FILE, `${WORKTREE_SESSION_FILE}.*.tmp`];
+    let next = existing;
+    for (const rule of rules) {
+      if (!next.split(/\r?\n/).includes(rule)) {
+        const sep = next.length === 0 || next.endsWith('\n') ? '' : '\n';
+        next = `${next}${sep}${rule}\n`;
+      }
+    }
+    if (next !== existing) {
+      await fs.writeFile(excludePath, next, 'utf8');
+    }
+  } catch {
+    // The marker remains authoritative when the ignore rule cannot be added.
+  }
+}
 
 /** Writes the owning session id into the worktree's session marker. */
 export async function writeWorktreeSessionMarker(
@@ -50,33 +126,413 @@ export async function writeWorktreeSessionMarker(
   // `git add -A` inside it would otherwise add the session id to its
   // first commit. Write a `.git/info/exclude` rule so the marker is
   // ignored without requiring (or modifying) a tracked `.gitignore`.
-  // `.git` inside a worktree is actually a file pointing at
-  // `<repo>/.git/worktrees/<name>/`, so resolve `--git-dir` instead
-  // of joining naively.
-  try {
-    const wtGit = simpleGit(worktreePath);
-    const gitDir = (await wtGit.revparse(['--git-dir'])).trim();
-    const excludePath = path.isAbsolute(gitDir)
-      ? path.join(gitDir, 'info', 'exclude')
-      : path.join(worktreePath, gitDir, 'info', 'exclude');
-    await fs.mkdir(path.dirname(excludePath), { recursive: true });
-    let existing = '';
-    try {
-      existing = await fs.readFile(excludePath, 'utf8');
-    } catch {
-      // File missing — fall through to fresh write.
-    }
-    const rule = WORKTREE_SESSION_FILE;
-    if (!existing.split(/\r?\n/).includes(rule)) {
-      const sep = existing.length === 0 || existing.endsWith('\n') ? '' : '\n';
-      await fs.writeFile(excludePath, `${existing}${sep}${rule}\n`, 'utf8');
-    }
-  } catch {
-    // Best-effort: if we can't write the exclude rule (read-only fs,
-    // unusual worktree layout), the marker is still functional —
-    // `git add -A` would just stage it. The ownership guard remains
-    // intact either way.
+  // Linked worktrees share ignore rules from the repository's common
+  // `info/exclude`, so resolve `--git-common-dir` instead of the
+  // per-worktree administrative directory returned by `--git-dir`.
+  await addWorktreeSessionMarkerExclude(worktreePath);
+}
+
+/**
+ * The marker is durably committed — staged, fsync'd, identity-verified and
+ * linked into place — but this primitive's own post-commit tail failed. The
+ * commit stands: a caller that compensates on failure must classify this as
+ * "the flip happened" rather than roll back a transfer the marker already
+ * records, and must not clean up a valid marker file. `committedOwner` is the
+ * session id the marker now names.
+ */
+export class WorktreeMarkerCommittedError extends Error {
+  readonly committedOwner: string;
+  constructor(committedOwner: string, options?: { cause?: unknown }) {
+    super(
+      `Worktree session marker committed for ${committedOwner}; the post-commit close failed`,
+      options,
+    );
+    this.name = 'WorktreeMarkerCommittedError';
+    this.committedOwner = committedOwner;
   }
+}
+
+/**
+ * Creates the daemon-owned marker without replacing any existing path.
+ * This is intentionally separate from {@link writeWorktreeSessionMarker},
+ * whose overwrite semantics are required by interactive worktree tools.
+ */
+export async function createWorktreeSessionMarkerExclusive(
+  worktreePath: string,
+  sessionId: string,
+): Promise<void> {
+  assertValidWorktreeSessionMarkerOwner(sessionId);
+  const markerPath = path.join(worktreePath, WORKTREE_SESSION_FILE);
+  // Staged beside the marker so the publishing link stays on one device, and
+  // named for the `.qwen-session.*.tmp` git-exclude rule.
+  const stagedPath = `${markerPath}.${randomBytes(6).toString('hex')}.tmp`;
+  const flags =
+    nodeFs.constants.O_WRONLY |
+    nodeFs.constants.O_CREAT |
+    nodeFs.constants.O_EXCL |
+    (nodeFs.constants.O_NOFOLLOW ?? 0);
+  // `fs.open` with O_EXCL throws before anything is created when a path
+  // already exists, so it stays outside the try: only a failure past this
+  // point has a file of ours to remove.
+  const handle = await fs.open(stagedPath, flags, 0o600);
+  // Captured from the opened handle so the cleanup below can verify the path
+  // still refers to the file this call created before removing it.
+  let stagedDev = 0;
+  let stagedIno = 0;
+  try {
+    const before = await handle.stat();
+    stagedDev = before.dev;
+    stagedIno = before.ino;
+    if (!before.isFile() || before.nlink !== 1 || before.ino === 0) {
+      throw new Error('Worktree session marker has an unsafe identity');
+    }
+    await handle.writeFile(sessionId, 'utf8');
+    await handle.sync();
+    const [after, pathStats] = await Promise.all([
+      handle.stat(),
+      fs.lstat(stagedPath),
+    ]);
+    if (
+      !after.isFile() ||
+      after.nlink !== 1 ||
+      after.size > WORKTREE_SESSION_MARKER_MAX_BYTES ||
+      after.dev !== before.dev ||
+      after.ino !== before.ino ||
+      pathStats.dev !== after.dev ||
+      pathStats.ino !== after.ino
+    ) {
+      throw new Error('Worktree session marker identity changed');
+    }
+    // Publish with a hard link so the marker path first exists once its inode
+    // already holds the owner and is fsync'd. Creating the marker path itself
+    // with O_EXCL and filling it afterwards leaves a crash window holding a
+    // 0-byte marker, which strict reads report as `invalid` — the one state no
+    // recovery path repairs. `link` fails EEXIST when the marker path is
+    // taken, so it is the same compare-and-swap O_EXCL was: a concurrent
+    // create still loses instead of overwriting.
+    await fs.link(stagedPath, markerPath);
+  } catch (error) {
+    await handle.close().catch(() => {});
+    // Remove only the file this call created: on the identity-changed branch
+    // the path already refers to someone else's inode, and unlinking it would
+    // turn a fail-closed detection into a destructive action against the
+    // detected file. Without a captured identity there is nothing to match,
+    // so the rare residue is left for operator cleanup instead. This catch is
+    // reachable only before the publish, so the marker path is never unlinked.
+    if (stagedIno !== 0) {
+      try {
+        const current = await fs.lstat(stagedPath);
+        if (current.dev === stagedDev && current.ino === stagedIno) {
+          await fs.unlink(stagedPath);
+        }
+      } catch {
+        // Path already gone — nothing of ours to remove.
+      }
+    }
+    throw error;
+  }
+  // Post-commit tail: the marker already names `sessionId`, so a failure here
+  // must propagate with the marker intact rather than trigger cleanup of a
+  // valid file. Classified so a caller that compensates on failure cannot read
+  // the committed flip as a pre-flip error and dismantle what the marker now
+  // names. Dropping the staged name belongs to the commit — until it lands the
+  // marker carries nlink 2 and strict reads reject it.
+  try {
+    await fs.unlink(stagedPath);
+    await handle.close();
+  } catch (error) {
+    await handle.close().catch(() => {});
+    throw new WorktreeMarkerCommittedError(sessionId, { cause: error });
+  }
+  await addWorktreeSessionMarkerExclude(worktreePath);
+}
+
+function assertValidWorktreeSessionMarkerOwner(sessionId: string): void {
+  if (
+    sessionId.length === 0 ||
+    Buffer.byteLength(sessionId, 'utf8') > WORKTREE_SESSION_MARKER_MAX_BYTES ||
+    sessionId.trim() !== sessionId
+  ) {
+    throw new Error('Invalid worktree session marker owner');
+  }
+}
+
+/** Strict daemon-only marker read that never collapses corruption into absence. */
+export async function readWorktreeSessionMarkerStrict(
+  worktreePath: string,
+): Promise<StrictWorktreeSessionMarker> {
+  const markerPath = path.join(worktreePath, WORKTREE_SESSION_FILE);
+  let handle: fs.FileHandle | undefined;
+  let observedMarker = false;
+  try {
+    const flags =
+      nodeFs.constants.O_RDONLY |
+      (nodeFs.constants.O_NOFOLLOW ?? 0) |
+      (nodeFs.constants.O_NONBLOCK ?? 0);
+    const before = await fs.lstat(markerPath);
+    observedMarker = true;
+    if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1) {
+      return { state: 'invalid', reason: 'unsafe marker file type' };
+    }
+    if (before.ino === 0 || before.size > WORKTREE_SESSION_MARKER_MAX_BYTES) {
+      return { state: 'invalid', reason: 'unsafe marker size or identity' };
+    }
+    handle = await fs.open(markerPath, flags);
+    const opened = await handle.stat();
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1 ||
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino
+    ) {
+      return {
+        state: 'invalid',
+        reason: 'marker identity changed before read',
+      };
+    }
+    const markerBuffer = Buffer.alloc(WORKTREE_SESSION_MARKER_MAX_BYTES + 1);
+    let bytesRead = 0;
+    while (bytesRead < markerBuffer.length) {
+      const chunk = await handle.read(
+        markerBuffer,
+        bytesRead,
+        markerBuffer.length - bytesRead,
+        bytesRead,
+      );
+      if (chunk.bytesRead === 0) break;
+      bytesRead += chunk.bytesRead;
+    }
+    if (bytesRead > WORKTREE_SESSION_MARKER_MAX_BYTES) {
+      return { state: 'invalid', reason: 'unsafe marker size or identity' };
+    }
+    const raw = markerBuffer.subarray(0, bytesRead).toString('utf8');
+    const after = await handle.stat();
+    const pathStats = await fs.lstat(markerPath);
+    if (
+      !after.isFile() ||
+      after.nlink !== 1 ||
+      after.size !== bytesRead ||
+      after.size > WORKTREE_SESSION_MARKER_MAX_BYTES ||
+      after.dev !== opened.dev ||
+      after.ino !== opened.ino ||
+      !pathStats.isFile() ||
+      pathStats.nlink !== 1 ||
+      pathStats.dev !== after.dev ||
+      pathStats.ino !== after.ino
+    ) {
+      return {
+        state: 'invalid',
+        reason: 'marker identity changed during read',
+      };
+    }
+    const sessionId = raw.trim();
+    if (
+      sessionId.length === 0 ||
+      sessionId !== raw ||
+      Buffer.byteLength(sessionId, 'utf8') > WORKTREE_SESSION_MARKER_MAX_BYTES
+    ) {
+      return { state: 'invalid', reason: 'invalid marker owner' };
+    }
+    return {
+      state: 'valid',
+      sessionId,
+      uid: process.geteuid === undefined ? null : after.uid,
+      dev: after.dev,
+      ino: after.ino,
+    };
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ENOENT') {
+      return observedMarker
+        ? { state: 'invalid', reason: 'marker disappeared during read' }
+        : { state: 'missing' };
+    }
+    return {
+      state: 'invalid',
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+/**
+ * Synchronous twin of {@link readWorktreeSessionMarkerStrict}. Exists for the
+ * `atomicWriteFile` assertCanCommit hook, which must re-verify the marker
+ * synchronously in the same tick as the rename commit.
+ */
+export function readWorktreeSessionMarkerStrictSync(
+  worktreePath: string,
+): StrictWorktreeSessionMarker {
+  const markerPath = path.join(worktreePath, WORKTREE_SESSION_FILE);
+  let fd: number | undefined;
+  let observedMarker = false;
+  try {
+    const flags =
+      nodeFs.constants.O_RDONLY |
+      (nodeFs.constants.O_NOFOLLOW ?? 0) |
+      (nodeFs.constants.O_NONBLOCK ?? 0);
+    const before = nodeFs.lstatSync(markerPath);
+    observedMarker = true;
+    if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1) {
+      return { state: 'invalid', reason: 'unsafe marker file type' };
+    }
+    if (before.ino === 0 || before.size > WORKTREE_SESSION_MARKER_MAX_BYTES) {
+      return { state: 'invalid', reason: 'unsafe marker size or identity' };
+    }
+    fd = nodeFs.openSync(markerPath, flags);
+    const opened = nodeFs.fstatSync(fd);
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1 ||
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino
+    ) {
+      return {
+        state: 'invalid',
+        reason: 'marker identity changed before read',
+      };
+    }
+    const markerBuffer = Buffer.alloc(WORKTREE_SESSION_MARKER_MAX_BYTES + 1);
+    let bytesRead = 0;
+    while (bytesRead < markerBuffer.length) {
+      const chunk = nodeFs.readSync(
+        fd,
+        markerBuffer,
+        bytesRead,
+        markerBuffer.length - bytesRead,
+        bytesRead,
+      );
+      if (chunk === 0) break;
+      bytesRead += chunk;
+    }
+    if (bytesRead > WORKTREE_SESSION_MARKER_MAX_BYTES) {
+      return { state: 'invalid', reason: 'unsafe marker size or identity' };
+    }
+    const raw = markerBuffer.subarray(0, bytesRead).toString('utf8');
+    const after = nodeFs.fstatSync(fd);
+    const pathStats = nodeFs.lstatSync(markerPath);
+    if (
+      !after.isFile() ||
+      after.nlink !== 1 ||
+      after.size !== bytesRead ||
+      after.size > WORKTREE_SESSION_MARKER_MAX_BYTES ||
+      after.dev !== opened.dev ||
+      after.ino !== opened.ino ||
+      !pathStats.isFile() ||
+      pathStats.nlink !== 1 ||
+      pathStats.dev !== after.dev ||
+      pathStats.ino !== after.ino
+    ) {
+      return {
+        state: 'invalid',
+        reason: 'marker identity changed during read',
+      };
+    }
+    const sessionId = raw.trim();
+    if (
+      sessionId.length === 0 ||
+      sessionId !== raw ||
+      Buffer.byteLength(sessionId, 'utf8') > WORKTREE_SESSION_MARKER_MAX_BYTES
+    ) {
+      return { state: 'invalid', reason: 'invalid marker owner' };
+    }
+    return {
+      state: 'valid',
+      sessionId,
+      uid: process.geteuid === undefined ? null : after.uid,
+      dev: after.dev,
+      ino: after.ino,
+    };
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ENOENT') {
+      return observedMarker
+        ? { state: 'invalid', reason: 'marker disappeared during read' }
+        : { state: 'missing' };
+    }
+    return {
+      state: 'invalid',
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    if (fd !== undefined) {
+      try {
+        nodeFs.closeSync(fd);
+      } catch {
+        // Best-effort close; the read result above stands.
+      }
+    }
+  }
+}
+
+/**
+ * Transfer the worktree marker's ownership to a replacement session.
+ *
+ * `expectedOwner` is the session id the opening strict read must find, or
+ * `null` for the missing-marker hatch (caller already proved the sidecar
+ * valid; the marker is re-created by linking a fully staged file into the
+ * path, which fails when a concurrently created marker already occupies it
+ * instead of overwriting it).
+ *
+ * An owned marker is rewritten through `atomicWriteFile` (sibling temp +
+ * fsync + rename) with an `assertCanCommit` hook that re-reads the marker
+ * synchronously and compares owner, dev/ino, and uid against the opening
+ * read — a marker swapped between the read and the commit aborts the write.
+ * Where uid identity is available, a foreign-owned marker is refused outright
+ * rather than rewritten through the ownership-preserving in-place path.
+ *
+ * The missing-marker hatch delegates to
+ * {@link createWorktreeSessionMarkerExclusive}, so a failure after that
+ * create committed surfaces as {@link WorktreeMarkerCommittedError}: the
+ * marker already names `newOwner` and must not be compensated backwards.
+ */
+export async function transferWorktreeSessionMarkerOwner(
+  worktreePath: string,
+  expectedOwner: string | null,
+  newOwner: string,
+): Promise<void> {
+  assertValidWorktreeSessionMarkerOwner(newOwner);
+  if (expectedOwner !== null) {
+    assertValidWorktreeSessionMarkerOwner(expectedOwner);
+    if (expectedOwner === newOwner) {
+      throw new Error('Worktree marker transfer needs a distinct new owner');
+    }
+  }
+  const opening = await readWorktreeSessionMarkerStrict(worktreePath);
+  if (opening.state === 'invalid') {
+    throw new Error(`Worktree marker is invalid: ${opening.reason}`);
+  }
+  if (opening.state === 'missing') {
+    if (expectedOwner !== null) {
+      throw new Error('Worktree marker owner does not match the expectation');
+    }
+    await createWorktreeSessionMarkerExclusive(worktreePath, newOwner);
+    return;
+  }
+  if (opening.sessionId !== expectedOwner) {
+    throw new Error('Worktree marker owner does not match the expectation');
+  }
+  const euid = process.geteuid?.();
+  if (euid !== undefined && opening.uid !== null && opening.uid !== euid) {
+    throw new Error('Worktree marker is owned by a different uid');
+  }
+  const markerPath = path.join(worktreePath, WORKTREE_SESSION_FILE);
+  await atomicWriteFile(markerPath, newOwner, {
+    mode: 0o600,
+    noFollow: true,
+    assertCanCommit: () => {
+      const current = readWorktreeSessionMarkerStrictSync(worktreePath);
+      if (
+        current.state !== 'valid' ||
+        current.sessionId !== opening.sessionId ||
+        current.dev !== opening.dev ||
+        current.ino !== opening.ino ||
+        current.uid !== opening.uid
+      ) {
+        throw new Error('Worktree marker changed during ownership transfer');
+      }
+    },
+  });
+  await addWorktreeSessionMarkerExclude(worktreePath);
 }
 
 /**
@@ -154,6 +610,24 @@ export function generateAgentWorktreeSlug(): string {
   return `${AGENT_WORKTREE_PREFIX}-${hex}`;
 }
 
+/**
+ * Attribute lines a `git worktree list --porcelain` record can carry after
+ * its `worktree <path>` line. Anything else on those lines means the path
+ * above contained a newline and the entry was truncated.
+ */
+function isWorktreeListPorcelainAttribute(line: string): boolean {
+  return (
+    line === 'bare' ||
+    line === 'detached' ||
+    line === 'locked' ||
+    line === 'prunable' ||
+    line.startsWith('HEAD ') ||
+    line.startsWith('branch ') ||
+    line.startsWith('locked ') ||
+    line.startsWith('prunable ')
+  );
+}
+
 export interface WorktreeInfo {
   /** Unique identifier for this worktree */
   id: string;
@@ -217,13 +691,19 @@ interface SessionConfigFile {
  */
 export class GitWorktreeService {
   private sourceRepoPath: string;
-  private git: SimpleGit;
+  private gitPromise: Promise<SimpleGit> | undefined;
   private readonly customBaseDir?: string;
 
   constructor(sourceRepoPath: string, customBaseDir?: string) {
     this.sourceRepoPath = path.resolve(sourceRepoPath);
-    this.git = simpleGit(this.sourceRepoPath);
     this.customBaseDir = customBaseDir;
+  }
+
+  private getGit(): Promise<SimpleGit> {
+    this.gitPromise ??= loadSimpleGit().then(({ simpleGit }) =>
+      simpleGit(this.sourceRepoPath),
+    );
+    return this.gitPromise;
   }
 
   /**
@@ -290,8 +770,15 @@ export class GitWorktreeService {
    */
   async getRepoTopLevel(): Promise<string | null> {
     try {
-      const out = await this.git.revparse(['--show-toplevel']);
-      const top = out.trim();
+      // `raw` rather than `revparse`: the latter trims the output, silently
+      // mutating a path that legitimately carries leading/trailing whitespace
+      // into a different anchor. Strip only the LF terminator — git's stdout
+      // is LF-terminated on every platform, so a trailing CR is path data,
+      // not part of the terminator.
+      const out = await (
+        await this.getGit()
+      ).raw(['rev-parse', '--show-toplevel']);
+      const top = out.replace(/\n$/, '');
       return top.length > 0 ? top : null;
     } catch (error) {
       // Caller falls back to its cwd via `?? cwd`. Log so a corrupt
@@ -306,20 +793,103 @@ export class GitWorktreeService {
   }
 
   /**
+   * Returns the repository's primary working tree path, or `null` when it
+   * cannot be determined. Unlike `getRepoTopLevel()` — which answers
+   * "which worktree is this cwd in" and so names a linked worktree's OWN
+   * root when run inside one — this always resolves the MAIN tree:
+   * `git worktree list --porcelain` lists the primary working tree first
+   * regardless of where in the repository it runs. Callers anchoring a
+   * check at the repository itself (not the current worktree) use this.
+   *
+   * The porcelain format is newline-delimited, so a main-tree path that
+   * itself contains a newline splits across lines and the first entry
+   * truncates. The remainder then appears where a record attribute belongs
+   * — it is not one, which detects most truncations. Not all: a remainder
+   * that is itself attribute-shaped (`detached`, `HEAD …`, …) — or a path
+   * ending right at a newline, whose blank remainder ends the record — still
+   * parses. The parsed anchor is therefore round-trip-validated below:
+   * `rev-parse --git-common-dir` run AT the anchor must agree with this
+   * repository's own common dir, otherwise this method returns `null` and
+   * callers fall back to `getRepoTopLevel()`, whose single-value
+   * `--show-toplevel` answer keeps interior newlines intact. (`--porcelain
+   * -z` would be immune but needs Git >= 2.36.) A truncated anchor is not
+   * merely wrong: it can resolve inside a DIFFERENT repository whose
+   * worktree registry the caller's gate would then consult.
+   */
+  async getMainWorktreePath(): Promise<string | null> {
+    try {
+      const out = await (
+        await this.getGit()
+      ).raw(['worktree', 'list', '--porcelain']);
+      const lines = out.split('\n');
+      // git preserves a path's leading/trailing whitespace verbatim, and a
+      // trim would silently mutate it into a different, wrong anchor. A
+      // trailing CR is path data, not a terminator: git's stdout is
+      // LF-terminated on every platform.
+      const firstLine = lines[0] ?? '';
+      if (!firstLine.startsWith('worktree ')) return null;
+      for (const line of lines.slice(1)) {
+        const attr = line.trim();
+        if (attr === '') break; // blank line ends the first record
+        if (!isWorktreeListPorcelainAttribute(attr)) return null;
+      }
+      const mainPath = firstLine.slice('worktree '.length);
+      if (mainPath.length === 0) return null;
+      // Round-trip validation (see the doc block): `--git-common-dir` answers
+      // `.git` (relative) from a main tree and an absolute path from a linked
+      // worktree, so resolve both sides. realpath both so a symlinked
+      // ancestor on either side (macOS /tmp -> /private/tmp) cannot
+      // manufacture a mismatch. A probe failure at the anchor fails closed.
+      const realpathOr = async (p: string): Promise<string> => {
+        try {
+          return await fs.realpath(p);
+        } catch {
+          return p;
+        }
+      };
+      const { simpleGit } = await loadSimpleGit();
+      const [ourRaw, anchorRaw] = await Promise.all([
+        (await this.getGit()).raw(['rev-parse', '--git-common-dir']),
+        simpleGit(mainPath).raw(['rev-parse', '--git-common-dir']),
+      ]);
+      const ourCommonDir = await realpathOr(
+        path.resolve(this.sourceRepoPath, ourRaw.trim()),
+      );
+      const anchorCommonDir = await realpathOr(
+        path.resolve(mainPath, anchorRaw.trim()),
+      );
+      return ourCommonDir === anchorCommonDir ? mainPath : null;
+    } catch (error) {
+      debugLogger.warn(
+        `getMainWorktreePath failed at ${this.sourceRepoPath}: ${error}`,
+      );
+      return null;
+    }
+  }
+
+  /**
    * Checks if the source path is a git repository.
    */
   async isGitRepository(): Promise<boolean> {
     try {
-      const isRoot = await this.git.checkIsRepo(CheckRepoActions.IS_REPO_ROOT);
-      if (isRoot) {
-        return true;
+      const [git, { CheckRepoActions }] = await Promise.all([
+        this.getGit(),
+        loadSimpleGit(),
+      ]);
+      try {
+        const isRoot = await git.checkIsRepo(CheckRepoActions.IS_REPO_ROOT);
+        if (isRoot) {
+          return true;
+        }
+      } catch {
+        // IS_REPO_ROOT check failed — fall through to the general check
       }
-    } catch {
-      // IS_REPO_ROOT check failed — fall through to the general check
-    }
-    // Not the root (or root check threw) — check if we're inside a git repo
-    try {
-      return await this.git.checkIsRepo();
+      // Not the root (or root check threw) — check if we're inside a git repo
+      try {
+        return await git.checkIsRepo();
+      } catch {
+        return false;
+      }
     } catch {
       return false;
     }
@@ -339,11 +909,12 @@ export class GitWorktreeService {
     }
 
     try {
-      await initRepositoryWithMainBranch(this.git);
+      const git = await this.getGit();
+      await initRepositoryWithMainBranch(git);
 
       // Create initial commit so we can create worktrees
-      await this.git.add('.');
-      await this.git.commit('Initial commit', {
+      await git.add('.');
+      await git.commit('Initial commit', {
         '--allow-empty': null,
       });
 
@@ -360,7 +931,9 @@ export class GitWorktreeService {
    * Gets the current branch name.
    */
   async getCurrentBranch(): Promise<string> {
-    const branch = await this.git.revparse(['--abbrev-ref', 'HEAD']);
+    const branch = await (
+      await this.getGit()
+    ).revparse(['--abbrev-ref', 'HEAD']);
     return branch.trim();
   }
 
@@ -368,8 +941,30 @@ export class GitWorktreeService {
    * Gets the current commit hash.
    */
   async getCurrentCommitHash(): Promise<string> {
-    const hash = await this.git.revparse(['HEAD']);
+    const hash = await (await this.getGit()).revparse(['HEAD']);
     return hash.trim();
+  }
+
+  /**
+   * Resolves a git ref name to a 40-char commit SHA. Returns `null` when
+   * the ref is unknown / unborn / not a commit.
+   *
+   * Used by Phase D-3 to lock in `FETCH_HEAD` immediately after
+   * `fetchPullRequestRef` succeeds, so the SHA passed to
+   * `git worktree add` is immutable against a concurrent `git fetch` from
+   * another process sharing the same repo, AND so `WorktreeExitDialog`'s
+   * `rev-list <originalHeadCommit>..HEAD` counts only THIS session's new
+   * work rather than every commit in the fetched PR.
+   */
+  async resolveRef(ref: string): Promise<string | null> {
+    try {
+      const out = (
+        await (await this.getGit()).raw(['rev-parse', '--verify', ref])
+      ).trim();
+      return /^[0-9a-f]{40}$/.test(out) ? out : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -406,14 +1001,9 @@ export class GitWorktreeService {
       const branchName = `${base}-${shortSession}-${sanitizedName}`;
 
       // Create the worktree with a new branch
-      await this.git.raw([
-        'worktree',
-        'add',
-        '-b',
-        branchName,
-        worktreePath,
-        base,
-      ]);
+      await (
+        await this.getGit()
+      ).raw(['worktree', 'add', '-b', branchName, worktreePath, base]);
 
       const worktree: WorktreeInfo = {
         id: `${sessionId}/${sanitizedName}`,
@@ -515,7 +1105,9 @@ export class GitWorktreeService {
     // untracked files are handled separately below via file copy.
     let dirtyStateSnapshot = '';
     try {
-      dirtyStateSnapshot = (await this.git.stash(['create'])).trim();
+      dirtyStateSnapshot = (
+        await (await this.getGit()).stash(['create'])
+      ).trim();
     } catch {
       // Ignore — proceed without dirty state if stash create fails
     }
@@ -524,11 +1116,9 @@ export class GitWorktreeService {
     // `git ls-files --others --exclude-standard` is read-only and safe.
     let untrackedFiles: string[] = [];
     try {
-      const raw = await this.git.raw([
-        'ls-files',
-        '--others',
-        '--exclude-standard',
-      ]);
+      const raw = await (
+        await this.getGit()
+      ).raw(['ls-files', '--others', '--exclude-standard']);
       untrackedFiles = raw.trim().split('\n').filter(Boolean);
     } catch {
       // Non-fatal: proceed without untracked files
@@ -574,6 +1164,7 @@ export class GitWorktreeService {
     // see the same files the user currently has on disk.
     if (result.success) {
       for (const worktree of result.worktrees) {
+        const { simpleGit } = await loadSimpleGit();
         const wtGit = simpleGit(worktree.path);
 
         // 1. Apply tracked dirty changes (staged + unstaged)
@@ -679,16 +1270,26 @@ export class GitWorktreeService {
   async removeWorktree(
     worktreePath: string,
   ): Promise<{ success: boolean; error?: string }> {
+    let git: SimpleGit;
+    try {
+      git = await this.getGit();
+    } catch (error) {
+      return {
+        success: false,
+        error: `Failed to remove worktree: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      };
+    }
+
     try {
       // Remove the worktree from git
-      await this.git.raw(['worktree', 'remove', worktreePath, '--force']);
+      await git.raw(['worktree', 'remove', worktreePath, '--force']);
       return { success: true };
     } catch (error) {
       // Try to remove the directory manually if git worktree remove fails
       try {
         await fs.rm(worktreePath, { recursive: true, force: true });
         // Prune worktree references
-        await this.git.raw(['worktree', 'prune']);
+        await git.raw(['worktree', 'prune']);
         return { success: true };
       } catch (_rmError) {
         return {
@@ -749,23 +1350,18 @@ export class GitWorktreeService {
 
     // Clean up branches that belonged to the worktrees
     try {
+      const git = await this.getGit();
       for (const branchName of worktreeBranches) {
         try {
-          await this.git.branch(['-D', branchName]);
+          await git.branch(['-D', branchName]);
           result.removedBranches.push(branchName);
         } catch {
           // Branch might already be deleted, ignore
         }
       }
+      await git.raw(['worktree', 'prune']);
     } catch {
-      // Ignore branch listing/deletion errors
-    }
-
-    // Prune worktree references
-    try {
-      await this.git.raw(['worktree', 'prune']);
-    } catch {
-      // Ignore prune errors
+      // Ignore branch deletion, loader, and prune errors
     }
 
     return result;
@@ -781,16 +1377,15 @@ export class GitWorktreeService {
     worktreePath: string,
     baseBranch?: string,
   ): Promise<string> {
-    const worktreeGit = simpleGit(worktreePath);
-
-    const base =
-      (await this.resolveBaseline(worktreeGit)) ??
-      baseBranch ??
-      (await this.getCurrentBranch());
-
     try {
+      const { simpleGit } = await loadSimpleGit();
+      const worktreeGit = simpleGit(worktreePath);
+      const base =
+        (await this.resolveBaseline(worktreeGit)) ??
+        baseBranch ??
+        (await this.getCurrentBranch());
       return await this.withStagedChanges(worktreeGit, () =>
-        worktreeGit.diff(['--binary', '--cached', base]),
+        worktreeGit.diff([...NO_EXEC_DIFF_FLAGS, '--binary', '--cached', base]),
       );
     } catch (error) {
       return `Error getting diff: ${error instanceof Error ? error.message : 'Unknown error'}`;
@@ -809,10 +1404,11 @@ export class GitWorktreeService {
     targetPath?: string,
   ): Promise<{ success: boolean; error?: string }> {
     const target = targetPath || this.sourceRepoPath;
-    const worktreeGit = simpleGit(worktreePath);
-    const targetGit = simpleGit(target);
 
     try {
+      const { simpleGit } = await loadSimpleGit();
+      const worktreeGit = simpleGit(worktreePath);
+      const targetGit = simpleGit(target);
       // Prefer the baseline commit (created during worktree setup after
       // overlaying dirty state) so the patch excludes pre-existing edits.
       let base = await this.resolveBaseline(worktreeGit);
@@ -827,7 +1423,7 @@ export class GitWorktreeService {
       }
 
       const patch = await this.withStagedChanges(worktreeGit, () =>
-        worktreeGit.diff(['--binary', '--cached', base]),
+        worktreeGit.diff([...NO_EXEC_DIFF_FLAGS, '--binary', '--cached', base]),
       );
 
       if (!patch.trim()) {
@@ -1030,6 +1626,407 @@ export class GitWorktreeService {
   }
 
   /**
+   * Parses a PR reference from a string. Recognised forms:
+   *
+   * - `#123` — shorthand PR number
+   * - `https://github.com/<owner>/<repo>/pull/123` — full GitHub URL
+   *   (any host, any query string, any fragment)
+   *
+   * Returns the parsed PR number on match, `null` otherwise. The slug for
+   * a PR worktree is derived by callers as `pr-<N>` and the branch as
+   * `worktree-pr-<N>` (see `createUserWorktree`).
+   *
+   * Mirrors claude-code's `parsePRReference` (utils/worktree.ts:633) so
+   * cross-CLI muscle memory transfers.
+   */
+  static parsePRReference(input: string): number | null {
+    if (typeof input !== 'string') return null;
+    const trimmed = input.trim();
+
+    // GitHub-style PR URL: https://<host>/owner/repo/pull/<N>
+    // - any host (public github.com or enterprise)
+    // - optional trailing slash, query string, or fragment
+    // - optional sub-path after `/pull/<N>/` (`/files`, `/commits`,
+    //   `/checks`, etc.) — users routinely copy URLs while browsing
+    //   files on a PR, and the PR number is still unambiguous
+    const urlMatch = trimmed.match(
+      /^https?:\/\/[^/]+\/[^/]+\/[^/]+\/pull\/(\d+)(?:\/[^?#]*)?(?:[?#].*)?$/i,
+    );
+    if (urlMatch?.[1]) {
+      const n = parseInt(urlMatch[1], 10);
+      return Number.isSafeInteger(n) && n > 0 ? n : null;
+    }
+
+    // `#N` shorthand. Reject leading zeros (`#0123`) to keep round-trips
+    // unambiguous — `gh pr view 0123` errors out anyway.
+    const hashMatch = trimmed.match(/^#([1-9]\d*)$/);
+    if (hashMatch?.[1]) {
+      const n = parseInt(hashMatch[1], 10);
+      return Number.isSafeInteger(n) && n > 0 ? n : null;
+    }
+
+    return null;
+  }
+
+  /**
+   * Identifies the registered worktree at `worktreePath` as a member of
+   * THIS repository (`sourceRepoPath`). Returns the branch + HEAD commit
+   * SHA on success, or `null` when the path is not a worktree of this
+   * repo.
+   *
+   * Used by Phase D-1's re-attach path: when `--worktree foo` is passed
+   * and `<repoRoot>/.qwen/worktrees/foo` already exists on disk, we
+   * verify it really IS a Qwen-managed worktree of the current repo (not
+   * a standalone `git init` someone dropped at that path) before
+   * assuming it's safe to chdir into. Returning the HEAD SHA in the
+   * same call avoids a second subprocess to recapture it after chdir.
+   *
+   * Implementation — a single `git rev-parse` returning four lines:
+   * 1. `HEAD` → the worktree's HEAD commit SHA (must come BEFORE
+   *    `--abbrev-ref` since the flag sticks for all subsequent refs).
+   * 2. `--abbrev-ref HEAD` → the branch name. A detached HEAD produces
+   *    `HEAD` here, which we treat as "no real branch" and return null
+   *    — the caller's re-attach gate will then refuse, since the
+   *    slug-derived branch couldn't possibly be `HEAD`.
+   * 3. `--git-common-dir` → the common `.git` directory. For a real
+   *    linked worktree of this repo that's `<sourceRepoPath>/.git`;
+   *    for a sibling `git init` it resolves to `<worktreePath>/.git`.
+   *    We compare against this repo's own common-dir to reject the
+   *    latter.
+   * 4. `--show-toplevel` → git's idea of the worktree top. For a real
+   *    linked worktree this equals `worktreePath`; for a plain
+   *    directory living UNDER the main repo (e.g. `mkdir
+   *    <repo>/.qwen/worktrees/foo`) git walks up to the outer `.git`
+   *    and returns the OUTER repo's root — which would otherwise pass
+   *    the common-dir check and let us "re-attach" to a non-worktree
+   *    directory. Compare paths to reject this.
+   */
+  async getRegisteredWorktreeBranch(
+    worktreePath: string,
+  ): Promise<{ branch: string; headCommit: string } | null> {
+    let resolvedWorktreePath: string;
+    try {
+      const stat = await fs.stat(worktreePath);
+      if (!stat.isDirectory()) return null;
+      // `realpath` so macOS /var → /private/var canonicalises before
+      // the toplevel comparison below — otherwise a real worktree
+      // under /var/folders compares unequal to git's `/private/var/…`
+      // answer and we'd reject every legitimate re-attach on macOS.
+      resolvedWorktreePath = await fs.realpath(worktreePath);
+    } catch {
+      return null;
+    }
+
+    // Run the two probes in parallel: this repo's common-dir comes from
+    // the source-repo client, the candidate's HEAD-SHA + branch + common-dir +
+    // toplevel come from a fresh simple-git rooted at `worktreePath`
+    // via a single combined rev-parse.
+    let ourCommonDir: string;
+    let headCommit: string;
+    let branch: string;
+    let probeCommonDir: string;
+    let probeToplevel: string;
+    try {
+      const { simpleGit } = await loadSimpleGit();
+      const probeGit = simpleGit(worktreePath);
+      const [ourRaw, probeRaw] = await Promise.all([
+        (await this.getGit()).raw(['rev-parse', '--git-common-dir']),
+        probeGit.raw([
+          'rev-parse',
+          'HEAD',
+          '--abbrev-ref',
+          'HEAD',
+          '--git-common-dir',
+          '--show-toplevel',
+        ]),
+      ]);
+      ourCommonDir = path.resolve(this.sourceRepoPath, ourRaw.trim());
+      const lines = probeRaw
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0);
+      if (lines.length < 4) return null;
+      headCommit = lines[0]!;
+      branch = lines[1]!;
+      probeCommonDir = path.resolve(worktreePath, lines[2]!);
+      probeToplevel = path.resolve(lines[3]!);
+    } catch (error) {
+      debugLogger.debug(
+        `getRegisteredWorktreeBranch: probe at ${worktreePath} failed: ${error}`,
+      );
+      return null;
+    }
+
+    if (probeCommonDir !== ourCommonDir) {
+      debugLogger.debug(
+        `getRegisteredWorktreeBranch: ${worktreePath} belongs to a different repo (common-dir=${probeCommonDir}, expected ${ourCommonDir})`,
+      );
+      return null;
+    }
+    if (probeToplevel !== resolvedWorktreePath) {
+      // Plain directory under the main repo — git walked up and
+      // returned the outer repo's toplevel. Refuse to treat as a
+      // worktree.
+      debugLogger.debug(
+        `getRegisteredWorktreeBranch: ${worktreePath} is not a registered worktree (toplevel=${probeToplevel}, expected ${resolvedWorktreePath})`,
+      );
+      return null;
+    }
+    if (!branch || branch === 'HEAD') return null;
+    return { branch, headCommit };
+  }
+
+  /**
+   * Returns true when `worktreePath` is a REGISTERED linked worktree of this
+   * repository — i.e. git's own registry entry for it points back at exactly
+   * this path — and it is not the repository's primary working tree.
+   *
+   * Two complementary checks, because neither alone suffices:
+   *
+   * 1. **Registry** (repo side): some `<commonDir>/worktrees/<name>/gitdir`
+   *    must name this path. Everything read here belongs to the repository, so
+   *    a candidate cannot forge it — fabricating `<target>/.git` and the git
+   *    dir it points at (with its own `commondir`/`gitdir`) only controls
+   *    candidate-side files, which are never consulted. This also rejects the
+   *    primary working tree, which has no `worktrees/<name>` entry, along with
+   *    other repositories' worktrees and a directory carrying a `.git` file
+   *    *copied* from a real worktree (the entry names the original, not the
+   *    copy).
+   * 2. **Liveness** (inside the path): the path's own `--git-dir` must be that
+   *    same entry. A registry record survives `rm -rf` of its directory (git
+   *    tags it `prunable` and keeps it for gc.worktreePruneExpire, 3 months by
+   *    default); if the path is then recreated as an ordinary directory, git
+   *    resolves it into the MAIN checkout. The registry answers "is this path
+   *    registered?"; only the probe answers "is it a worktree right now?".
+   *
+   * A `.git`-is-a-file heuristic would misfire here (the main tree also carries
+   * a `.git` file under `git clone --separate-git-dir` and in submodules), and
+   * reading the registry directly avoids parsing `git worktree list`, whose
+   * porcelain form is newline-delimited — and so injectable by a worktree path
+   * that itself contains a newline — unless `-z` is used, which needs
+   * Git >= 2.36 and would break older git.
+   *
+   * Fail-closed: any git or I/O error returns false, so a caller that gates
+   * isolation on this check rejects an unverifiable path rather than
+   * silently pinning a sub-agent to a possibly-main tree.
+   */
+  async isRegisteredLinkedWorktree(worktreePath: string): Promise<boolean> {
+    const realpathOr = async (p: string): Promise<string> => {
+      try {
+        return await fs.realpath(p);
+      } catch {
+        return path.resolve(p);
+      }
+    };
+    try {
+      const target = await fs.realpath(worktreePath);
+
+      // ── Registry side, read from THIS repository ──────────────────────
+      // `<commonDir>/worktrees/<name>/gitdir` records the path of the worktree
+      // that entry belongs to. Everything read here lives on the repo side, so
+      // a candidate directory cannot forge an entry: fabricating `<target>/.git`
+      // (and the git dir it names, with its own `commondir`/`gitdir`) only
+      // controls candidate-side files, which are never consulted.
+      const ourCommonDir = path.resolve(
+        this.sourceRepoPath,
+        (
+          await (await this.getGit()).raw(['rev-parse', '--git-common-dir'])
+        ).trim(),
+      );
+      const worktreesDir = path.join(ourCommonDir, 'worktrees');
+      let entryNames: string[];
+      try {
+        entryNames = await fs.readdir(worktreesDir);
+      } catch {
+        return false; // the repository has no linked worktrees at all
+      }
+
+      let entryGitDir: string | null = null;
+      for (const name of entryNames) {
+        const entry = path.join(worktreesDir, name);
+        let pointer: string;
+        try {
+          pointer = (
+            await fs.readFile(path.join(entry, 'gitdir'), 'utf8')
+          ).trim();
+        } catch {
+          continue; // incomplete entry — ignore
+        }
+        // `gitdir` holds `<registeredPath>/.git`.
+        if ((await realpathOr(path.dirname(pointer))) === target) {
+          entryGitDir = entry;
+          break;
+        }
+      }
+      // No entry names this path. This also rejects the primary working tree,
+      // which never has a `worktrees/<name>` entry of its own.
+      if (!entryGitDir) return false;
+
+      // ── Liveness probe, inside the path ───────────────────────────────
+      // A registry record survives `rm -rf` of its directory (git tags it
+      // `prunable` and keeps it for gc.worktreePruneExpire, 3 months by
+      // default). If the path is later recreated as an ordinary directory, git
+      // resolves it into the MAIN checkout, so its `--git-dir` will not be this
+      // entry. The registry answers "is this path registered?"; only a probe
+      // inside the path answers "is it a worktree right now?".
+      const { simpleGit } = await loadSimpleGit();
+      const rawGitDir = (
+        await simpleGit(target).raw(['rev-parse', '--git-dir'])
+      ).trim();
+      const probeGitDir = await realpathOr(path.resolve(target, rawGitDir));
+      return probeGitDir === (await realpathOr(entryGitDir));
+    } catch (error) {
+      debugLogger.debug(
+        `isRegisteredLinkedWorktree: probe at ${worktreePath} failed: ${error}`,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Fetches the GitHub PR ref `refs/pull/<N>/head` from the `origin` remote
+   * so a subsequent `createUserWorktree(..., 'FETCH_HEAD')` call can branch
+   * off the PR's tip (Phase D-3). Returns `{ success: true }` on success,
+   * or `{ success: false, error }` with a user-facing reason on failure.
+   *
+   * Implementation notes:
+   *
+   * - Uses `git fetch origin pull/<N>/head` (no `gh` CLI dependency).
+   * - Hard timeout of 30s by default — overridable for tests. A hung git
+   *   process on a misconfigured corporate proxy would otherwise stall
+   *   the entire startup sequence.
+   * - Does NOT create a local branch — leaves the ref accessible only
+   *   via `FETCH_HEAD`. Subsequent `git worktree add -b <branch> <wt>
+   *   FETCH_HEAD` materialises the worktree branch off it.
+   *
+   * Error message taxonomy is friendly because this is the user's first
+   * impression when their `--worktree=#<N>` fails:
+   * - missing `origin` → tell them the remote is required + how to fix
+   * - timeout → mention the configured timeout so they can blame the network
+   * - generic failure → "PR may not exist or origin is unreachable"
+   */
+  async fetchPullRequestRef(
+    prNumber: number,
+    options?: { timeoutMs?: number },
+  ): Promise<{ success: true } | { success: false; error: string }> {
+    if (
+      !Number.isSafeInteger(prNumber) ||
+      prNumber <= 0 ||
+      prNumber > 1_000_000_000
+    ) {
+      // Out-of-range PR numbers can't sensibly hit GitHub. Reject locally
+      // rather than firing a doomed network call.
+      return {
+        success: false,
+        error: `Invalid PR number: ${prNumber}.`,
+      };
+    }
+    const timeoutMs = options?.timeoutMs ?? 30_000;
+
+    // Two-layer defense for the refspec argv element:
+    //
+    // 1. Regex digit-only validation at the call site — CodeQL's
+    //    `js/second-order-command-line-injection` rule recognises
+    //    `/^[1-9][0-9]*$/.test(x)` as a lexical sanitizer, which proves
+    //    `prNumber` cannot resemble a `--upload-pack=…` flag. The
+    //    entry guard above already establishes this at runtime, but
+    //    CodeQL's interprocedural taint tracker doesn't see through
+    //    that guard; the regex check IS the pattern its sanitizer
+    //    library recognises.
+    // 2. `--end-of-options` as a git-runtime marker. Even though
+    //    layer 1 makes a flag-shaped refspec impossible, the marker
+    //    tells git definitively that every subsequent argv element
+    //    is positional — defense-in-depth against a future
+    //    regression that loosens the entry guard.
+    const prNumberStr = String(prNumber);
+    if (!/^[1-9][0-9]*$/.test(prNumberStr)) {
+      // Unreachable given the entry guard; here to make the
+      // lexical sanitizer visible to static analyzers.
+      return {
+        success: false,
+        error: `Invalid PR number: ${prNumber}.`,
+      };
+    }
+    const refspec = `pull/${prNumberStr}/head`;
+
+    try {
+      // Force English git stderr so the error-taxonomy regexes below
+      // match. Without this, users with non-English locales fall
+      // through to the generic "PR may not exist" branch even for
+      // well-known cases like missing-origin. The git binary itself is
+      // unaffected by LANG/LC_ALL beyond message strings.
+      await execFileAsync(
+        'git',
+        ['fetch', '--end-of-options', 'origin', refspec],
+        {
+          cwd: this.sourceRepoPath,
+          timeout: timeoutMs,
+          env: { ...process.env, LANG: 'C', LC_ALL: 'C' },
+        },
+      );
+      return { success: true };
+    } catch (error) {
+      // execFile reports timeouts via `signal: 'SIGTERM'` on the
+      // error object; the stderr text gives us the underlying git error.
+      const err = error as NodeJS.ErrnoException & {
+        stderr?: string | Buffer;
+        signal?: string;
+      };
+      const stderr =
+        typeof err.stderr === 'string'
+          ? err.stderr
+          : err.stderr instanceof Buffer
+            ? err.stderr.toString('utf8')
+            : '';
+      const lower = stderr.toLowerCase();
+
+      if (err.signal === 'SIGTERM') {
+        return {
+          success: false,
+          error:
+            `Failed to fetch PR #${prNumber}: timed out after ${Math.round(timeoutMs / 1000)}s. ` +
+            `Check network connectivity and any HTTP(S) proxy settings.`,
+        };
+      }
+      if (
+        lower.includes('does not appear to be a git repository') ||
+        lower.includes('could not read from remote repository') ||
+        lower.includes("'origin' does not appear")
+      ) {
+        return {
+          success: false,
+          error:
+            `--worktree=#${prNumber} requires an "origin" remote that points at GitHub. ` +
+            `Add one with \`git remote add origin <url>\` and retry.`,
+        };
+      }
+      if (
+        lower.includes('no such ref') ||
+        lower.includes("couldn't find remote ref") ||
+        lower.includes("couldn't find remote ref pull/")
+      ) {
+        return {
+          success: false,
+          error:
+            `Failed to fetch PR #${prNumber}: the PR does not exist on origin, ` +
+            `or origin is not a GitHub repository (only GitHub exposes refs/pull/<N>/head).`,
+        };
+      }
+      // Generic fallback. Include the stderr first line so an operator
+      // running with --debug can correlate, but keep it terse.
+      const firstLine = stderr.split('\n').find((l) => l.trim().length > 0);
+      const detail = firstLine ? ` (${firstLine.trim()})` : '';
+      debugLogger.warn(
+        `fetchPullRequestRef: git fetch pull/${prNumber}/head failed: ${error}`,
+      );
+      return {
+        success: false,
+        error: `Failed to fetch PR #${prNumber}: PR may not exist, or origin remote is unreachable${detail}.`,
+      };
+    }
+  }
+
+  /**
    * Validates a worktree slug. Returns null on success, or an error message.
    *
    * Rules (mirrors claude-code's `validateWorktreeSlug`):
@@ -1043,7 +2040,10 @@ export class GitWorktreeService {
    *   `agent-1234567` would be silently deleted after 30 days along
    *   with any work it contained.
    */
-  static validateUserWorktreeSlug(slug: string): string | null {
+  static validateUserWorktreeSlug(
+    slug: string,
+    options?: { allowPrBackedShape?: boolean },
+  ): string | null {
     if (typeof slug !== 'string' || slug.length === 0) {
       return 'Worktree name must be a non-empty string.';
     }
@@ -1055,6 +2055,18 @@ export class GitWorktreeService {
     }
     if (slug.includes('..') || slug.startsWith('.') || slug.startsWith('-')) {
       return 'Worktree name must not start with "." or "-" or contain "..".';
+    }
+    if (
+      /^pr-[1-9]\d{0,8}$/.test(slug) &&
+      options?.allowPrBackedShape !== true
+    ) {
+      // `--worktree=#<N>` launches own this shape; a user-chosen slug with
+      // it would bind the session to PR N (and take the sweep's state
+      // stamps) although the session never touched that PR.
+      return (
+        'Worktree name must not look like "pr-<number>": that shape is ' +
+        'reserved for PR-backed worktrees.'
+      );
     }
     if (slug.startsWith(`${AGENT_WORKTREE_PREFIX}-`)) {
       // The exact `agent-<7hex>` slugs that `generateAgentWorktreeSlug`
@@ -1089,8 +2101,16 @@ export class GitWorktreeService {
   async createUserWorktree(
     slug: string,
     baseBranch?: string,
+    options?: {
+      symlinkDirectories?: readonly string[];
+      /** The caller owns the pr-<N> shape (PR-backed startup). */
+      prBacked?: boolean;
+    },
   ): Promise<CreateWorktreeResult> {
-    const validationError = GitWorktreeService.validateUserWorktreeSlug(slug);
+    const validationError = GitWorktreeService.validateUserWorktreeSlug(
+      slug,
+      options?.prBacked === true ? { allowPrBackedShape: true } : undefined,
+    );
     if (validationError) {
       debugLogger.warn(
         `createUserWorktree: invalid slug ${slug}: ${validationError}`,
@@ -1132,14 +2152,9 @@ export class GitWorktreeService {
         return { success: false, error };
       }
 
-      await this.git.raw([
-        'worktree',
-        'add',
-        '-b',
-        branchName,
-        worktreePath,
-        base,
-      ]);
+      await (
+        await this.getGit()
+      ).raw(['worktree', 'add', '-b', branchName, worktreePath, base]);
 
       // Configure core.hooksPath so commits inside the worktree run the
       // main repo's hooks (the new worktree's .git directory has no hooks
@@ -1151,6 +2166,22 @@ export class GitWorktreeService {
           `createUserWorktree: failed to configure core.hooksPath for ${slug}: ${error}`,
         );
       });
+
+      // Phase D-2: symlink user-configured directories from the main
+      // repo into the new worktree (e.g. node_modules) so the model can
+      // run tests / builds without a fresh install. Same fail-open
+      // policy as hooksPath — failures log and continue.
+      const symlinkPaths = options?.symlinkDirectories ?? [];
+      if (symlinkPaths.length > 0) {
+        await this.symlinkConfiguredDirectories(
+          worktreePath,
+          symlinkPaths,
+        ).catch((error) => {
+          debugLogger.warn(
+            `createUserWorktree: symlinkConfiguredDirectories failed for ${slug}: ${error}`,
+          );
+        });
+      }
 
       const worktree: WorktreeInfo = {
         id: slug,
@@ -1206,7 +2237,7 @@ export class GitWorktreeService {
     if (!hooksPath) {
       try {
         const commonDir = (
-          await this.git.raw(['rev-parse', '--git-common-dir'])
+          await (await this.getGit()).raw(['rev-parse', '--git-common-dir'])
         ).trim();
         const resolvedCommonDir = path.isAbsolute(commonDir)
           ? commonDir
@@ -1224,7 +2255,10 @@ export class GitWorktreeService {
     }
     if (!hooksPath) return;
 
-    const worktreeGit = simpleGit(worktreePath);
+    const { simpleGit } = await loadSimpleGit();
+    const worktreeGit = simpleGit(worktreePath, {
+      unsafe: { allowUnsafeHooksPath: true },
+    });
     let existing = '';
     try {
       // Saves the write subprocess when value already matches. The probe
@@ -1253,6 +2287,277 @@ export class GitWorktreeService {
   }
 
   /**
+   * Phase D-2 symlink loop. For each configured directory under the main
+   * repository, creates a symbolic link from the new worktree to the
+   * main-repo location (`<worktreePath>/<dir>` → `<repoRoot>/<dir>`).
+   *
+   * Fail-open semantics — the worktree IS already on disk and usable by
+   * the time this runs, so a symlink failure must NOT abort the parent
+   * `createUserWorktree` call. Per-entry failures are logged at debug or
+   * warn level depending on cause:
+   *
+   * - **ENOENT on source** (the main repo does not have the directory):
+   *   debug log, skip. Typical for users who configure `node_modules`
+   *   but launch from a fresh clone where `npm install` hasn't run yet.
+   * - **EEXIST on destination** (something already lives at the symlink
+   *   target inside the worktree): debug log, skip. No overwrite; the
+   *   existing content (whether file, dir, or stale link) wins.
+   * - **Absolute path or path traversal in the configured value**:
+   *   warn log, skip the entry. Configured values must stay relative to
+   *   the repo root to prevent a setting from redirecting writes onto
+   *   `/etc`, `~`, or anywhere outside the repo subtree.
+   * - **Other I/O errors**: warn log, continue to the next entry.
+   *
+   * Mirrors claude-code's `symlinkDirectories` helper (utils/worktree.ts).
+   */
+  private async symlinkConfiguredDirectories(
+    worktreePath: string,
+    configured: readonly string[],
+  ): Promise<void> {
+    // Loop-invariant canonical paths, hoisted out of the per-entry loop.
+    //
+    // We must `fs.realpath` the repo root (rather than `path.resolve`,
+    // which is purely lexical) so every containment check below compares
+    // canonical paths to canonical paths. The post-stat `realSource =
+    // fs.realpath(sourceAbs)` produces a canonical path, and on any
+    // system where the repo path contains a symlink component (macOS
+    // `/tmp → /private/tmp` is ubiquitous; user-symlinked source trees on
+    // Linux/Windows too) the lexical `path.resolve(sourceRepoPath)` does
+    // not share a prefix with that canonical realpath. Without this hoist
+    // `isWithinRoot(realSource, repoRootAbs)` silently rejects EVERY
+    // configured entry — cf. PR #4381 round 8 regression.
+    let repoRootAbs: string;
+    try {
+      repoRootAbs = await fs.realpath(this.sourceRepoPath);
+    } catch {
+      // realpath of a non-existent / inaccessible repo root is fatal for
+      // the symlink loop's containment checks (we can't validate against
+      // a path we can't canonicalise). Bail out — the worktree itself is
+      // already on disk so this is non-destructive; we just skip the
+      // opt-in symlink step.
+      debugLogger.warn(
+        `symlinkConfiguredDirectories: cannot realpath sourceRepoPath "${this.sourceRepoPath}", skipping all entries`,
+      );
+      return;
+    }
+    const gitDirAbs = path.join(repoRootAbs, '.git');
+    const qwenDirAbs = path.join(repoRootAbs, '.qwen');
+    // Same canonical-vs-canonical requirement for the dest side. The
+    // worktree was just created by `git worktree add`, so the path
+    // should exist; fall back to the input path on realpath error so a
+    // weird-but-extant worktree path doesn't deadlock the whole loop.
+    const realWorktreePath = await fs
+      .realpath(worktreePath)
+      .catch(() => worktreePath);
+
+    for (const raw of configured) {
+      if (typeof raw !== 'string' || raw.length === 0) {
+        debugLogger.warn(
+          `symlinkConfiguredDirectories: skipping non-string / empty entry: ${JSON.stringify(raw)}`,
+        );
+        continue;
+      }
+
+      // Reject absolute paths and any traversal-prone form. Resolve first
+      // to catch `./foo/../../etc` style escapes that look relative.
+      if (path.isAbsolute(raw)) {
+        debugLogger.warn(
+          `symlinkConfiguredDirectories: refusing absolute path "${raw}"`,
+        );
+        continue;
+      }
+      // Reject any literal `..` segment up front. The post-resolve
+      // `isWithinRoot` check below would still accept `foo/../bar`
+      // (resolves to `bar`, which is inside the repo), but the public
+      // contract — settingsSchema description, docs/users/features/
+      // worktree.md, WorktreeSettings JSDoc — promises rejection of
+      // any entry containing `..`. Enforce that promise here.
+      if (raw.split(/[\\/]/).includes('..')) {
+        debugLogger.warn(
+          `symlinkConfiguredDirectories: refusing path "${raw}" — contains '..' segment`,
+        );
+        continue;
+      }
+      const sourceAbs = path.resolve(repoRootAbs, raw);
+      if (sourceAbs === repoRootAbs) {
+        // `""` / `"."` / `"./"` etc. — pointless and would alias the
+        // entire repo into itself. Reject explicitly so the path-prefix
+        // checks below don't have to handle this degenerate case.
+        debugLogger.warn(
+          `symlinkConfiguredDirectories: refusing empty / repo-root path "${raw}"`,
+        );
+        continue;
+      }
+      if (!isWithinRoot(sourceAbs, repoRootAbs)) {
+        debugLogger.warn(
+          `symlinkConfiguredDirectories: refusing path "${raw}" — resolves outside repo root (${sourceAbs} vs ${repoRootAbs})`,
+        );
+        continue;
+      }
+
+      // Refuse to symlink git-internal paths into the worktree. `.git`
+      // would silently break commits / status / diff inside the
+      // worktree (the worktree's own gitlink file points at the parent
+      // common-dir, and a symlink would shadow it). The whole `.qwen`
+      // tree is also off-limits: linking `.qwen` (parent) would
+      // recursively pull `.qwen/worktrees` into the new worktree,
+      // recreating the loop; linking `.qwen/worktrees` directly
+      // creates the same loop more obviously; and `.qwen/projects`
+      // / `.qwen/tmp` are CLI metadata users have no legitimate
+      // reason to share across worktrees.
+      // `gitDirAbs` / `qwenDirAbs` are canonical (derived from the
+      // realpath'd `repoRootAbs` hoisted above the loop), so these
+      // comparisons stay consistent with the post-stat realpath check.
+      if (isWithinRoot(sourceAbs, gitDirAbs)) {
+        debugLogger.warn(
+          `symlinkConfiguredDirectories: refusing git-internal path "${raw}"`,
+        );
+        continue;
+      }
+      if (isWithinRoot(sourceAbs, qwenDirAbs)) {
+        debugLogger.warn(
+          `symlinkConfiguredDirectories: refusing path "${raw}" — ` +
+            `the .qwen tree is CLI-managed; symlinking any of it could ` +
+            `create a worktrees-inside-worktrees loop or alias CLI metadata.`,
+        );
+        continue;
+      }
+
+      // Confirm the source exists. We don't insist on it being a directory
+      // specifically — `node_modules` is canonically a dir, but a user
+      // who wants to share a single file (`.env`, `secrets.json`) via
+      // `symlinkDirectories` should still get the link.
+      let sourceStat: { isDirectory: () => boolean } | null = null;
+      try {
+        sourceStat = await fs.stat(sourceAbs);
+      } catch (error) {
+        if (isNodeError(error) && error.code === 'ENOENT') {
+          debugLogger.debug(
+            `symlinkConfiguredDirectories: source missing, skipping: ${sourceAbs}`,
+          );
+        } else {
+          debugLogger.warn(
+            `symlinkConfiguredDirectories: cannot stat ${sourceAbs}: ${error}`,
+          );
+        }
+        continue;
+      }
+
+      // Resolve through any symlinks in the source path and RE-RUN the
+      // containment + blocklist checks against the realpath. The lexical
+      // checks above only see `path.resolve(repoRoot, raw)` — they can't
+      // tell that `<repo>/node_modules` is actually a symlink chaining
+      // into `.git`, an outside dir, or `.qwen`. Without this step a
+      // committed-or-out-of-band source symlink bypasses every guard the
+      // lexical loop set up. Use the realpath as the symlink target so
+      // the new link points canonically rather than preserving the chain.
+      let realSource: string;
+      try {
+        realSource = await fs.realpath(sourceAbs);
+      } catch (error) {
+        debugLogger.warn(
+          `symlinkConfiguredDirectories: cannot realpath source "${sourceAbs}": ${error}`,
+        );
+        continue;
+      }
+      if (!isWithinRoot(realSource, repoRootAbs)) {
+        debugLogger.warn(
+          `symlinkConfiguredDirectories: refusing path "${raw}" — real source ${realSource} escapes repo root ${repoRootAbs}`,
+        );
+        continue;
+      }
+      if (isWithinRoot(realSource, gitDirAbs)) {
+        debugLogger.warn(
+          `symlinkConfiguredDirectories: refusing path "${raw}" — real source ${realSource} resolves inside .git`,
+        );
+        continue;
+      }
+      if (isWithinRoot(realSource, qwenDirAbs)) {
+        debugLogger.warn(
+          `symlinkConfiguredDirectories: refusing path "${raw}" — real source ${realSource} resolves inside .qwen`,
+        );
+        continue;
+      }
+
+      const destAbs = path.join(worktreePath, raw);
+
+      // Ensure the parent directory of `destAbs` exists. For top-level
+      // entries (`node_modules`) this is a no-op against the worktree
+      // root, but for nested values (`tools/cache`) we may need to
+      // create the intermediate dirs first — git worktree add does NOT
+      // create them.
+      try {
+        await fs.mkdir(path.dirname(destAbs), { recursive: true });
+      } catch (error) {
+        debugLogger.warn(
+          `symlinkConfiguredDirectories: cannot mkdir parent of ${destAbs}: ${error}`,
+        );
+        continue;
+      }
+
+      // Sibling-drift defense to the round-7 source-side realpath check:
+      // `path.join(worktreePath, raw)` is lexical too. If `git worktree
+      // add` materialized a committed symlink under the worktree
+      // (e.g. HEAD ships `tools → /etc`), then the OS-side resolution
+      // of `<worktree>/tools/cache` traverses through the committed
+      // symlink and our `fs.mkdir` / `fs.symlink` write OUTSIDE the
+      // worktree. Realpath the dest parent and refuse if it escapes.
+      let realDestParent: string;
+      try {
+        realDestParent = await fs.realpath(path.dirname(destAbs));
+      } catch (error) {
+        debugLogger.warn(
+          `symlinkConfiguredDirectories: cannot realpath dest parent for "${raw}" (${path.dirname(destAbs)}): ${error}`,
+        );
+        continue;
+      }
+      if (!isWithinRoot(realDestParent, realWorktreePath)) {
+        debugLogger.warn(
+          `symlinkConfiguredDirectories: refusing path "${raw}" — dest parent ${realDestParent} escapes worktree root ${realWorktreePath} (committed-symlink chain)`,
+        );
+        continue;
+      }
+
+      // `fs.symlink` rejects with EEXIST when the destination already
+      // exists. Treat that as "user already populated this slot, leave
+      // it alone" — same as claude-code's behavior.
+      try {
+        // On Windows, `fs.symlink(..., 'dir')` requires
+        // SeCreateSymbolicLinkPrivilege (administrator rights, or
+        // Developer Mode + unprivileged-symlink-creation enabled) and
+        // EPERMs on default consumer installs. A junction is a reparse
+        // point that achieves the same "this path resolves over there"
+        // semantics for directories without elevation. `'file'` symlinks
+        // on Windows also need the same privilege but there's no
+        // junction-equivalent for files, so we leave `'file'` as-is and
+        // accept the EPERM fall-through for the rare file-symlink case.
+        const symlinkType = sourceStat.isDirectory()
+          ? process.platform === 'win32'
+            ? 'junction'
+            : 'dir'
+          : 'file';
+        // Point at the canonical realpath rather than the lexical
+        // `sourceAbs` so the new link is one-hop and doesn't preserve
+        // the chain we just validated.
+        await fs.symlink(realSource, destAbs, symlinkType);
+        debugLogger.debug(
+          `symlinkConfiguredDirectories: linked ${destAbs} → ${realSource} (${symlinkType})`,
+        );
+      } catch (error) {
+        if (isNodeError(error) && error.code === 'EEXIST') {
+          debugLogger.debug(
+            `symlinkConfiguredDirectories: destination exists, skipping: ${destAbs}`,
+          );
+        } else {
+          debugLogger.warn(
+            `symlinkConfiguredDirectories: failed to link ${destAbs} → ${realSource}: ${error}`,
+          );
+        }
+      }
+    }
+  }
+
+  /**
    * Returns true if a local branch with the given name exists.
    *
    * Uses `for-each-ref` because `simple-git.raw` swallows the non-zero
@@ -1268,7 +2573,9 @@ export class GitWorktreeService {
    */
   private async localBranchExists(branchName: string): Promise<boolean> {
     try {
-      const out = await this.git.raw([
+      const out = await (
+        await this.getGit()
+      ).raw([
         'for-each-ref',
         '--count=1',
         '--format=%(refname)',
@@ -1356,8 +2663,9 @@ export class GitWorktreeService {
     // remove branches whose tip is not reachable from HEAD or any
     // upstream — preserving any commits the subagent made before
     // ending with a clean working tree.
+    const git = await this.getGit();
     try {
-      await this.git.branch(['-d', branchName]);
+      await git.branch(['-d', branchName]);
       return { success: true };
     } catch (error) {
       // Refused either because the branch carries unmerged commits
@@ -1372,7 +2680,7 @@ export class GitWorktreeService {
 
     if (options.forceDeleteBranch) {
       try {
-        await this.git.branch(['-D', branchName]);
+        await git.branch(['-D', branchName]);
         return { success: true };
       } catch (error) {
         // Best-effort: branch may have been deleted already, or may not
@@ -1404,13 +2712,14 @@ export class GitWorktreeService {
   async hasUnmergedWorktreeCommits(slug: string): Promise<boolean> {
     const branchName = worktreeBranchForSlug(slug);
     try {
-      const tipSha = (await this.git.revparse([branchName])).trim();
+      const git = await this.getGit();
+      const tipSha = (await git.revparse([branchName])).trim();
       if (!tipSha) return true;
       // List every local branch and remote-tracking ref whose tip is at
       // or above the worktree branch's tip. If anything other than the
       // worktree branch itself appears, the commits are covered.
       const refs = (
-        await this.git.raw([
+        await git.raw([
           'for-each-ref',
           '--contains',
           tipSha,
@@ -1445,16 +2754,31 @@ export class GitWorktreeService {
    */
   async hasWorktreeChanges(worktreePath: string): Promise<boolean> {
     try {
-      const wtGit = simpleGit(worktreePath);
-      const status = await wtGit.status();
-      // Defensive: `status.isClean()` reads several status arrays, but
-      // we OR with `conflicted.length` explicitly so future simple-git
-      // versions that change the bookkeeping cannot silently let a
-      // mid-merge worktree appear clean to the agent cleanup path
-      // (which would then delete it and lose the resolution work).
-      // `not_added` covers untracked; `staged`/`modified`/etc. cover
-      // the rest.
-      return !status.isClean() || status.conflicted.length > 0;
+      // `--no-optional-locks` keeps the read from refreshing and writing the
+      // index, so a tree-shipped `.git/hooks/post-index-change` never runs and
+      // the probe stays a pure read. The flag is carried in argv — not via
+      // simple-git's `.env('GIT_OPTIONAL_LOCKS', '0')`, whose two-arg form
+      // *replaces* the child environment (dropping PATH/HOME and hiding the
+      // global `core.excludesFile` / `safe.directory`).
+      const { stdout } = await execFileAsync(
+        'git',
+        [
+          ...NO_EXEC_CONFIG,
+          '--no-optional-locks',
+          'status',
+          '--porcelain',
+          '--untracked-files=all',
+        ],
+        {
+          cwd: worktreePath,
+          encoding: 'utf8',
+          maxBuffer: 10 * 1024 * 1024,
+        },
+      );
+      // Porcelain v1 emits one line per change (`XY path`); any line — tracked
+      // (` M`), untracked (`??`), or conflicted (`UU`) — means the worktree is
+      // not clean.
+      return stdout.trim().length > 0;
     } catch {
       return true;
     }
@@ -1468,21 +2792,36 @@ export class GitWorktreeService {
     worktreePath: string,
   ): Promise<{ tracked: number; untracked: number } | null> {
     try {
-      const wtGit = simpleGit(worktreePath);
-      const status = await wtGit.status();
-      // `conflicted` is mutually exclusive with the other arrays in
-      // simple-git's status — a worktree mid-merge with no other
-      // edits would otherwise read as `{tracked: 0, untracked: 0}`
-      // and slip past the dirty-state guard in `exit_worktree`,
-      // discarding the merge resolution. Treat as tracked changes.
-      const tracked =
-        status.staged.length +
-        status.modified.length +
-        status.deleted.length +
-        status.renamed.length +
-        status.created.length +
-        status.conflicted.length;
-      const untracked = status.not_added.length;
+      const { stdout } = await execFileAsync(
+        'git',
+        [
+          ...NO_EXEC_CONFIG,
+          '--no-optional-locks',
+          'status',
+          '--porcelain',
+          '--untracked-files=all',
+        ],
+        {
+          cwd: worktreePath,
+          encoding: 'utf8',
+          maxBuffer: 10 * 1024 * 1024,
+        },
+      );
+      let tracked = 0;
+      let untracked = 0;
+      // Porcelain v1: each change line begins with a two-char status code.
+      // `??` is untracked; every other code is a tracked change — staged,
+      // unstaged, renamed, or conflicted (`UU` and friends, which porcelain v1
+      // emits as ordinary lines, so the mid-merge case the previous simple-git
+      // enumeration already covered stays covered).
+      for (const line of stdout.split('\n')) {
+        if (line.length === 0) continue;
+        if (line.startsWith('??')) {
+          untracked += 1;
+        } else {
+          tracked += 1;
+        }
+      }
       return { tracked, untracked };
     } catch {
       return null;

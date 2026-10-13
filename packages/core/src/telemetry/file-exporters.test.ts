@@ -8,7 +8,9 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { FileSpanExporter } from './file-exporters.js';
+import { ExportResultCode } from '@opentelemetry/core';
+import type { ReadableLogRecord } from '@opentelemetry/sdk-logs';
+import { FileLogExporter, FileSpanExporter } from './file-exporters.js';
 
 type SerializeAccess = { serialize: (data: unknown) => string };
 
@@ -53,5 +55,84 @@ describe('FileExporter.serialize', () => {
     expect(out).toContain('"name": "span-1"');
     expect(out).toContain('"[Circular]"');
     expect(out.endsWith('\n')).toBe(true);
+  });
+
+  // Pins the outfile sink's key-absent contract: when logPrompts is off the
+  // producer emits request_text/response_text as undefined, and safeJsonStringify
+  // (JSON.stringify) drops undefined-valued keys instead of writing `null` or an
+  // empty string. FileLogExporter inherits FileExporter.serialize unchanged.
+  it('FileLogExporter omits undefined-valued attributes (logPrompts off)', async () => {
+    const outfile = path.join(tmpDir, 'logs.jsonl');
+    const logExporter = new FileLogExporter(outfile);
+    const logRecord = {
+      body: 'api response',
+      hrTime: [1000, 0] as [number, number],
+      attributes: {
+        request_text: undefined,
+        response_text: 'visible',
+      },
+    } as unknown as ReadableLogRecord;
+
+    await new Promise<void>((resolve) => {
+      logExporter.export([logRecord], (result) => {
+        expect(result.code).toBe(ExportResultCode.SUCCESS);
+        resolve();
+      });
+    });
+    await logExporter.shutdown();
+
+    const out = fs.readFileSync(outfile, 'utf8');
+    expect(out).not.toContain('request_text');
+    expect(out).toContain('"response_text": "visible"');
+  });
+});
+
+// Telemetry is best-effort and must never crash the agent. The outfile is often
+// a relative path resolved against a cwd that lacks the directory (e.g. an ACP
+// session whose process cwd is `/`), which makes createWriteStream emit an
+// async `error` event that, if unhandled, takes down the whole process.
+describe('FileExporter robustness', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'file-exporters-robust-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 50,
+    });
+  });
+
+  it('creates the parent directory when it does not exist', async () => {
+    const nested = path.join(tmpDir, 'a', 'b', 'c');
+    const exporter = new FileSpanExporter(path.join(nested, 'out.jsonl'));
+    expect(fs.existsSync(nested)).toBe(true);
+    await exporter.shutdown();
+  });
+
+  it('does not crash when the outfile path is unusable', async () => {
+    // Make the parent a regular file so the directory — and therefore the
+    // write stream — cannot be created. The async stream `error` must be
+    // absorbed rather than crashing the process.
+    const blocker = path.join(tmpDir, 'blocker');
+    fs.writeFileSync(blocker, 'x');
+    const badPath = path.join(blocker, 'out.jsonl');
+
+    let exporter: FileSpanExporter | undefined;
+    expect(() => {
+      exporter = new FileSpanExporter(badPath);
+    }).not.toThrow();
+
+    const code = await new Promise<ExportResultCode>((resolve) => {
+      exporter!.export([{ name: 'span' } as never], (result) =>
+        resolve(result.code),
+      );
+    });
+    expect(code).toBe(ExportResultCode.FAILED);
+    await exporter!.shutdown();
   });
 });

@@ -5,7 +5,9 @@
  */
 
 import type {
+  CompactionThresholds,
   CompressionStatus,
+  FindingsResultDisplay,
   MCPServerConfig,
   ThoughtSummary,
   ToolCallConfirmationDetails,
@@ -13,14 +15,16 @@ import type {
   ToolResultDisplay,
   AgentStatus,
   ArenaDiffSummary,
+  GoalSnapshotV2,
+  GoalStateCause,
 } from '@qwen-code/qwen-code-core';
 import type { PartListUnion } from '@google/genai';
-import { type ReactNode } from 'react';
+import type { ReactNode } from 'react';
 
 export type { ThoughtSummary };
 
 export enum AuthState {
-  // Attemtping to authenticate or re-authenticate
+  // Attempting to authenticate or re-authenticate
   Unauthenticated = 'unauthenticated',
   // Auth dialog is open for user to select auth method
   Updating = 'updating',
@@ -36,7 +40,7 @@ export enum StreamingState {
 }
 
 // Copied from server/src/core/turn.ts for CLI usage
-export enum GeminiEventType {
+export enum LlmEventType {
   Content = 'content',
   ToolCallRequest = 'tool_call_request',
   // Add other event types if the UI hook needs to handle them
@@ -49,6 +53,11 @@ export enum ToolCallStatus {
   Executing = 'Executing',
   Success = 'Success',
   Error = 'Error',
+}
+
+export interface InlineImageData {
+  data: string;
+  mimeType: string;
 }
 
 export interface ToolCallEvent {
@@ -65,7 +74,39 @@ export interface IndividualToolCallDisplay {
   callId: string;
   name: string;
   description: string;
+  /**
+   * Raw tool-call arguments, rendered inline under the header when
+   * `ui.showToolCallArgs` is on. `description` is only ever a human summary
+   * (`invocation.getDescription()`) — for most built-in tools it drops the
+   * actual parameters (Edit shows just the filename), which is what the
+   * setting exists to recover.
+   *
+   * Holds the same object reference as the scheduler's `request.args` — no
+   * copy, so it costs nothing in memory. Undefined on the daemon path, which
+   * never carries args across the boundary; the args row is then skipped.
+   */
+  args?: Record<string, unknown>;
   resultDisplay: ToolResultDisplay | string | undefined;
+  visionBridgeNotice?: string;
+  /**
+   * Full tool-result text for the Ctrl+O full-detail transcript (§4.9).
+   * Derived (NOT persisted) — extracted via `getToolResponseDisplayText` from
+   * the already-persisted `functionResponse` parts at live/resume/replay time.
+   * Used only when `fullDetail && isCollapsibleTool(name)` to replace the
+   * summary `resultDisplay` for read/search/list tools whose `returnDisplay`
+   * is only a count. Undefined → fall back to the summary.
+   */
+  detailedDisplay?: string;
+  /**
+   * The findings display a later report_findings call replaced. Kept so a
+   * rewind past the replacing call can restore this report's checklist;
+   * dropped by history compaction together with resultDisplay.
+   */
+  supersededFindingsDisplay?: FindingsResultDisplay;
+  /** Inline images carried by this tool's persisted response parts. */
+  images?: InlineImageData[];
+  /** Images hidden after the per-row rendering limit. */
+  omittedImageCount?: number;
   status: ToolCallStatus;
   confirmationDetails: ToolCallConfirmationDetails | undefined;
   renderOutputAsMarkdown?: boolean;
@@ -80,6 +121,66 @@ export interface CompressionProps {
   originalTokenCount: number | null;
   newTokenCount: number | null;
   compressionStatus: CompressionStatus | null;
+  /**
+   * Which compression path produced this item. 'summarize' replaces the
+   * pre-marker history with a synthetic summary prefix; 'fast' (rule-based,
+   * no LLM summary) removes no user prompts from the API history, so its
+   * marker must not be treated as a rewind boundary. Absent on items from
+   * older sessions, which are treated as 'summarize'.
+   */
+  compressionKind?: 'summarize' | 'fast';
+  /**
+   * Token-count provenance (#9309). The compression paths measure on
+   * different scales, so estimated numbers are rendered with a '~' prefix
+   * to keep consecutive banners from reading as lost context.
+   */
+  originalTokenCountIsEstimated?: boolean;
+  newTokenCountIsEstimated?: boolean;
+}
+
+/**
+ * Structured companion to the `/compress` sentences a command streams over ACP.
+ *
+ * The English sentence stays on the wire so text-only ACP hosts keep rendering
+ * something, but a host that owns its own UI language renders the outcome from
+ * this instead. Token counts travel as numbers (never preformatted) so the
+ * consumer picks its own grouping and estimated marker.
+ */
+export type ContextCompressionMeta =
+  | {
+      phase: 'progress';
+    }
+  | {
+      /**
+       * Terminal, like `done`: the fast path had nothing to strip. The session
+       * merges it into the progress block so the pending row is replaced in
+       * place, which is why it carries no counts.
+       */
+      phase: 'noop';
+    }
+  | {
+      phase: 'done';
+      originalTokenCount: number;
+      newTokenCount: number;
+      originalTokenCountIsEstimated?: boolean;
+      newTokenCountIsEstimated?: boolean;
+      /** Server-authored advisory; free-form text, not a translation key. */
+      warning?: string;
+    };
+
+/**
+ * A note about the invocation itself, emitted before the compression starts.
+ *
+ * It rides on its own `_meta` key rather than on `contextCompression`: the
+ * reducer folds a turn's text frames into one block and spreads `_meta` key by
+ * key, so a note sharing that key would be overwritten by the result frame that
+ * follows. A host that reads this key renders the note as its own row beside
+ * the compression it belongs to.
+ */
+export interface ContextCompressionNotice {
+  phase: 'notice';
+  /** Instruction budget the caller was clipped to. */
+  instructionsLimit: number;
 }
 
 export interface SummaryProps {
@@ -90,30 +191,60 @@ export interface SummaryProps {
 
 export interface HistoryItemBase {
   text?: string; // Text content for user/gemini/info/error messages
+  /** Display-only flags that do not affect canonical history semantics. */
+  display?: {
+    /**
+     * If true, the item is kept in history for turn mapping but not
+     * rendered in the restored transcript. Set by ui.history.collapseOnResume
+     * when resuming a session.
+     */
+    suppressOnRestore?: boolean;
+    /**
+     * Identifies special display-only items, like the summary row added
+     * when history is collapsed.
+     */
+    kind?: 'collapse-summary';
+  };
 }
 
 export type HistoryItemUser = HistoryItemBase & {
   type: 'user';
   text: string;
   promptId?: string;
+  /**
+   * Whether this UI history item represents a user turn that reached the model.
+   *
+   * NOTE: This is set explicitly by slash command processing because visible
+   * slash-command invocations may be handled locally without entering API
+   * history. Regular user messages leave this undefined and are classified by
+   * the legacy lexical fallback in isRealUserTurn. New user-item paths with
+   * ambiguous model-history behavior must set this explicitly.
+   */
+  sentToModel?: boolean;
 };
 
-export type HistoryItemGemini = HistoryItemBase & {
+export type HistoryItemLlm = HistoryItemBase & {
   type: 'gemini';
   text: string;
+  images?: InlineImageData[];
+  omittedImageCount?: number;
+  timestamp?: number;
 };
 
-export type HistoryItemGeminiContent = HistoryItemBase & {
+export type HistoryItemLlmContent = HistoryItemBase & {
   type: 'gemini_content';
   text: string;
+  images?: InlineImageData[];
+  omittedImageCount?: number;
 };
 
-export type HistoryItemGeminiThought = HistoryItemBase & {
+export type HistoryItemLlmThought = HistoryItemBase & {
   type: 'gemini_thought';
   text: string;
+  durationMs?: number;
 };
 
-export type HistoryItemGeminiThoughtContent = HistoryItemBase & {
+export type HistoryItemLlmThoughtContent = HistoryItemBase & {
   type: 'gemini_thought_content';
   text: string;
 };
@@ -143,6 +274,13 @@ export type HistoryItemSuccess = HistoryItemBase & {
 
 export type HistoryItemRetryCountdown = HistoryItemBase & {
   type: 'retry_countdown';
+  text: string;
+};
+
+// Dim, tip-style disclosure shown when the vision bridge runs (success or
+// cancellation). Failures use the prominent ERROR variant instead.
+export type HistoryItemVisionNotice = HistoryItemBase & {
+  type: 'vision_notice';
   text: string;
 };
 
@@ -184,6 +322,9 @@ export type HistoryItemStats = HistoryItemBase & {
  */
 export interface DiffRenderRow {
   filename: string;
+  /** Pre-rename path when this row is a rename; absent otherwise. `filename`
+   *  is the current (post-rename) path used to address the file. */
+  oldPath?: string;
   /** `undefined` for binary files; a line count (lower bound if `truncated`)
    *  otherwise. */
   added?: number;
@@ -220,6 +361,10 @@ export type HistoryItemToolStats = HistoryItemBase & {
   type: 'tool_stats';
 };
 
+export type HistoryItemSkillStats = HistoryItemBase & {
+  type: 'skill_stats';
+};
+
 export type HistoryItemQuit = HistoryItemBase & {
   type: 'quit';
   duration: string;
@@ -245,6 +390,16 @@ export type HistoryItemToolGroup = HistoryItemBase & {
   /** Count of tool calls that read from managed-auto-memory files. Pre-computed for badge rendering. */
   memoryReadCount?: number;
   isUserInitiated?: boolean;
+  /**
+   * Identity of the scheduler batch that produced this group (#9420).
+   * Minted when the batch is scheduled and stamped on both the live
+   * pending copy and the committed copy, so the transient double render
+   * of one batch collapses by identity — never by callIds, which collide
+   * across unrelated batches. Unique per mount, so ids persisted in
+   * checkpoints can never match newly minted ones; adapter-built groups
+   * carry no id. Neither is ever collapsed.
+   */
+  batchId?: string;
 };
 
 /**
@@ -288,10 +443,21 @@ export interface ToolDefinition {
   name: string;
   displayName: string;
   description?: string;
+  /** Omni media-policy tool that only runs via fixed policies: it is hidden
+   * from the model's declarations, so /tools annotates it for the human. */
+  fixedOnly?: boolean;
+  /**
+   * Registered, but its schema is not in the eager model request — the tool
+   * is reached on demand via `tool_search`. Set for `shouldDefer` tools and
+   * for tools the `tools.eager` allowlist omits (#9827, #10075).
+   */
+  deferred?: boolean;
 }
 
 export interface SkillDefinition {
   name: string;
+  description?: string;
+  level?: string;
 }
 
 export type HistoryItemToolsList = HistoryItemBase & {
@@ -342,15 +508,47 @@ export type HistoryItemMcpStatus = HistoryItemBase & {
 
 // --- Context Usage types ---
 
+export type ContextTier = 'safe' | 'warn' | 'auto' | 'hard';
+
+/**
+ * Alias for the core compaction-thresholds shape. Re-exported under the
+ * CLI-friendly name so consumers in this package don't pull on the core
+ * module path; structurally identical to `CompactionThresholds`. The
+ * `readonly` modifiers on the core type are immaterial for UI rendering,
+ * but kept implicitly through the alias.
+ */
+export type ContextThresholds = CompactionThresholds;
+
 export interface ContextCategoryBreakdown {
   systemPrompt: number;
   builtinTools: number;
   mcpTools: number;
   memoryFiles: number;
+  /** Skill tool definition + the `<available_skills>` listing as sent + loaded bodies. */
   skills: number;
+  /** Startup prelude outside the skill listing: environment context, MCP server instructions, deferred-tools reminder. */
+  startupContext?: number;
+  /** Content estimate of the conversation after the startup prelude. */
   messages: number;
+  /** Provider total not accounted for by any category estimate. Categories plus this sum to `totalTokens`. */
+  unattributed?: number;
+  /** Provider-reported cached prefix. An annotation, not a category: the cached prefix spans several categories. */
+  cachedTokens?: number;
   freeSpace: number;
+  /**
+   * Distance from the auto-compaction threshold to the window edge.
+   * Derived from `thresholds.auto` (= `contextWindowSize - auto`); retained
+   * so the legacy three-segment progress bar in `ContextUsage.tsx` keeps
+   * working without a separate code path.
+   */
   autocompactBuffer: number;
+  /** Three-tier ladder used by auto-compaction (warn / auto / hard) plus the effective window. */
+  thresholds: ContextThresholds;
+  /**
+   * Which tier the current usage sits in. `safe` is below `warn`; `warn` /
+   * `auto` / `hard` mean `totalTokens` has crossed the corresponding tier.
+   */
+  currentTier: ContextTier;
 }
 
 export interface ContextToolDetail {
@@ -365,7 +563,7 @@ export interface ContextMemoryDetail {
 
 export interface ContextSkillDetail {
   name: string;
-  /** Token cost of the skill listing (name+description) in the tool definition */
+  /** Token cost of this skill's entry in the `<available_skills>` listing as sent (after budget trimming) */
   tokens: number;
   /** Whether this skill has been invoked and its full body loaded into context */
   loaded?: boolean;
@@ -383,7 +581,7 @@ export type HistoryItemContextUsage = HistoryItemBase & {
   mcpTools: ContextToolDetail[];
   memoryFiles: ContextMemoryDetail[];
   skills: ContextSkillDetail[];
-  /** True when totalTokens is estimated (no API call yet) rather than from API response */
+  /** True when totalTokens is absent or derived from a local estimate rather than provider usage. */
   isEstimated?: boolean;
   /** When true, show per-item detail sections (tools, memory, skills). Default: false (compact). */
   showDetails?: boolean;
@@ -440,6 +638,20 @@ export interface BtwProps {
 export type HistoryItemBtw = HistoryItemBase & {
   type: 'btw';
   btw: BtwProps;
+};
+
+/**
+ * Independent second-opinion review rendered by `/advisor`. `text` is the
+ * reviewer's markdown; `model` is the resolved model id that produced it,
+ * shown in the header. An unknown `advisorModel` is passed to the provider
+ * as-is and surfaces as an error if rejected; only unresolvable alias
+ * selectors fall back to the main model. Configured model fallbacks are not
+ * used for advisor requests.
+ */
+export type HistoryItemAdvisor = HistoryItemBase & {
+  type: 'advisor';
+  text: string;
+  model: string;
 };
 
 /**
@@ -507,7 +719,26 @@ export type GoalStatusKind =
   | 'cleared'
   | 'failed'
   | 'aborted'
+  | 'paused'
   | 'checking';
+
+export const GOAL_STATUS_KINDS = [
+  'set',
+  'achieved',
+  'cleared',
+  'failed',
+  'aborted',
+  'paused',
+  'checking',
+] as const satisfies readonly GoalStatusKind[];
+
+/** Narrows an untrusted value (e.g. a persisted transcript field). */
+export function isGoalStatusKind(value: unknown): value is GoalStatusKind {
+  return (
+    typeof value === 'string' &&
+    (GOAL_STATUS_KINDS as readonly string[]).includes(value)
+  );
+}
 
 export const TERMINAL_GOAL_STATUS_KINDS = [
   'achieved',
@@ -527,10 +758,17 @@ export type HistoryItemGoalStatus = HistoryItemBase & {
   type: 'goal_status';
   kind: GoalStatusKind;
   condition: string;
-  /** Set for progress and terminal goal states. */
+  /** Set for active, progress, and terminal goal states. */
   iterations?: number;
+  setAt?: number;
   durationMs?: number;
   lastReason?: string;
+};
+
+export type HistoryItemGoalState = HistoryItemBase & {
+  type: 'goal_state';
+  snapshot: GoalSnapshotV2;
+  cause?: GoalStateCause;
 };
 
 // Using Omit<HistoryItem, 'id'> seems to have some issues with typescript's
@@ -541,15 +779,16 @@ export type HistoryItemWithoutId =
   | HistoryItemUser
   | HistoryItemNotification
   | HistoryItemUserShell
-  | HistoryItemGemini
-  | HistoryItemGeminiContent
-  | HistoryItemGeminiThought
-  | HistoryItemGeminiThoughtContent
+  | HistoryItemLlm
+  | HistoryItemLlmContent
+  | HistoryItemLlmThought
+  | HistoryItemLlmThoughtContent
   | HistoryItemInfo
   | HistoryItemError
   | HistoryItemWarning
   | HistoryItemSuccess
   | HistoryItemRetryCountdown
+  | HistoryItemVisionNotice
   | HistoryItemAbout
   | HistoryItemHelp
   | HistoryItemToolGroup
@@ -557,6 +796,7 @@ export type HistoryItemWithoutId =
   | HistoryItemStats
   | HistoryItemModelStats
   | HistoryItemToolStats
+  | HistoryItemSkillStats
   | HistoryItemQuit
   | HistoryItemCompression
   | HistoryItemSummary
@@ -570,6 +810,7 @@ export type HistoryItemWithoutId =
   | HistoryItemArenaSessionComplete
   | HistoryItemInsightProgress
   | HistoryItemBtw
+  | HistoryItemAdvisor
   | HistoryItemMemorySaved
   | HistoryItemAwayRecap
   | HistoryItemUserPromptSubmitBlocked
@@ -577,9 +818,22 @@ export type HistoryItemWithoutId =
   | HistoryItemStopHookSystemMessage
   | HistoryItemDoctor
   | HistoryItemDiffStats
-  | HistoryItemGoalStatus;
+  | HistoryItemGoalStatus
+  | HistoryItemGoalState;
 
 export type HistoryItem = HistoryItemWithoutId & { id: number };
+
+/**
+ * Shared visibility predicate: an item collapsed on session resume
+ * (`ui.history.collapseOnResume`) sets `display.suppressOnRestore` and is
+ * represented only by its collapse-summary row. Both the main view
+ * (MainContent) and the Ctrl+O transcript (AppContainer's freeze snapshot)
+ * filter on this, so keep the single source of truth here to prevent the two
+ * surfaces from diverging.
+ */
+export const isHistoryItemVisibleAfterRestore = (
+  item: Pick<HistoryItem, 'display'>,
+): boolean => !item.display?.suppressOnRestore;
 
 // Message types used by internal command feedback (subset of HistoryItem types)
 export enum MessageType {
@@ -593,6 +847,7 @@ export enum MessageType {
   STATS = 'stats',
   MODEL_STATS = 'model_stats',
   TOOL_STATS = 'tool_stats',
+  SKILL_STATS = 'skill_stats',
   QUIT = 'quit',
   GEMINI = 'gemini',
   COMPRESSION = 'compression',
@@ -606,8 +861,12 @@ export enum MessageType {
   ARENA_SESSION_COMPLETE = 'arena_session_complete',
   INSIGHT_PROGRESS = 'insight_progress',
   BTW = 'btw',
+  ADVISOR = 'advisor',
+  NOTIFICATION = 'notification',
   DIFF_STATS = 'diff_stats',
   GOAL_STATUS = 'goal_status',
+  GOAL_STATE = 'goal_state',
+  VISION_NOTICE = 'vision_notice',
 }
 
 export interface InsightProgressProps {
@@ -673,6 +932,11 @@ export type Message =
       content?: string;
     }
   | {
+      type: MessageType.SKILL_STATS;
+      timestamp: Date;
+      content?: string;
+    }
+  | {
       type: MessageType.QUIT;
       timestamp: Date;
       duration: string;
@@ -702,17 +966,24 @@ export interface ConsoleMessageItem {
 
 /**
  * Result type for a slash command that should immediately result in a prompt
- * being submitted to the Gemini model.
+ * being submitted to the model.
  */
 export interface SubmitPromptResult {
   type: 'submit_prompt';
   content: PartListUnion;
   /** Optional callback invoked after the agent turn completes successfully. */
   onComplete?: () => Promise<void>;
+  /** Refresh context-file-backed instructions after this prompt writes them. */
+  refreshContextFilesOnWrite?: boolean;
+  /**
+   * Optional per-turn model id. Applies to this submitted prompt (and its
+   * tool-call continuations) only — no session change, no persistence.
+   */
+  modelOverride?: string;
 }
 
 /**
- * Defines the result of the slash command processor for its consumer (useGeminiStream).
+ * Defines the result of the slash command processor for its consumer (useLlmStream).
  */
 export type SlashCommandProcessorResult =
   | {

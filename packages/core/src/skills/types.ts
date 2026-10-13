@@ -36,8 +36,22 @@ export interface SkillConfig {
   description: string;
 
   /**
-   * Optional list of tool names that this skill is allowed to use.
-   * For v1, this is informational only (no gating).
+   * Optional list of tools to auto-approve while this skill is active.
+   *
+   * Each entry is a permission rule string in the same syntax as
+   * `settings.json` `permissions.allow` — e.g. `Bash(git *)`, `Edit`, `Read`,
+   * `mcp__server__tool`. When the skill is invoked (via the model Skill-tool or
+   * a user `/<skill>` slash command), each entry is added as a session-scoped
+   * allow rule, so matching tool calls are auto-approved instead of prompting.
+   *
+   * This is an additive grant only: it never hides or restricts the tools the
+   * model can see, and since #10075 `permissions.allow` no longer affects
+   * registration at all. A tool the `settings.tools.eager` allowlist omits
+   * stays deferred — registered, inspectable via `tool_search`, invokable via
+   * `tool_call` — regardless of this grant. An eager-by-default tool omitted by `tools.eager` needs its
+   * name added plus a restart; a tool deferred by default needs
+   * `tools.visible` instead (#9827).
+   * Malformed entries are ignored. See `applySkillAllowedTools`.
    */
   allowedTools?: string[];
 
@@ -78,9 +92,31 @@ export interface SkillConfig {
   body: string;
 
   /**
-   * For extension-level skills: the name of the providing extension
+   * For extension-level skills: the canonical name of the providing extension
    */
   extensionName?: string;
+
+  /**
+   * For extension-level skills: the localized display name of the providing
+   * extension. Presentation only; never use this field as an identity.
+   */
+  extensionDisplayName?: string;
+
+  /**
+   * The name exactly as written in this skill's SKILL.md frontmatter. For an
+   * extension skill, `name` is the registry identity
+   * (`<extensionName>:<authoredName>`) and this is the authored part.
+   *
+   * Absent wherever there is only one spelling: every non-extension skill, and
+   * the manifest's own rows (`extension.skills[]`), which are never qualified.
+   * Registration sets it on every extension registry row, so for those rows the
+   * two spellings never coincide.
+   *
+   * Never recovered by splitting `name`: `SKILL_NAME_PATTERN` admits `:`, so
+   * an author may write `rust:chat` inside `rust`, and that skill's authored
+   * name is `rust:chat`, not `chat`.
+   */
+  authoredName?: string;
 
   /**
    * Argument hint shown after the slash command name in completion menus.
@@ -102,6 +138,13 @@ export interface SkillConfig {
    * field in SKILL.md.
    */
   disableModelInvocation?: boolean;
+
+  /**
+   * Whether users can invoke this skill directly via `/<skill-name>`.
+   * Defaults to true. Parsed from the `user-invocable` frontmatter field in
+   * SKILL.md.
+   */
+  userInvocable?: boolean;
 
   /**
    * Optional glob patterns that gate when this skill is offered to the model.
@@ -146,6 +189,28 @@ export function parseModelField(
     return undefined;
   }
   return trimmed;
+}
+
+/**
+ * Parse the `user-invocable` field from skill frontmatter.
+ * Returns `undefined` when omitted or set to an invalid value, preserving the
+ * command-layer default that skills are user-invocable unless explicitly
+ * disabled.
+ */
+export function parseUserInvocableField(
+  frontmatter: Record<string, unknown>,
+): boolean | undefined {
+  const raw = frontmatter['user-invocable'];
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (raw === true || raw === 'true') {
+    return true;
+  }
+  if (raw === false || raw === 'false') {
+    return false;
+  }
+  return undefined;
 }
 
 /**
@@ -225,6 +290,24 @@ export function parsePathsField(
 export const SKILL_NAME_PATTERN = /^[\p{L}\p{N}_:.-]+$/u;
 
 /**
+ * Parse the `allowedTools` field from skill frontmatter.
+ * Returns `undefined` when the field is omitted. Throws when the field is
+ * present but not an array.
+ */
+export function parseAllowedToolsField(
+  frontmatter: Record<string, unknown>,
+): string[] | undefined {
+  const raw = frontmatter['allowedTools'];
+  if (raw == null) {
+    return undefined;
+  }
+  if (!Array.isArray(raw)) {
+    throw new Error('"allowedTools" must be an array');
+  }
+  return raw.map(String);
+}
+
+/**
  * Validate that a skill `name` is safe to embed into prompts and reminders
  * verbatim. Throws with a descriptive message if not — the surrounding
  * parser converts this into a `parseErrors` entry and skips the skill,
@@ -236,6 +319,71 @@ export function validateSkillName(name: string): void {
       `"name" must match ${SKILL_NAME_PATTERN} (letters, digits, _, :, ., -); got "${name}"`,
     );
   }
+}
+
+/**
+ * The registry identity of an extension skill: the extension's name, `:`, and
+ * the authored name.
+ *
+ * Built only by concatenation from the manifest that owns the skill, never
+ * parsed back apart — `SKILL_NAME_PATTERN` admits `:`, so an author may write
+ * `rust:chat` inside `rust` and that skill's authored name is `rust:chat`,
+ * not `chat`. The authored spelling is carried alongside as
+ * `SkillConfig.authoredName`.
+ */
+export function qualifySkillName(
+  extensionName: string,
+  authoredName: string,
+): string {
+  return `${extensionName}:${authoredName}`;
+}
+
+/**
+ * Every spelling a restriction must match to keep biting after an extension
+ * skill gained its prefix. A restriction is an entry that can only remove
+ * capability: `skills.disabled`, `skills.defaultDisabled`,
+ * `slashCommands.disabled`.
+ *
+ * Deny-by-default: a pre-existing `skills.disabled: ['pdf']` still blocks
+ * `rust:pdf`. A rename that silently un-blocked it would be a capability grant
+ * delivered by an unrelated code change.
+ *
+ * Grants are the opposite case and are deliberately not covered here:
+ * `skills.enabled` matches the registry identity only, so a legacy bare entry
+ * opens nothing.
+ *
+ * The returned spellings are normalized the way every settings list is
+ * (`trim().toLowerCase()`), so they are for matching only and must not be
+ * reused for display. Order is canonical identity first, authored second.
+ */
+export function skillRestrictionNames(skill: {
+  name: string;
+  authoredName?: string;
+}): string[] {
+  const { name, authoredName } = skill;
+  const canonical = name.trim().toLowerCase();
+  const authored = authoredName?.trim().toLowerCase();
+  return authored && authored !== canonical
+    ? [canonical, authored]
+    : [canonical];
+}
+
+/**
+ * The authored spelling of a skill name — what the manifest and the workspace
+ * extension-skill store key on — for every lookup that reads those views
+ * instead of the registry identity.
+ *
+ * `authoredName` is absent whenever the two spellings are the same, so the
+ * fallback is `name`. The fallback is the whole rule and is deliberately not
+ * written out per call site: a site that forgets it stops matching the
+ * manifest, and for `isInactiveExtensionSkill` the miss reads as "this skill
+ * is not inactive", which is a fail-open.
+ */
+export function authoredSkillName(skill: {
+  name: string;
+  authoredName?: string;
+}): string {
+  return skill.authoredName ?? skill.name;
 }
 
 /**

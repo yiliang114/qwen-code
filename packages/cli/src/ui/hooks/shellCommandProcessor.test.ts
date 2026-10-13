@@ -3,6 +3,7 @@
  * Copyright 2025 Google LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+// @vitest-environment jsdom
 
 import { act, renderHook } from '@testing-library/react';
 import {
@@ -17,6 +18,11 @@ import {
 
 const mockIsBinary = vi.hoisted(() => vi.fn());
 const mockShellExecutionService = vi.hoisted(() => vi.fn());
+const runtimeShellMock = vi.hoisted(() => vi.fn());
+vi.mock('@qwen-code/qwen-code-core/sandbox/runtime-shell.js', () => ({
+  executeRuntimeShell: runtimeShellMock,
+}));
+
 vi.mock('@qwen-code/qwen-code-core', async (importOriginal) => {
   const original =
     await importOriginal<typeof import('@qwen-code/qwen-code-core')>();
@@ -36,8 +42,9 @@ import {
   OUTPUT_UPDATE_INTERVAL_MS,
 } from './shellCommandProcessor.js';
 import {
+  MAX_RETAINED_TOOL_RESULT_DISPLAY_CHARS,
   type Config,
-  type GeminiClient,
+  type LlmClient,
   type ShellExecutionResult,
   type ShellOutputEvent,
 } from '@qwen-code/qwen-code-core';
@@ -53,7 +60,7 @@ describe('useShellCommandProcessor', () => {
   let onExecMock: Mock;
   let onDebugMessageMock: Mock;
   let mockConfig: Config;
-  let mockGeminiClient: GeminiClient;
+  let mockLlmClient: LlmClient;
 
   let mockShellOutputCallback: (event: ShellOutputEvent) => void;
   let resolveExecutionPromise: (result: ShellExecutionResult) => void;
@@ -62,6 +69,9 @@ describe('useShellCommandProcessor', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    runtimeShellMock.mockImplementation((_runtime, ...args) =>
+      mockShellExecutionService(...args),
+    );
 
     addItemToHistoryMock = vi.fn();
     setPendingHistoryItemMock = vi.fn();
@@ -76,7 +86,7 @@ describe('useShellCommandProcessor', () => {
         terminalWidth: 80,
       }),
     } as Config;
-    mockGeminiClient = { addHistory: vi.fn() } as unknown as GeminiClient;
+    mockLlmClient = { addHistory: vi.fn() } as unknown as LlmClient;
 
     vi.mocked(os.platform).mockReturnValue('linux');
     vi.mocked(os.tmpdir).mockReturnValue('/tmp');
@@ -105,7 +115,7 @@ describe('useShellCommandProcessor', () => {
         onExecMock,
         onDebugMessageMock,
         mockConfig,
-        mockGeminiClient,
+        mockLlmClient,
         setShellInputFocusedMock,
       ),
     );
@@ -122,6 +132,35 @@ describe('useShellCommandProcessor', () => {
     pid: 12345,
     executionMethod: 'child_process',
     ...overrides,
+  });
+
+  it('binds sandboxed shell mode to its Config without a host pwd file', async () => {
+    mockConfig.getShellExecutionSandbox = () =>
+      ({ filesystem: 'read-only', network: 'closed' }) as ReturnType<
+        Config['getShellExecutionSandbox']
+      >;
+    const { result } = renderProcessorHook();
+    act(() => {
+      result.current.handleShellCommand(
+        'echo sandbox',
+        new AbortController().signal,
+      );
+    });
+    expect(runtimeShellMock).toHaveBeenCalledWith(
+      mockConfig,
+      'echo sandbox',
+      '/test/dir',
+      expect.any(Function),
+      expect.any(AbortSignal),
+      false,
+      expect.any(Object),
+    );
+    expect(crypto.randomBytes).not.toHaveBeenCalled();
+    expect(fs.writeFileSync).not.toHaveBeenCalled();
+    await act(async () => {
+      resolveExecutionPromise(createMockServiceResult());
+      await onExecMock.mock.calls[0][0];
+    });
   });
 
   it('should initiate command execution and set pending state', async () => {
@@ -146,7 +185,7 @@ describe('useShellCommandProcessor', () => {
       isUserInitiated: true,
     });
     const tmpFile = path.join(os.tmpdir(), 'shell_pwd_abcdef.tmp');
-    const wrappedCommand = `{ ls -l; }; __code=$?; pwd > "${tmpFile}"; exit $__code`;
+    const wrappedCommand = `{ ls -l;\n}; __code=$?; pwd > "${tmpFile}"; exit $__code`;
     expect(mockShellExecutionService).toHaveBeenCalledWith(
       wrappedCommand,
       '/test/dir',
@@ -156,6 +195,30 @@ describe('useShellCommandProcessor', () => {
       expect.any(Object),
     );
     expect(onExecMock).toHaveBeenCalledWith(expect.any(Promise));
+  });
+
+  it('closes a dangling line continuation before appending the terminator so it is not escaped (R6-8)', async () => {
+    const { result } = renderProcessorHook();
+
+    act(() => {
+      result.current.handleShellCommand(
+        'echo hi \\',
+        new AbortController().signal,
+      );
+    });
+
+    const tmpFile = path.join(os.tmpdir(), 'shell_pwd_abcdef.tmp');
+    // The appended `;` must start its own line: a bare `;` right after the
+    // backslash is escaped into a literal `;` argument (bash runs `ls ';'`).
+    const wrappedCommand = `{ echo hi \\\n;\n}; __code=$?; pwd > "${tmpFile}"; exit $__code`;
+    expect(mockShellExecutionService).toHaveBeenCalledWith(
+      wrappedCommand,
+      '/test/dir',
+      expect.any(Function),
+      expect.any(Object),
+      false,
+      expect.any(Object),
+    );
   });
 
   it('should handle successful execution and update history correctly', async () => {
@@ -186,8 +249,72 @@ describe('useShellCommandProcessor', () => {
         ],
       }),
     );
-    expect(mockGeminiClient.addHistory).toHaveBeenCalled();
+    expect(mockLlmClient.addHistory).toHaveBeenCalled();
     expect(setShellInputFocusedMock).toHaveBeenCalledWith(false);
+  });
+
+  it('compacts large shell output for UI history without changing model history behavior', async () => {
+    const largeOutput = `head-${'x'.repeat(100_000)}-tail`;
+    const { result } = renderProcessorHook();
+
+    act(() => {
+      result.current.handleShellCommand(
+        'generate-large-output',
+        new AbortController().signal,
+      );
+    });
+    const execPromise = onExecMock.mock.calls[0][0];
+
+    act(() => {
+      resolveExecutionPromise(createMockServiceResult({ output: largeOutput }));
+    });
+    await act(async () => await execPromise);
+
+    const finalHistoryItem = addItemToHistoryMock.mock.calls[1][0];
+    const finalDisplay = finalHistoryItem.tools[0].resultDisplay as string;
+    expect(finalDisplay.length).toBeLessThanOrEqual(
+      MAX_RETAINED_TOOL_RESULT_DISPLAY_CHARS,
+    );
+    expect(finalDisplay).toContain('head-');
+    expect(finalDisplay).toContain('-tail');
+    expect(finalDisplay).toContain('truncated from');
+
+    const modelHistoryText = (
+      vi.mocked(mockLlmClient.addHistory).mock.calls[0]![0].parts![0]! as {
+        text: string;
+      }
+    ).text;
+    expect(modelHistoryText.length).toBeGreaterThan(10_000);
+    expect(modelHistoryText.length).toBeLessThan(10_500);
+    expect(modelHistoryText).toContain('head-');
+    expect(modelHistoryText).not.toContain('-tail');
+    expect(modelHistoryText).toContain('... (truncated)');
+  });
+
+  it('preserves unmatched surrogate code units in truncated shell model history', async () => {
+    const longOutput = `head-\uD800-${'x'.repeat(11_000)}`;
+    const { result } = renderProcessorHook();
+
+    act(() => {
+      result.current.handleShellCommand(
+        'surrogate-output',
+        new AbortController().signal,
+      );
+    });
+    const execPromise = onExecMock.mock.calls[0][0];
+
+    act(() => {
+      resolveExecutionPromise(createMockServiceResult({ output: longOutput }));
+    });
+    await act(async () => await execPromise);
+
+    const modelHistoryText = (
+      vi.mocked(mockLlmClient.addHistory).mock.calls[0]![0].parts![0]! as {
+        text: string;
+      }
+    ).text;
+    expect(modelHistoryText).toContain('\uD800');
+    expect(modelHistoryText).not.toContain('\uFFFD');
   });
 
   it('should handle command failure and display error status', async () => {
@@ -217,6 +344,29 @@ describe('useShellCommandProcessor', () => {
     expect(setShellInputFocusedMock).toHaveBeenCalledWith(false);
   });
 
+  it('should treat PTY clean-exit signal 0 as a successful command', async () => {
+    const { result } = renderProcessorHook();
+
+    act(() => {
+      result.current.handleShellCommand(
+        'pty-clean-exit',
+        new AbortController().signal,
+      );
+    });
+    const execPromise = onExecMock.mock.calls[0][0];
+
+    act(() => {
+      resolveExecutionPromise(createMockServiceResult({ signal: 0 }));
+    });
+    await act(async () => await execPromise);
+
+    const finalHistoryItem = addItemToHistoryMock.mock.calls[1][0];
+    expect(finalHistoryItem.tools[0].status).toBe(ToolCallStatus.Success);
+    expect(finalHistoryItem.tools[0].resultDisplay).not.toContain(
+      'terminated by signal',
+    );
+  });
+
   describe('UI Streaming and Throttling', () => {
     beforeEach(() => {
       vi.useFakeTimers({ toFake: ['Date'] });
@@ -235,7 +385,7 @@ describe('useShellCommandProcessor', () => {
       });
 
       // Verify it's using the non-pty shell
-      const wrappedCommand = `{ stream; }; __code=$?; pwd > "${path.join(
+      const wrappedCommand = `{ stream;\n}; __code=$?; pwd > "${path.join(
         os.tmpdir(),
         'shell_pwd_abcdef.tmp',
       )}"; exit $__code`;
@@ -479,12 +629,18 @@ describe('useShellCommandProcessor', () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
 
     const { result } = renderProcessorHook();
+    const abortController = new AbortController();
+    const addEventListenerSpy = vi.spyOn(
+      abortController.signal,
+      'addEventListener',
+    );
+    const removeEventListenerSpy = vi.spyOn(
+      abortController.signal,
+      'removeEventListener',
+    );
 
     act(() => {
-      result.current.handleShellCommand(
-        'a-command',
-        new AbortController().signal,
-      );
+      result.current.handleShellCommand('a-command', abortController.signal);
     });
     const execPromise = onExecMock.mock.calls[0][0];
 
@@ -499,6 +655,10 @@ describe('useShellCommandProcessor', () => {
     const tmpFile = path.join(os.tmpdir(), 'shell_pwd_abcdef.tmp');
     // Verify that the temporary file was cleaned up
     expect(vi.mocked(fs.unlinkSync)).toHaveBeenCalledWith(tmpFile);
+    expect(removeEventListenerSpy).toHaveBeenCalledWith(
+      'abort',
+      addEventListenerSpy.mock.calls[0][1],
+    );
     expect(setShellInputFocusedMock).toHaveBeenCalledWith(false);
   });
 

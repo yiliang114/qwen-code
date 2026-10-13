@@ -31,9 +31,12 @@ import type {
   ChatCompressionEvent,
   InvalidChunkEvent,
   ContentRetryEvent,
+  ProtocolTagSanitizedEvent,
+  ApiRetryEvent,
   ContentRetryFailureEvent,
   ConversationFinishedEvent,
   SubagentExecutionEvent,
+  GoalStateEvent,
   ExtensionInstallEvent,
   ExtensionUninstallEvent,
   ToolOutputTruncatedEvent,
@@ -45,6 +48,7 @@ import type {
   UserFeedbackEvent,
   UserRetryEvent,
   RipgrepFallbackEvent,
+  RipgrepRuntimeRecoveryEvent,
   EndSessionEvent,
   ExtensionUpdateEvent,
   ArenaSessionStartedEvent,
@@ -68,7 +72,7 @@ import {
 } from '../../utils/debugLogger.js';
 import { safeJsonStringify } from '../../utils/safeJsonStringify.js';
 import { sanitizeHookName } from '../sanitize.js';
-import { InstallationManager } from '../../utils/installationManager.js';
+import { InstallationManager } from '../../config/installationManager.js';
 import { FixedDeque } from 'mnemonist';
 import { AuthType } from '../../core/contentGenerator.js';
 
@@ -99,6 +103,9 @@ const MAX_EVENTS = 1000;
  * Maximum events to retry after a failed RUM flush
  */
 const MAX_RETRY_EVENTS = 100;
+
+const ERROR_TEXT_PROPERTY_KEYS = ['error_message', 'error_excerpt'];
+const REDACTED_ERROR_TEXT = '***REDACTED***';
 
 export interface LogResponse {
   nextRequestWaitMs?: number;
@@ -178,6 +185,7 @@ export class QwenLogger {
 
   enqueueLogEvent(event: RumEvent): void {
     try {
+      this.redactEventErrorText(event);
       // Manually handle overflow for FixedDeque, which throws when full.
       const wasAtCapacity = this.events.size >= MAX_EVENTS;
 
@@ -194,6 +202,23 @@ export class QwenLogger {
       }
     } catch (error) {
       this.debugLogger.error('QwenLogger: Failed to enqueue log event.', error);
+    }
+  }
+
+  private redactEventErrorText(event: RumEvent): void {
+    const properties = event.properties;
+    if (properties) {
+      for (const key of ERROR_TEXT_PROPERTY_KEYS) {
+        const value = properties[key];
+        if (typeof value === 'string') {
+          properties[key] = REDACTED_ERROR_TEXT;
+        }
+      }
+    }
+
+    const message = (event as RumExceptionEvent).message;
+    if (typeof message === 'string') {
+      (event as RumExceptionEvent).message = REDACTED_ERROR_TEXT;
     }
   }
 
@@ -282,7 +307,8 @@ export class QwenLogger {
         auth_type: authType,
         model: this.config?.getModel(),
         base_url:
-          authType === AuthType.USE_OPENAI
+          authType === AuthType.USE_OPENAI ||
+          authType === AuthType.USE_OPENAI_RESPONSES
             ? this.config?.getContentGeneratorConfig().baseUrl || ''
             : '',
         ...(this.config?.getChannel?.()
@@ -486,6 +512,7 @@ export class QwenLogger {
       properties: {
         prompt_id: event.prompt_id,
         prompt_length: event.prompt_length,
+        ...(event.model ? { model: event.model } : {}),
       },
     });
 
@@ -534,9 +561,13 @@ export class QwenLogger {
       `tool_call#${event.function_name}`,
       {
         properties: {
+          call_id: event.call_id,
           prompt_id: event.prompt_id,
           response_id: event.response_id,
           tool_name: event.function_name,
+          status: event.status,
+          execution_status: event.execution_status,
+          tool_type: event.tool_type,
           permission: event.decision,
           success: event.success ? 1 : 0,
           duration_ms: event.duration_ms,
@@ -576,12 +607,42 @@ export class QwenLogger {
         subagent_name: event.subagent_name,
         status: event.status,
         terminate_reason: event.terminate_reason,
+        ...(event.loop_type ? { loop_type: event.loop_type } : {}),
       },
       snapshots: JSON.stringify({
         ...(event.execution_summary
           ? { execution_summary: event.execution_summary }
           : {}),
       }),
+    });
+
+    this.enqueueLogEvent(rumEvent);
+    this.flushIfNeeded();
+  }
+
+  logGoalStateEvent(event: GoalStateEvent): void {
+    // The Goal id is left out: this sink aggregates by installation, where a
+    // per-Goal identifier only adds a unique value to every row.
+    const properties: Record<string, unknown> = {
+      cause: event.cause,
+      revision: event.revision,
+    };
+    for (const key of [
+      'status',
+      'limit_kind',
+      'turn_count',
+      'tokens_used',
+      'no_progress_turns',
+      'token_budget',
+      'turn_budget',
+      'active_time_ms',
+      'active_time_budget_ms',
+      'objective_length',
+    ] as const) {
+      if (event[key] !== undefined) properties[key] = event[key];
+    }
+    const rumEvent = this.createActionEvent('goal', 'goal_state', {
+      properties,
     });
 
     this.enqueueLogEvent(rumEvent);
@@ -649,6 +710,7 @@ export class QwenLogger {
         model: event.model,
         prompt_id: event.prompt_id,
         auth_type: event.auth_type,
+        loop_wakeups_cancelled: event.loop_wakeups_cancelled,
       },
     });
 
@@ -881,6 +943,28 @@ export class QwenLogger {
     this.flushIfNeeded();
   }
 
+  logRipgrepRuntimeRecoveryEvent(event: RipgrepRuntimeRecoveryEvent): void {
+    const rumEvent = this.createActionEvent(
+      'misc',
+      'ripgrep_runtime_recovery',
+      {
+        properties: {
+          platform: process.platform,
+          arch: process.arch,
+          selection_mode: event.selection_mode,
+          retry_triggered: event.retry_triggered,
+          ...(event.retry_succeeded !== undefined
+            ? { retry_succeeded: event.retry_succeeded }
+            : {}),
+          failure_kind: event.failure_kind,
+        },
+      },
+    );
+
+    this.enqueueLogEvent(rumEvent);
+    this.flushIfNeeded();
+  }
+
   logLoopDetectionDisabledEvent(): void {
     const rumEvent = this.createActionEvent(
       'misc',
@@ -910,6 +994,7 @@ export class QwenLogger {
       properties: {
         skill_name: event.skill_name,
         success: event.success ? 1 : 0,
+        prompt_id: event.prompt_id,
       },
     });
 
@@ -950,6 +1035,41 @@ export class QwenLogger {
         error_type: event.error_type,
         attempt_number: event.attempt_number,
         retry_delay_ms: event.retry_delay_ms,
+      },
+    });
+
+    this.enqueueLogEvent(rumEvent);
+    this.flushIfNeeded();
+  }
+
+  logProtocolTagSanitizedEvent(event: ProtocolTagSanitizedEvent): void {
+    const rumEvent = this.createActionEvent('misc', 'protocol_tag_sanitized', {
+      properties: {
+        model: event.model,
+        prompt_id: event.prompt_id ?? '',
+        response_id: event.response_id ?? '',
+        tag_name: event.tag_name,
+        tool_call_count: event.tool_call_count,
+      },
+    });
+
+    this.enqueueLogEvent(rumEvent);
+    this.flushIfNeeded();
+  }
+
+  // Phase 4b — HTTP-status retry from retryWithBackoff (429/5xx). Distinct from
+  // logContentRetryEvent which is fired by llmChat's content-recovery loop.
+  logApiRetryEvent(event: ApiRetryEvent): void {
+    const rumEvent = this.createActionEvent('misc', 'api_retry', {
+      properties: {
+        model: event.model,
+        prompt_id: event.prompt_id ?? '',
+        attempt_number: event.attempt_number,
+        error_type: event.error_type ?? 'unknown',
+        status_code:
+          event.status_code !== undefined ? String(event.status_code) : '',
+        retry_delay_ms: event.retry_delay_ms,
+        subagent_name: event.subagent_name ?? '',
       },
     });
 
@@ -1029,10 +1149,6 @@ export class QwenLogger {
       exit_code: event.exit_code,
     };
 
-    if (event.error && this.config?.getTelemetryLogPromptsEnabled()) {
-      properties['error'] = event.error;
-    }
-
     const rumEvent = this.createActionEvent(
       'hook',
       `hook_call#${event.hook_event_name}`,
@@ -1048,7 +1164,7 @@ export class QwenLogger {
     if (!proxyUrl) return undefined;
     // undici which is widely used in the repo can only support http & https proxy protocol,
     // https://github.com/nodejs/undici/issues/2224
-    if (proxyUrl.startsWith('http')) {
+    if (/^https?:\/\//i.test(proxyUrl)) {
       return new HttpsProxyAgent(proxyUrl);
     } else {
       throw new Error('Unsupported proxy type');

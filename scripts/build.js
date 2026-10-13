@@ -25,54 +25,32 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, '..');
 
-// npm install if node_modules was removed (e.g. via npm run clean or scripts/clean.js)
+// Install if node_modules was removed (e.g. via npm run clean or scripts/clean.js)
 if (!existsSync(join(root, 'node_modules'))) {
-  execSync('npm install', { stdio: 'inherit', cwd: root });
+  execSync('corepack pnpm install --frozen-lockfile', {
+    stdio: 'inherit',
+    cwd: root,
+  });
 }
 
 // build all workspaces/packages in dependency order
 execSync('npm run generate', { stdio: 'inherit', cwd: root });
 
-// Build in dependency order:
-// 1. core (foundation package, includes test-utils)
-// 2. web-templates (embeddable web templates - used by cli)
-// 3. channel-base (base channel infrastructure - used by channel adapters and cli)
-// 4. channel adapters (depend on channel-base)
-// 5. acp-bridge (depends on core - used by cli)
-// 6. cli (depends on core, acp-bridge, web-templates, channel packages)
-// 7. webui (shared UI components - used by vscode companion)
-// 8. sdk (no internal dependencies)
-// 9. vscode-ide-companion (depends on webui)
-const buildOrder = [
-  'packages/core',
-  'packages/web-templates',
-  'packages/channels/base',
-  'packages/channels/telegram',
-  'packages/channels/weixin',
-  'packages/channels/dingtalk',
-  'packages/channels/plugin-example',
-  'packages/acp-bridge',
-  'packages/cli',
-  'packages/webui',
-  'packages/sdk-typescript',
-  'packages/vscode-ide-companion',
-];
+// Select the CLI by path: the repository root has the same package name.
+const cliOnly = process.argv.includes('--cli-only');
+// Mobile MCP has an independent build and was never part of the root build.
+const filter = cliOnly
+  ? '--filter "{./packages/cli}..." --filter @qwen-code/node-repl-mcp --filter @qwen-code/channel-plugin-example'
+  : '--filter "!@qwen-code/mobile-mcp"';
+execSync(`corepack pnpm -r ${filter} run build`, {
+  stdio: 'inherit',
+  cwd: root,
+});
 
-for (const workspace of buildOrder) {
-  execSync(`npm run build --workspace=${workspace}`, {
-    stdio: 'inherit',
-    cwd: root,
-  });
-
-  // After cli is built, generate the JSON Schema for settings
-  // so the vscode-ide-companion extension can provide IntelliSense
-  if (workspace === 'packages/cli') {
-    execSync('node --import tsx/esm scripts/generate-settings-schema.ts', {
-      stdio: 'inherit',
-      cwd: root,
-    });
-  }
-}
+execSync('node --import tsx/esm scripts/generate-settings-schema.ts', {
+  stdio: 'inherit',
+  cwd: root,
+});
 
 // also build container image if sandboxing is enabled
 // skip (-s) npm install + build since we did that above

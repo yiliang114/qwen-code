@@ -1,21 +1,116 @@
 # Web Search
 
-Qwen Code supports web search capabilities through **MCP (Model Context Protocol)** integrations. Rather than a built-in search tool, web search is provided by connecting to external MCP servers, giving you full flexibility to choose the search service that best fits your needs.
+Qwen Code provides web search two ways:
 
-## ⚠️ Breaking Change: Built-in `web_search` Tool Removed
+1. **Built-in `web_search` tool** — backed by the DashScope Responses API server-side search. On by default at startup for supported ModelStudio and OpenAI-compatible DashScope configurations; no extra provider or MCP setup.
+2. **MCP (Model Context Protocol) integrations** — connect any external search service (Tavily, GLM, and others). Use this when your provider cannot back the built-in tool.
 
-> **Affected versions:** `V0.0.7+` through the last release with built-in web search support.
+## Built-in `web_search`
 
-The built-in `web_search` tool and all its associated configuration have been **removed**. If you were using any of the following, you should migrate to the MCP-based approach described in this document:
+The built-in tool issues a self-contained search request to a small auxiliary model with DashScope's server-side `web_search` (and `web_extractor`) tools, and returns the narrated findings plus source URLs.
 
-| Removed                                                                | What to do                                                                                  |
-| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `webSearch` block in `settings.json`                                   | Configure an MCP server in `mcpServers` instead (see below)                                 |
-| `advanced.tavilyApiKey` in `settings.json`                             | Use the [Tavily MCP server](#tavily-websearch)                                              |
-| `TAVILY_API_KEY` environment variable                                  | Use the [Tavily MCP server](#tavily-websearch)                                              |
-| `DASHSCOPE_API_KEY` for web search                                     | Use the [Alibaba Cloud Bailian WebSearch MCP](#alibaba-cloud-bailian-websearch-recommended) |
-| `GLM_API_KEY` for web search                                           | Use the [GLM WebSearch Prime MCP](#glm-websearch-prime-zhipuai)                             |
-| `--tavily-api-key` / `--glm-api-key` / `--dashscope-api-key` CLI flags | Configure via `mcpServers` in `settings.json`                                               |
+### When it turns on by itself
+
+If you configured nothing under `tools.webSearch`, the tool registers whenever the model you are running can back the search request with the same credentials:
+
+| How you signed in                                                                                                          | Built-in search                                 |
+| -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| Alibaba ModelStudio → **Standard API Key**                                                                                 | on                                              |
+| Alibaba ModelStudio → **Token Plan**                                                                                       | on                                              |
+| Alibaba ModelStudio → **Coding Plan**                                                                                      | off — its endpoint is not verified for this API |
+| An OpenAI-compatible `modelProviders` or Custom Provider entry on a recognized DashScope Responses host, with a direct key | on                                              |
+| Third-party providers (OpenRouter, DeepSeek, ModelScope, …), custom endpoints on other hosts, local models                 | off                                             |
+
+Searches bill the same key as your main model. Permission handling follows the active approval mode and rules; in `default` approval mode the first search asks for confirmation. When your provider cannot back the tool, it simply does not appear at startup — no startup warning.
+
+To turn it off:
+
+```json
+{ "tools": { "webSearch": { "enabled": false } } }
+```
+
+or `ENABLE_WEB_SEARCH=false`. Bare mode and safe mode always disable it.
+
+### Configuring it explicitly
+
+Point the tool at a ModelStudio Standard/Token Plan or another verified DashScope Responses entry. This is useful when your main model runs on another provider and you also hold a separate supported DashScope key. Coding Plan hosts are excluded from automatic activation because the Responses search tools are not verified there. You can opt in explicitly with `tools.webSearch.model`; if the endpoint does not serve them, the first search fails loudly. Use an MCP search provider if you do not want to rely on that unverified path.
+
+```json
+{
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "qwen3.8-flash",
+        "envKey": "DASHSCOPE_API_KEY",
+        "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      }
+    ]
+  },
+  "tools": {
+    "webSearch": {
+      "enabled": true,
+      "model": "qwen3.8-flash"
+    }
+  }
+}
+```
+
+| Setting                         | Env override                 | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ------------------------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tools.webSearch.enabled`       | `ENABLE_WEB_SEARCH`          | Set `false` to turn the tool off. Implicit startup activation requires leaving `enabled`, `model`, and the env-only backend unset. Setting `true` permits automatic derivation only when the env-only backend is also unset; otherwise a `model` is required.                                                                                                                                                                                                                                                                                                                          |
+| `tools.webSearch.model`         | `WEB_SEARCH_MODEL`           | Search model selector for the explicit path (`modelId` or `authType:modelId`). With `WEB_SEARCH_BASE_URL` it is the plain model id for that endpoint; otherwise it must match a declared DashScope-compatible `modelProviders` entry. The automatic path uses `qwen3.8-flash`.                                                                                                                                                                                                                                                                                                         |
+| `tools.webSearch.webExtractor`  | `WEB_SEARCH_EXTRACTOR`       | Let the search agent open result pages for better-grounded answers (default `true`; billed separately by DashScope).                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `tools.webSearch.timeoutMs`     | `WEB_SEARCH_TIMEOUT_MS`      | Total time budget for one search, in milliseconds (default `120000`, max `600000`; other values fall back to the default). A search that runs out of time returns what arrived as a partial result once at least one search call has completed; if the budget expires before the first search call finishes, the tool reports a timeout error instead, because narration with no executed search is not auditable evidence. A per-tool execution cap (`QWEN_CODE_TOOL_EXECUTION_TIMEOUT_MS`) below this budget fires first and discards the partial result; keep it above `timeoutMs`. |
+| `tools.webSearch.maxPerSession` | `WEB_SEARCH_MAX_PER_SESSION` | Maximum `web_search` calls in one session (default `200`, max `10000`; other values fall back to the default). The count is shared with subagents and resets when the session changes (`/clear`, `/resume`, branching). Once it is reached, further searches are skipped and the model is told to continue with what it has gathered.                                                                                                                                                                                                                                                  |
+
+### Env-only configuration (no settings.json)
+
+For environments where you cannot write a settings file (locked-down containers, CI
+with env injection only), the tool can be configured entirely through environment
+variables — no `modelProviders` entry needed:
+
+```bash
+export ENABLE_WEB_SEARCH=true
+export WEB_SEARCH_MODEL=qwen3.8-flash
+export WEB_SEARCH_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+export DASHSCOPE_API_KEY=sk-...        # or set WEB_SEARCH_API_KEY instead
+```
+
+`WEB_SEARCH_BASE_URL` mirrors a `modelProviders` entry's `baseUrl` and must be a
+DashScope-compatible endpoint; when it is set, it takes precedence over
+`modelProviders` resolution and `WEB_SEARCH_MODEL` is used as the plain DashScope
+model id. The API key is read from `WEB_SEARCH_API_KEY` if set, otherwise from
+`DASHSCOPE_API_KEY`. Misconfiguration still surfaces as a startup notice.
+
+Notes:
+
+- The selector must resolve to a DashScope-compatible `modelProviders` entry carrying a direct API key via `envKey`. Your main model can be any provider — only the search side request needs a DashScope entry. Qwen OAuth cannot back the tool.
+- Which providers can activate the tool is decided at startup. Once active, the search backend follows the currently selected model on the next search; switching to an unsupported provider makes that invocation fail, while switching from a session where the tool was absent still requires a restart to register it.
+- Automatic host detection intentionally accepts only known DashScope regional, Token Plan MaaS, and internal Alibaba hosts. Generic `*.alicloudapi.com` gateways and `DASHSCOPE_PROXY_BASE_URL` are excluded because they are not known to forward the Responses search tools.
+- If enabled explicitly but misconfigured, the tool stays off and a startup notice explains which condition failed. Automatic activation never emits a notice.
+- Searches bill your DashScope key (`usage.x_tools` counts). Auto approval mode (the default) lets the classifier approve searches without prompting; in `default` approval mode the tool asks, and approving with "always allow" persists a standard `WebSearch` permission rule, like other tools.
+- There is no client-side model allowlist; a model the Responses endpoint does not serve fails loudly on first use.
+- A search that exceeds its time budget returns what arrived as a partial result once at least one search call has completed; if the budget expires before the first search call finishes, the tool reports a timeout error instead, because narration with no executed search is not auditable evidence. When a search call did complete but the narrated answer never arrived, the result carries at most 6,000 characters of the page text the agent had read, labeled as raw page content.
+- The per-session cap counts `web_search` tool calls, not the searches one call runs internally, and a call that fails still counts because the request was sent. A skipped call is not an error: it tells the model the budget is used and to ask you to raise `tools.webSearch.maxPerSession` if more searches are genuinely needed.
+
+## MCP alternatives
+
+If your provider cannot back the built-in tool, web search is available by connecting an external MCP server — see the services below.
+
+## ⚠️ Historical Breaking Change: original built-in `web_search` removed
+
+> **Affected versions:** `V0.0.7+` through the last release with the original multi-provider built-in web search.
+
+The original built-in `web_search` tool (Tavily/Google/GLM/DashScope multi-provider) and its configuration were **removed**. The built-in tool documented above is a different implementation with different configuration. If you were using any of the following, migrate either to the new built-in tool (DashScope) or to MCP:
+
+| Removed                                                                | What to do                                                      |
+| ---------------------------------------------------------------------- | --------------------------------------------------------------- |
+| `webSearch` block in `settings.json`                                   | Configure an MCP server in `mcpServers` instead (see below)     |
+| `advanced.tavilyApiKey` in `settings.json`                             | Use the [Tavily MCP server](#tavily-websearch)                  |
+| `TAVILY_API_KEY` environment variable                                  | Use the [Tavily MCP server](#tavily-websearch)                  |
+| `DASHSCOPE_API_KEY` for web search                                     | Use the [built-in `web_search` tool](#built-in-web_search)      |
+| `GLM_API_KEY` for web search                                           | Use the [GLM WebSearch Prime MCP](#glm-websearch-prime-zhipuai) |
+| `--tavily-api-key` / `--glm-api-key` / `--dashscope-api-key` CLI flags | Configure via `mcpServers` in `settings.json`                   |
 
 ### Migration Examples
 
@@ -74,9 +169,9 @@ The built-in `web_search` tool and all its associated configuration have been **
 
 ## Supported MCP Web Search Services
 
-### Alibaba Cloud Bailian WebSearch (Recommended)
+### Alibaba Cloud Bailian WebSearch
 
-The official web search MCP service provided by Alibaba Cloud Bailian platform, powered by DashScope.
+The official web search MCP service provided by Alibaba Cloud Bailian platform, powered by DashScope. If you have a DashScope key, prefer the built-in `web_search` tool above — it uses a stronger search path than this MCP service.
 
 - **MCP Marketplace:** https://bailian.console.aliyun.com/cn-beijing?tab=mcp#/mcp-market/detail/WebSearch
 - **Cost:** Paid (billed via Alibaba Cloud DashScope)

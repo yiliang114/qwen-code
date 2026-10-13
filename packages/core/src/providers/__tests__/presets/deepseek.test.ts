@@ -5,11 +5,9 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import {
-  AuthType,
-  deepseekProvider,
-  buildInstallPlan,
-} from '@qwen-code/qwen-code-core';
+import { AuthType } from '../../../core/contentGenerator.js';
+import { deepseekProvider } from '../../presets/deepseek.js';
+import { buildInstallPlan } from '../../provider-config.js';
 
 describe('deepseekProvider', () => {
   it('has correct provider config', () => {
@@ -26,15 +24,34 @@ describe('deepseekProvider', () => {
     const plan = buildInstallPlan(deepseekProvider, {
       baseUrl: 'https://api.deepseek.com',
       apiKey: 'sk-deepseek',
-      modelIds: ['deepseek-v4-flash', 'deepseek-v4-pro'],
+      modelIds: ['deepseek-v4-flash', 'deepseek-v4-pro', 'DeepSeek-V4-Pro'],
     });
 
     const models = plan.modelProviders?.[0]?.models;
-    expect(models).toHaveLength(2);
+    expect(models?.map((model) => model.id)).toEqual([
+      'deepseek-v4-flash',
+      'deepseek-v4-pro',
+      'DeepSeek-V4-Pro',
+    ]);
     expect(models?.[0]).toMatchObject({
       id: 'deepseek-v4-flash',
       name: '[DeepSeek] deepseek-v4-flash',
-      generationConfig: { contextWindowSize: 1000000 },
+    });
+    expect(models?.[0]?.generationConfig).toEqual({
+      contextWindowSize: 1000000,
+    });
+    expect(models?.[2]).toMatchObject({
+      id: 'DeepSeek-V4-Pro',
+      name: '[DeepSeek] DeepSeek-V4-Pro',
+    });
+    expect(models?.[2]?.generationConfig).toEqual({
+      contextWindowSize: 1000000,
+    });
+    expect(models?.[2]?.capabilities?.reasoning).toEqual({
+      thinking: true,
+      efforts: ['low', 'high', 'max'],
+      defaultEffort: 'high',
+      disableField: 'thinking',
     });
   });
 

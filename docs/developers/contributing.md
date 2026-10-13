@@ -30,7 +30,10 @@ We favor small, atomic PRs that address a single issue or add a single, self-con
 - **Do:** Create a PR that fixes one specific bug or adds one specific feature.
 - **Don't:** Bundle multiple unrelated changes (e.g., a bug fix, a new feature, and a refactor) into a single PR.
 
-Large changes should be broken down into a series of smaller, logical PRs that can be reviewed and merged independently.
+As a rule of thumb, start splitting a PR once it exceeds about 1,200 changed
+lines. PRs above about 2,000 changed lines should either be split into a series
+of smaller, logical PRs that can be reviewed and merged independently, or
+explain in the PR description why the change needs to land together.
 
 #### 3. Use Draft PRs for Work in Progress
 
@@ -43,6 +46,12 @@ Before submitting your PR, ensure that all automated checks are passing by runni
 #### 5. Update Documentation
 
 If your PR introduces a user-facing change (e.g., a new command, a modified flag, or a change in behavior), you must also update the relevant documentation in the `/docs` directory.
+
+New or updated design documents must include complete English (`<name>.md`) and
+Simplified Chinese (`<name>.zh-CN.md`) versions in the same directory and PR.
+Keep their structure, decisions, constraints, and acceptance criteria aligned,
+and add reciprocal language links. See the design documentation requirements
+in [English](../design/README.md) or [简体中文](../design/README.zh-CN.md).
 
 #### 6. Write Clear Commit Messages and a Good PR Description
 
@@ -93,7 +102,7 @@ This command typically compiles TypeScript to JavaScript, bundles assets, and pr
 
 [Sandboxing](#sandboxing) is highly recommended and requires, at a minimum, setting `QWEN_SANDBOX=true` in your `~/.env` and ensuring a sandboxing provider (e.g. `macOS Seatbelt`, `docker`, or `podman`) is available. See [Sandboxing](#sandboxing) for details.
 
-To build both the `qwen-code` CLI utility and the sandbox container, run `build:all` from the root directory:
+To build both the `qwen` CLI utility and the sandbox container, run `build:all` from the root directory:
 
 ```bash
 npm run build:all
@@ -109,7 +118,7 @@ To start the Qwen Code application from the source code (after building), run th
 npm start
 ```
 
-If you'd like to run the source build outside of the qwen-code folder, you can utilize `npm link path/to/qwen-code/packages/cli` (see: [docs](https://docs.npmjs.com/cli/v9/commands/npm-link)) to run with `qwen-code`
+If you'd like to run the source build outside of the qwen-code folder, you can utilize `npm link path/to/qwen-code/packages/cli` (see: [docs](https://docs.npmjs.com/cli/v9/commands/npm-link)) to run with `qwen`
 
 ### Running Tests
 
@@ -135,7 +144,7 @@ To run the integration tests, use the following command:
 npm run test:e2e
 ```
 
-For more detailed information on the integration testing framework, please see the [Integration Tests documentation](./docs/integration-tests.md).
+For more detailed information on the integration testing framework, please see the [Integration Tests documentation](./development/integration-tests.md).
 
 ### Linting and Preflight Checks
 
@@ -200,7 +209,7 @@ This section describes how to develop and preview the documentation locally.
 
 ### Prerequisites
 
-1. Ensure you have Node.js (version 18+) installed
+1. Ensure you have Node.js (version 22+) installed
 2. Have npm or yarn available
 
 ### Setup Documentation Site Locally
@@ -254,10 +263,10 @@ Alternatively, you can use the "Launch Program" configuration in VS Code if you 
 To hit a breakpoint inside the sandbox container run:
 
 ```bash
-DEBUG=1 qwen-code
+DEBUG=1 qwen
 ```
 
-**Note:** If you have `DEBUG=true` in a project's `.env` file, it won't affect qwen-code due to automatic exclusion. Use `.qwen-code/.env` files for qwen-code specific debug settings.
+**Note:** If you have `DEBUG=true` in a project's `.env` file, it won't affect `qwen` due to automatic exclusion. Use `.qwen/.env` files for `qwen`-specific debug settings.
 
 ### React DevTools
 

@@ -8,12 +8,20 @@ import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
-import { SubagentManager } from './subagent-manager.js';
-import { type SubagentConfig, SubagentError } from './types.js';
+import { SubagentManager, loadSubagentFromDir } from './subagent-manager.js';
+import {
+  type SubagentConfig,
+  SubagentError,
+  SubagentErrorCode,
+} from './types.js';
 import type { ToolRegistry } from '../tools/tool-registry.js';
 import type { Config } from '../config/config.js';
+import { ApprovalMode } from '../config/approval-mode.js';
 import { makeFakeConfig } from '../test-utils/config.js';
 import { AuthType } from '../core/contentGenerator.js';
+import { ToolNames } from '../tools/tool-names.js';
+import type { ExecutionEnvironment } from '../services/execution-environment.js';
+import { Storage } from '../config/storage.js';
 
 // Mock file system operations
 vi.mock('fs/promises');
@@ -23,10 +31,15 @@ vi.mock('os');
 const mockParseYaml = vi.hoisted(() => vi.fn());
 const mockStringifyYaml = vi.hoisted(() => vi.fn());
 
-vi.mock('../utils/yaml-parser.js', () => ({
-  parse: mockParseYaml,
-  stringify: mockStringifyYaml,
-}));
+vi.mock('../utils/yaml-parser.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('../utils/yaml-parser.js')>();
+  return {
+    parse: mockParseYaml,
+    stringify: mockStringifyYaml,
+    sanitizeValue: actual.sanitizeValue,
+  };
+});
 
 // Mock dependencies - create mock functions at the top level
 const mockValidateConfig = vi.hoisted(() => vi.fn());
@@ -126,15 +139,18 @@ describe('SubagentManager', () => {
     mockParseYaml.mockImplementation((yamlString: string) => {
       // Handle different test cases based on YAML content
       // Check disallowedTools before tools to avoid substring match
-      if (yamlString.includes('disallowedTools: write_file')) {
-        // Scalar form
-        return {
-          name: 'test-agent',
-          description: 'A test subagent',
-          disallowedTools: 'write_file',
-        };
-      }
       if (yamlString.includes('disallowedTools:')) {
+        const dtLine = yamlString
+          .split('\n')
+          .find((l: string) => l.startsWith('disallowedTools:'));
+        const dtInline = dtLine?.replace('disallowedTools:', '').trim();
+        if (dtInline && dtInline !== '') {
+          return {
+            name: 'test-agent',
+            description: 'A test subagent',
+            disallowedTools: dtInline,
+          };
+        }
         return {
           name: 'test-agent',
           description: 'A test subagent',
@@ -142,6 +158,21 @@ describe('SubagentManager', () => {
         };
       }
       if (yamlString.includes('tools:')) {
+        const toolsLine = yamlString
+          .split('\n')
+          .find((l: string) => l.startsWith('tools:'));
+        const inlineValue = toolsLine?.replace('tools:', '').trim();
+        if (
+          inlineValue &&
+          !inlineValue.startsWith('\n') &&
+          inlineValue !== ''
+        ) {
+          return {
+            name: 'test-agent',
+            description: 'A test subagent',
+            tools: inlineValue,
+          };
+        }
         return {
           name: 'test-agent',
           description: 'A test subagent',
@@ -162,15 +193,20 @@ describe('SubagentManager', () => {
           runConfig: { max_time_minutes: 5, max_turns: 10 },
         };
       }
-      if (yamlString.includes('background:')) {
+      if (
+        yamlString.includes('background:') ||
+        yamlString.includes('approvalMode:')
+      ) {
         const bgMatch = yamlString.match(/background:\s*"?(true|false)"?/);
-        const bgValue = bgMatch?.[1] === 'true' ? true : false;
-        return {
+        const approvalMatch = yamlString.match(/approvalMode:\s*"?([\w-]+)"?/);
+        const result: Record<string, unknown> = {
           name: yamlString.match(/name:\s*(\S+)/)?.[1] ?? 'test-agent',
           description:
             yamlString.match(/description:\s*(.+)/)?.[1] ?? 'A test subagent',
-          background: bgValue,
         };
+        if (bgMatch) result['background'] = bgMatch[1] === 'true';
+        if (approvalMatch) result['approvalMode'] = approvalMatch[1];
+        return result;
       }
       if (yamlString.includes('name: agent1')) {
         return { name: 'agent1', description: 'First agent' };
@@ -226,6 +262,111 @@ describe('SubagentManager', () => {
     manager = new SubagentManager(mockConfig);
   });
 
+  describe('resolveModelGrade', () => {
+    const builtinConfig: SubagentConfig = {
+      name: 'Explore',
+      description: 'Explore files',
+      systemPrompt: 'Explore.',
+      level: 'builtin',
+      isBuiltin: true,
+      model: 'fast',
+    };
+
+    it('resolves only available grades and preserves custom defaults', () => {
+      const configuredManager = new SubagentManager(
+        makeFakeConfig({
+          agents: {
+            modelGrades: { small: 'fast', high: 'qwen-max' },
+            allowedGrades: ['high'],
+          },
+        }),
+      );
+
+      expect(configuredManager.getAvailableModelGrades()).toEqual(
+        new Map([['high', 'qwen-max']]),
+      );
+      expect(configuredManager.resolveModelGrade('high', builtinConfig)).toBe(
+        'qwen-max',
+      );
+      expect(
+        configuredManager.resolveModelGrade('small', builtinConfig),
+      ).toBeUndefined();
+      expect(
+        configuredManager.resolveModelGrade('missing', builtinConfig),
+      ).toBeUndefined();
+
+      expect(
+        configuredManager.resolveModelGrade('high', {
+          ...builtinConfig,
+          level: 'project',
+          isBuiltin: false,
+          model: 'custom-model',
+        }),
+      ).toBeUndefined();
+      expect(
+        configuredManager.resolveModelGrade('high', {
+          ...builtinConfig,
+          level: 'project',
+          isBuiltin: false,
+          model: 'inherit',
+        }),
+      ).toBe('qwen-max');
+    });
+
+    it('exposes every valid grade without an allowlist', () => {
+      const configuredManager = new SubagentManager(
+        makeFakeConfig({
+          agents: { modelGrades: { small: 'fast', high: 'qwen-max' } },
+        }),
+      );
+
+      expect(configuredManager.getAvailableModelGrades()).toEqual(
+        new Map([
+          ['small', 'fast'],
+          ['high', 'qwen-max'],
+        ]),
+      );
+    });
+
+    it('trims grade keys before publishing and resolving', () => {
+      const configuredManager = new SubagentManager(
+        makeFakeConfig({
+          agents: {
+            modelGrades: { ' small ': 'fast', high: 'qwen-max' },
+            allowedGrades: [' small ', 'high'],
+          },
+        }),
+      );
+
+      const grades = configuredManager.getAvailableModelGrades();
+      expect([...grades.keys()]).toEqual(['small', 'high']);
+      expect(grades.get('small')).toBe('fast');
+      expect(configuredManager.resolveModelGrade('small', builtinConfig)).toBe(
+        'fast',
+      );
+    });
+
+    it('ignores malformed grade settings', () => {
+      const malformedGrades = new SubagentManager(
+        makeFakeConfig({
+          agents: {
+            modelGrades: {
+              valid: 'qwen-max',
+              invalid: 42 as unknown as string,
+              blank: '  ',
+              '  ': 'qwen-max',
+            },
+            allowedGrades: ['valid', 'invalid', 'blank', '  '],
+          },
+        }),
+      );
+
+      expect(malformedGrades.getAvailableModelGrades()).toEqual(
+        new Map([['valid', 'qwen-max']]),
+      );
+    });
+  });
+
   afterEach(() => {
     vi.restoreAllMocks();
   });
@@ -246,7 +387,613 @@ description: A test subagent
 You are a helpful assistant.
 `;
 
+  describe('execution backend definitions', () => {
+    beforeEach(async () => {
+      const yaml = await vi.importActual<
+        typeof import('../utils/yaml-parser.js')
+      >('../utils/yaml-parser.js');
+      mockParseYaml.mockImplementation(yaml.parse);
+      mockStringifyYaml.mockImplementation(yaml.stringify);
+    });
+
+    it.each(
+      [
+        'executionBackend: container',
+        'executor: {kind: invalid, command: runner}',
+      ].flatMap((declaration) =>
+        [
+          ['Reviewer', 'Explore'],
+          ['Reviewer', "'Explore'", 'Last'],
+          ['First', "'Explore'", '"Plan"', 'Last'],
+        ].map((names) => ({ declaration, names })),
+      ),
+    )(
+      'reserves every duplicate name on refusal: $declaration $names',
+      async ({ declaration, names }) => {
+        const declaredNames = names.map((name) =>
+          name.replace(/^["']|["']$/g, ''),
+        );
+        const projectDir = path.join(
+          mockConfig.getProjectRoot(),
+          '.qwen',
+          'agents',
+        );
+        const content = `---\n${names.map((name) => `name: ${name}`).join('\n')}\ndescription: Project agent\n${declaration}\n---\nReview the project.\n`;
+        vi.mocked(fs.readdir).mockImplementation(
+          async (directory) =>
+            (directory === projectDir ? ['reviewer.md'] : []) as never,
+        );
+        vi.mocked(fs.readFile).mockResolvedValue(content);
+        for (const name of declaredNames) {
+          await expect(manager.loadSubagent(name)).rejects.toMatchObject({
+            message: expect.stringMatching(
+              /invalid (executionBackend declaration|executor block)/,
+            ),
+          });
+        }
+        const refusals = new Map<string, SubagentError>();
+        expect(await loadSubagentFromDir(projectDir, refusals)).toEqual([]);
+        expect([...refusals.keys()].sort()).toEqual(
+          declaredNames.map((name) => name.toLowerCase()).sort(),
+        );
+
+        vi.mocked(fs.readFile).mockResolvedValue(
+          content.replace(`${declaration}\n`, ''),
+        );
+        const local = await manager.loadSubagent(declaredNames.at(-1)!);
+        expect(local).toMatchObject({
+          name: declaredNames.at(-1),
+          level: 'project',
+        });
+        expect(local?.executionBackend).toBeUndefined();
+      },
+    );
+
+    it.each(
+      ['|', '>'].flatMap((style) =>
+        [
+          'executor:\n\tcommand: acp-reviewer',
+          'executionBackend: container\nmetadata:\n\tcommand: example',
+        ].map((declaration) => ({ style, declaration })),
+      ),
+    )(
+      'does not reserve names from $style prose on refusal: $declaration',
+      async ({ style, declaration }) => {
+        const projectDir = path.join(
+          mockConfig.getProjectRoot(),
+          '.qwen',
+          'agents',
+        );
+        vi.mocked(fs.readdir).mockImplementation(
+          async (directory) =>
+            (directory === projectDir ? ['reviewer.md'] : []) as never,
+        );
+        vi.mocked(fs.readFile).mockResolvedValue(
+          `---\nname: reviewer\ndescription: ${style}\n  This agent documents other agents.\n  name: explore\n${declaration}\n---\nReview the project carefully.\n`,
+        );
+
+        const refusals = new Map<string, SubagentError>();
+        expect(await loadSubagentFromDir(projectDir, refusals)).toEqual([]);
+        expect.soft([...refusals.keys()]).toEqual(['reviewer']);
+        await expect(manager.loadSubagent('Explore')).resolves.toMatchObject({
+          name: 'Explore',
+          isBuiltin: true,
+        });
+        await expect(manager.loadSubagent('reviewer')).rejects.toMatchObject({
+          subagentName: 'reviewer',
+        });
+      },
+    );
+
+    it('retains the lenient refusal name when the AST name cannot resolve', async () => {
+      const projectDir = path.join(
+        mockConfig.getProjectRoot(),
+        '.qwen',
+        'agents',
+      );
+      vi.mocked(fs.readdir).mockResolvedValue(['reviewer.md'] as never);
+      vi.mocked(fs.readFile).mockResolvedValue(
+        '---\nname: *missing\ndescription: Project agent\nexecutor: {kind: invalid, command: runner}\n---\nReview the project.\n',
+      );
+
+      const refusals = new Map<string, SubagentError>();
+      expect(await loadSubagentFromDir(projectDir, refusals)).toEqual([]);
+      expect([...refusals.keys()]).toEqual(['*missing']);
+      expect(refusals.get('*missing')?.subagentName).toBe('*missing');
+    });
+
+    it.each([
+      { yamlName: '123', name: '123' },
+      { yamlName: 'true', name: 'true' },
+      { yamlName: '[Explore]', name: 'Explore' },
+      { yamlName: '[true]', name: 'true' },
+      { yamlName: '[Explore, null]', name: 'Explore' },
+      { yamlName: '*agentName', name: 'Explore' },
+      { yamlName: '*agentName', name: 'Explore', anchor: '[Explore, null]' },
+    ])(
+      'uses the accepted name for refusals and valid controls: $yamlName',
+      async ({ yamlName, name, anchor }) => {
+        const { SubagentValidator } =
+          await vi.importActual<typeof import('./validation.js')>(
+            './validation.js',
+          );
+        const validator = new SubagentValidator();
+        mockValidateConfig.mockImplementation((config: SubagentConfig) =>
+          validator.validateConfig(config),
+        );
+        const projectDir = path.join(
+          mockConfig.getProjectRoot(),
+          '.qwen',
+          'agents',
+        );
+        const userDir = path.join(Storage.getGlobalQwenDir(), 'agents');
+        const projectFile = path.join(projectDir, `${name}.md`);
+        const userFile = path.join(userDir, 'lower-priority.md');
+        const frontmatter = `alias: &agentName ${anchor ?? 'Explore'}\nname: ${yamlName}`;
+        let projectContent = `---\n${frontmatter}\ndescription: Project agent\nexecutionBackend: null\n---\nComplete the project task.\n`;
+        const userContent = `---\nname: '${name}'\ndescription: User agent\n---\nComplete the user task.\n`;
+        vi.mocked(fs.readdir).mockImplementation(
+          async (directory) =>
+            (directory === projectDir
+              ? [`${name}.md`]
+              : directory === userDir
+                ? ['lower-priority.md']
+                : []) as never,
+        );
+        vi.mocked(fs.readFile).mockImplementation(async (file) => {
+          if (file === projectFile) return projectContent;
+          if (file === userFile) return userContent;
+          throw new Error(`Unexpected file read: ${String(file)}`);
+        });
+
+        expect(await manager.loadSubagent(name, 'user')).toMatchObject({
+          name,
+          level: 'user',
+          systemPrompt: 'Complete the user task.',
+        });
+        await expect(manager.loadSubagent(name)).rejects.toMatchObject({
+          subagentName: name,
+          message: expect.stringContaining(
+            'invalid executionBackend declaration',
+          ),
+        });
+
+        projectContent = `---\n${frontmatter}\ndescription: Project agent\nexecutionBackend: *missing\n---\nComplete the project task.\n`;
+        await expect(manager.loadSubagent(name)).rejects.toMatchObject({
+          subagentName: name,
+          message: expect.stringContaining(
+            'invalid executionBackend declaration',
+          ),
+        });
+
+        projectContent = `---\n${frontmatter}\nexecutionBackend: container\n---\nComplete the project task.\n`;
+        await expect(manager.loadSubagent(name)).rejects.toMatchObject({
+          subagentName: name,
+          message: expect.stringContaining(
+            'invalid executionBackend declaration',
+          ),
+        });
+
+        projectContent = `---\n${frontmatter}\ndescription: Project agent\nexecutionBackend: container\n---\nComplete the project task.\n`;
+        expect(await manager.loadSubagent(name)).toMatchObject({
+          name,
+          level: 'project',
+          executionBackend: 'container',
+          systemPrompt: 'Complete the project task.',
+        });
+
+        projectContent =
+          '---\nname: {invalid: name}\ndescription: Project agent\nexecutionBackend: null\n---\nComplete the project task.\n';
+        expect(await manager.loadSubagent(name)).toMatchObject({
+          name,
+          level: 'user',
+          systemPrompt: 'Complete the user task.',
+        });
+      },
+    );
+
+    it.each([
+      'name: Explore\ndescription: Test\nexecutionBackend: null',
+      'name: Explore\ndescription: Test\nexecutionBackend: local',
+      "name: 'Explore'\ndescription: Test\nexecutionBackend: false",
+      'name: Explore\ndescription: Test\nexecutionBackend: container\nexecutionBackend: local',
+      'name: Explore\ndescription: bad: yaml\nexecutionBackend: container',
+      'name: Explore\ndescription: Test\n\texecutionBackend: container',
+      'name: Explore\nexecutionBackend: container',
+    ])(
+      'reserves an invalid higher-priority declaration instead of resolving a builtin: %s',
+      async (frontmatter) => {
+        vi.mocked(fs.readdir).mockResolvedValue([
+          'different-filename.md',
+        ] as never);
+        vi.mocked(fs.readFile).mockResolvedValue(
+          `---\n${frontmatter}\n---\nComplete the task.`,
+        );
+        await expect(manager.loadSubagent('explore')).rejects.toMatchObject({
+          subagentName: 'Explore',
+          message: expect.stringContaining(
+            'invalid executionBackend declaration',
+          ),
+        });
+        expect(await manager.isNameAvailable('Explore')).toBe(false);
+        expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+      },
+    );
+
+    it('records later validation failure and clears a stale backend refusal after removal', async () => {
+      vi.mocked(fs.readdir).mockResolvedValue(['explore.md'] as never);
+      vi.mocked(fs.readFile).mockResolvedValue(
+        '---\nname: Explore\ndescription: Test\nexecutionBackend: container\n---\nPrompt',
+      );
+      mockValidateConfig.mockReturnValue({
+        isValid: false,
+        errors: ['Invalid prompt'],
+        warnings: [],
+      });
+      await expect(manager.loadSubagent('Explore')).rejects.toThrow(
+        'invalid executionBackend declaration',
+      );
+      vi.mocked(fs.readdir).mockRejectedValue(new Error('ENOENT'));
+      expect((await manager.loadSubagent('Explore'))?.isBuiltin).toBe(true);
+    });
+
+    it('carries an actual extension-loader backend refusal through named resolution', async () => {
+      vi.mocked(fs.readdir).mockResolvedValue(['agent.md'] as never);
+      vi.mocked(fs.readFile).mockResolvedValue(
+        '---\nname: Explore\ndescription: Test\nexecutionBackend: null\n---\nPrompt',
+      );
+      const refusals = new Map<string, SubagentError>();
+      const agents = await loadSubagentFromDir('/extension/agents', refusals);
+      expect(agents).toEqual([]);
+      expect(refusals.has('explore')).toBe(true);
+      vi.spyOn(mockConfig, 'getActiveExtensions').mockReturnValue([
+        { agents, agentExecutorRefusals: refusals } as never,
+      ]);
+      vi.mocked(fs.readdir).mockResolvedValue([] as never);
+      await expect(manager.loadSubagent('Explore')).rejects.toThrow(
+        'invalid executionBackend declaration',
+      );
+    });
+
+    it('round-trips a backend through serialization and unrelated updates', async () => {
+      const original = manager.parseSubagentContent(
+        '---\nname: test-agent\ndescription: Test\nexecutionBackend: container\n---\nComplete the task.',
+        validConfig.filePath!,
+        'project',
+      );
+      expect(original.executionBackend).toBe('container');
+      const serialized = manager.serializeSubagent(original);
+      expect(serialized).toContain('executionBackend: container');
+      vi.mocked(fs.readdir).mockResolvedValue(['test-agent.md'] as never);
+      vi.mocked(fs.readFile).mockResolvedValue(serialized);
+      await manager.updateSubagent('test-agent', { description: 'Updated' });
+      const saved = vi.mocked(fs.writeFile).mock.calls[0][1];
+      expect(typeof saved).toBe('string');
+      expect(
+        manager.parseSubagentContent(
+          saved as string,
+          validConfig.filePath!,
+          'project',
+        ),
+      ).toMatchObject({
+        description: 'Updated',
+        executionBackend: 'container',
+      });
+    });
+
+    it.each([null, 'local', false])(
+      'rejects invalid direct serialization %j before writing',
+      (executionBackend) => {
+        expect(() =>
+          manager.serializeSubagent({
+            ...validConfig,
+            executionBackend,
+          } as unknown as SubagentConfig),
+        ).toThrow('invalid executionBackend declaration');
+        expect(fs.writeFile).not.toHaveBeenCalled();
+      },
+    );
+
+    it('retains invalid session objects so named dispatch refuses rather than falling through', async () => {
+      manager.loadSessionSubagents([
+        {
+          ...validConfig,
+          name: 'Explore',
+          executionBackend: null,
+        } as unknown as SubagentConfig,
+      ]);
+      await expect(manager.loadSubagent('Explore')).rejects.toThrow(
+        'invalid executionBackend declaration',
+      );
+      expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+    });
+
+    it.each(['definition', 'operator'] as const)(
+      'refuses %s-required execution without an environment at both consumption points',
+      async (source) => {
+        vi.spyOn(mockConfig, 'isTrustedFolder').mockReturnValue(true);
+        vi.spyOn(mockConfig, 'getAgentExecutionBackend').mockReturnValue(
+          source === 'operator' ? 'container' : undefined,
+        );
+        const config =
+          source === 'definition'
+            ? { ...validConfig, executionBackend: 'container' as const }
+            : validConfig;
+        await expect(
+          manager.createAgentHeadless(config, mockConfig),
+        ).rejects.toThrow('requires a container execution environment');
+        await expect(manager.convertToRuntimeConfig(config)).rejects.toThrow(
+          'requires a container execution environment',
+        );
+        expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+      },
+    );
+
+    it('permits definition conversion with an actual environment while retaining the operator floor', async () => {
+      vi.spyOn(mockConfig, 'isTrustedFolder').mockReturnValue(true);
+      vi.spyOn(mockConfig, 'getAgentExecutionBackend').mockReturnValue(
+        'container',
+      );
+      vi.spyOn(mockConfig, 'getExecutionEnvironment').mockReturnValue(
+        {} as ExecutionEnvironment,
+      );
+      await expect(
+        manager.convertToRuntimeConfig({
+          ...validConfig,
+          executionBackend: 'container',
+        }),
+      ).resolves.toMatchObject({
+        promptConfig: { systemPrompt: validConfig.systemPrompt },
+      });
+      expect(mockConfig.getAgentExecutionBackend()).toBe('container');
+    });
+  });
+
   describe('parseSubagentContent', () => {
+    it.each([
+      'null',
+      'false',
+      '0',
+      '""',
+      '{ kind: ACP, command: npx }',
+      '{ kind: acp, command: " " }',
+      '{ kind: acp, command: npx, args: [null] }',
+    ])('rejects invalid executor frontmatter %s', async (executor) => {
+      const content = `---\nname: test-agent\ndescription: Test\nexecutor: ${executor}\n---\nPrompt`;
+      vi.mocked(fs.readFile).mockResolvedValue(content);
+      await expect(
+        manager.parseSubagentFile(validConfig.filePath!, 'project'),
+      ).rejects.toThrow(/invalid executor block/);
+      expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+    });
+
+    it('rejects an executor whose null argument the shared parser would sanitize away', async () => {
+      // Pins the load-bearing guard that validates the ORIGINAL YAML node
+      // (parseDocument) rather than the shared parser's sanitized result. The
+      // shared parser strips null sequence items, turning `args: [null]` into
+      // `args: []` — which parseAgentExecutor ACCEPTS, launching the command
+      // with truncated arguments. Only the original node still carries [null]
+      // and is rejected. Drive the real shared parser so the stripping actually
+      // happens; with the guard reverted to the sanitized value this no longer
+      // throws and the test goes red.
+      const yaml = await vi.importActual<
+        typeof import('../utils/yaml-parser.js')
+      >('../utils/yaml-parser.js');
+      mockParseYaml.mockImplementationOnce(yaml.parse);
+      const content =
+        '---\nname: test-agent\ndescription: Test\nexecutor:\n  kind: acp\n  command: npx\n  args:\n    - null\n---\nPrompt';
+      vi.mocked(fs.readFile).mockResolvedValue(content);
+      await expect(
+        manager.parseSubagentFile(validConfig.filePath!, 'project'),
+      ).rejects.toThrow(/invalid executor block/);
+      expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+    });
+
+    it('rejects a definition whose frontmatter has a YAML syntax error rather than trusting a repaired executor node', async () => {
+      // parseDocument repairs invalid YAML instead of throwing; document.errors
+      // is the only signal. Without this guard an unterminated quote yields a
+      // silently repaired executor node that dispatches a different command than
+      // the file declares.
+      const yaml = await vi.importActual<
+        typeof import('../utils/yaml-parser.js')
+      >('../utils/yaml-parser.js');
+      mockParseYaml.mockImplementation(yaml.parse);
+      const content =
+        "---\nname: test-agent\ndescription: Test\nexecutor:\n  kind: acp\n  command: 'npx\n---\nPrompt";
+      vi.mocked(fs.readFile).mockResolvedValue(content);
+      await expect(
+        manager.parseSubagentFile(validConfig.filePath!, 'project'),
+      ).rejects.toThrow(/invalid YAML frontmatter|invalid executor block/);
+      expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+    });
+
+    it('still loads a non-executor definition whose frontmatter strict YAML rejects', async () => {
+      // R5-1: the document.errors refusal must be scoped to executor-bearing
+      // files. A description containing a colon makes strict YAML reject, but
+      // the shared parser's parseSimple fallback still loads it; with no
+      // executor block the definition must keep loading exactly as at the merge
+      // base, or the agent silently vanishes from /agents and subagent_type
+      // fails as agent-not-found. Drive the real shared parser so the lenient
+      // fallback is actually exercised; an unconditional document.errors guard
+      // makes this throw and the test go red.
+      const yaml = await vi.importActual<
+        typeof import('../utils/yaml-parser.js')
+      >('../utils/yaml-parser.js');
+      mockParseYaml.mockImplementation(yaml.parse);
+      const content =
+        '---\nname: reviewer\ndescription: Reviews code: fast and careful\n---\nPrompt';
+      vi.mocked(fs.readFile).mockResolvedValue(content);
+      const config = await manager.parseSubagentFile(
+        validConfig.filePath!,
+        'project',
+      );
+      expect(config.name).toBe('reviewer');
+      expect(config.description).toBe('Reviews code: fast and careful');
+      expect(config.executor).toBeUndefined();
+    });
+
+    it('refuses a quoted top-level "executor" key when the frontmatter YAML is malformed (R7-1 under-refusal leg)', async () => {
+      // A quoted `"executor":` plus a YAML error the lenient parser tolerates
+      // (an unquoted colon in description) is missed by parseSimple (keeps the
+      // quotes in the key) and by a repaired parseDocument (nests it). Only the
+      // column-0 raw-text probe catches it; without that the file loads with no
+      // executor and silently runs in-process — the exact substitution this PR
+      // exists to prevent.
+      const yaml = await vi.importActual<
+        typeof import('../utils/yaml-parser.js')
+      >('../utils/yaml-parser.js');
+      mockParseYaml.mockImplementation(yaml.parse);
+      const content =
+        '---\nname: worker\ndescription: Reviews code: fast\n"executor":\n  kind: acp\n  command: npx\n---\nPrompt';
+      vi.mocked(fs.readFile).mockResolvedValue(content);
+      await expect(
+        manager.parseSubagentFile(validConfig.filePath!, 'project'),
+      ).rejects.toThrow(/invalid executor block/);
+      expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+    });
+
+    it('refuses a malformed file whose only "executor" token is nested, fail-closed (R10-1 re-scopes the R7-1 over-refusal leg)', async () => {
+      // R10-1 widened the claim probe to indentation-tolerant so an executor key
+      // the real AST dropped cannot slip through to a silent in-process run (a
+      // TAB- or space-indented top-level `executor:` that the column-0 anchor
+      // missed). The accepted cost: an `executor:` token nested under another
+      // key, in a file that ALSO has a YAML error, is now treated as a claim the
+      // AST lost and refused — a visible, user-fixable over-refusal that beats an
+      // invisible substitution. Reverting the probe to column-0 anchoring turns
+      // this red (the definition loads again). A nested executor token in a file
+      // with NO YAML error still loads: the guard is gated on errors.length > 0.
+      const yaml = await vi.importActual<
+        typeof import('../utils/yaml-parser.js')
+      >('../utils/yaml-parser.js');
+      mockParseYaml.mockImplementation(yaml.parse);
+      const content =
+        '---\nname: reviewer\ndescription: Reviews code: fast\nmetadata:\n  executor: legacy-note\n---\nPrompt';
+      vi.mocked(fs.readFile).mockResolvedValue(content);
+      await expect(
+        manager.parseSubagentFile(validConfig.filePath!, 'project'),
+      ).rejects.toThrow(/invalid executor block/);
+      expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+    });
+
+    it('loads a valid executor whose frontmatter has an unrelated tolerated YAML error before it (R7-1 over-refusal, narrowed)', async () => {
+      // A duplicate `name:` key from a bad merge is a tolerated YAML error that
+      // sits BEFORE the executor line, so it cannot reach the executor subtree:
+      // `document.toJS().executor` stays byte-faithful. The old
+      // `claimsExecutor && document.errors.length > 0` guard hard-refused this,
+      // deleting a valid external-agent definition from /agents (and breaking
+      // `subagent_type:`) over an unrelated quirk that loads at the merge base.
+      // Removing the line-scoping must turn this red, while the quoted-key and
+      // unterminated-quote refusals (errors at/after the executor line) stay
+      // green.
+      const yaml = await vi.importActual<
+        typeof import('../utils/yaml-parser.js')
+      >('../utils/yaml-parser.js');
+      mockParseYaml.mockImplementation(yaml.parse);
+      const content =
+        '---\nname: a\nname: b\ndescription: Test\nexecutor:\n  kind: acp\n  command: claude-agent-acp\n---\nPrompt';
+      vi.mocked(fs.readFile).mockResolvedValue(content);
+      const config = await manager.parseSubagentFile(
+        validConfig.filePath!,
+        'project',
+      );
+      expect(config.executor).toEqual({
+        kind: 'acp',
+        command: 'claude-agent-acp',
+      });
+    });
+
+    it('refuses an executor whose node parseDocument dropped via an earlier error, not trusting the parseSimple fallback (R9-2)', async () => {
+      // A compact-mapping error on an EARLIER line (the unquoted colon in
+      // description) makes parseDocument drop the whole remainder, so the
+      // executor node is ABSENT (has('executor') is false) rather than
+      // byte-faithful — YAML errors are not line-local, so an error before the
+      // executor line does not mean the executor survived. The lenient
+      // parseSimple fallback then rebuilds `command: |` plus an indented `npx`
+      // as `{command:'|', npx:''}` (it is a line-based heuristic, not a YAML
+      // parser), and parseAgentExecutor would accept `command:'|'`, spawning an
+      // executable literally named `|` that the file never declared. The refusal
+      // must key on parseDocument losing the node (!hasExecutor), not on
+      // parseSimple also missing it. Reverting that leg to
+      // `!hasExecutor && frontmatter.executor === undefined` turns this red,
+      // while the duplicate-key load test above (has('executor') true) stays
+      // green.
+      const yaml = await vi.importActual<
+        typeof import('../utils/yaml-parser.js')
+      >('../utils/yaml-parser.js');
+      mockParseYaml.mockImplementation(yaml.parse);
+      const content =
+        '---\nname: explore\ndescription: Reviews code: fast\nexecutor:\n  kind: acp\n  command: |\n    npx\n---\nPrompt';
+      vi.mocked(fs.readFile).mockResolvedValue(content);
+      await expect(
+        manager.parseSubagentFile(validConfig.filePath!, 'project'),
+      ).rejects.toThrow(/invalid executor block/);
+      expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+    });
+
+    it('refuses an executor whose frontmatter has an unresolved YAML alias instead of throwing a raw parse error (R9 deferred :1968)', async () => {
+      // parseDocument tolerates an unresolved alias (`command: *undef`) with an
+      // EMPTY document.errors, so the errors-based executor guard cannot catch
+      // it, but document.toJS() throws when it resolves the node. Without the
+      // try/catch around toJS() the raw "Unresolved alias" YAML error escapes
+      // parseSubagentContent; with it the definition is refused as an invalid
+      // executor block. Removing the try/catch turns this red (the rejection
+      // message becomes the raw YAML error, not /invalid executor block/).
+      const yaml = await vi.importActual<
+        typeof import('../utils/yaml-parser.js')
+      >('../utils/yaml-parser.js');
+      mockParseYaml.mockImplementation(yaml.parse);
+      const content =
+        '---\nname: explore\ndescription: Test\nexecutor:\n  kind: acp\n  command: *undefined_anchor\n---\nPrompt';
+      vi.mocked(fs.readFile).mockResolvedValue(content);
+      await expect(
+        manager.parseSubagentFile(validConfig.filePath!, 'project'),
+      ).rejects.toThrow(/invalid executor block/);
+      expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+    });
+
+    it('loads a block-scalar prose "executor:" as no executor, not a hoisted command (R10-1)', async () => {
+      // A `description: |` block scalar whose prose contains an `executor:` line,
+      // plus an unresolved alias elsewhere so the strict parse fails and the
+      // lenient parseSimple fallback runs. parseSimple hoists the prose
+      // `executor:` into a top-level key ({kind:acp, command:npx}); the old code
+      // used that value as executorRaw and loaded the definition as EXTERNAL,
+      // dispatching `npx` — a command that exists only as prose. parseDocument
+      // correctly sees no top-level executor (hasExecutor false) and, with no
+      // document error, the guard does not fire, so the fix loads with executor
+      // undefined. Restoring the parseSimple fallback for executorRaw turns this
+      // red (config.executor becomes {kind:'acp', command:'npx'}).
+      const yaml = await vi.importActual<
+        typeof import('../utils/yaml-parser.js')
+      >('../utils/yaml-parser.js');
+      mockParseYaml.mockImplementation(yaml.parse);
+      const content =
+        '---\nname: x\ndescription: |\n  executor:\n    kind: acp\n    command: npx\nother: *undefined_anchor\n---\nPrompt';
+      vi.mocked(fs.readFile).mockResolvedValue(content);
+      const config = await manager.parseSubagentFile(
+        validConfig.filePath!,
+        'project',
+      );
+      expect(config.executor).toBeUndefined();
+    });
+
+    it('visibly reports invalid executors while continuing discovery', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.mocked(fs.readdir).mockResolvedValue(['bad.md', 'good.md'] as never);
+      vi.mocked(fs.readFile).mockImplementation(async (file) =>
+        String(file).endsWith('bad.md')
+          ? '---\nname: bad\ndescription: Test\nexecutor: { kind: acp, command: " " }\n---\nPrompt'
+          : validMarkdown,
+      );
+      const agents = await manager.listSubagents({
+        level: 'project',
+        force: true,
+      });
+      expect(agents.map((agent) => agent.name)).toEqual(['test-agent']);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('invalid executor block'),
+      );
+    });
+
     it('should parse valid markdown content', () => {
       const config = manager.parseSubagentContent(
         validMarkdown,
@@ -297,6 +1044,52 @@ You are a helpful assistant.
       expect(config.tools).toEqual(['read_file', 'write_file']);
     });
 
+    it('should parse comma-separated tools string into array', () => {
+      const markdownWithCSV = `---
+name: test-agent
+description: A test subagent
+tools: Read, Bash, Grep, Glob, WebSearch, WebFetch, mcp__context7__*
+---
+
+You are a helpful assistant.
+`;
+
+      const config = manager.parseSubagentContent(
+        markdownWithCSV,
+        validConfig.filePath!,
+        'project',
+      );
+
+      expect(config.tools).toEqual([
+        'Read',
+        'Bash',
+        'Grep',
+        'Glob',
+        'WebSearch',
+        'WebFetch',
+        'mcp__context7__*',
+      ]);
+    });
+
+    it('should parse single tool string into array', () => {
+      const markdownWithSingle = `---
+name: test-agent
+description: A test subagent
+tools: Read
+---
+
+You are a helpful assistant.
+`;
+
+      const config = manager.parseSubagentContent(
+        markdownWithSingle,
+        validConfig.filePath!,
+        'project',
+      );
+
+      expect(config.tools).toEqual(['Read']);
+    });
+
     it('should parse content with disallowedTools array', () => {
       const markdownWithDisallowed = `---
 name: test-agent
@@ -335,6 +1128,29 @@ You are a helpful assistant.
       );
 
       expect(config.disallowedTools).toEqual(['write_file']);
+    });
+
+    it('should parse comma-separated disallowedTools string into array', () => {
+      const markdownWithCSV = `---
+name: test-agent
+description: A test subagent
+disallowedTools: write_file, mcp__slack, Bash
+---
+
+You are a helpful assistant.
+`;
+
+      const config = manager.parseSubagentContent(
+        markdownWithCSV,
+        validConfig.filePath!,
+        'project',
+      );
+
+      expect(config.disallowedTools).toEqual([
+        'write_file',
+        'mcp__slack',
+        'Bash',
+      ]);
     });
 
     it('should parse content with model selector', () => {
@@ -565,7 +1381,7 @@ You are a monitor.
       expect(config.background).toBe(true);
     });
 
-    it('should not set background when background: false', () => {
+    it('preserves background: false for foreground agents', () => {
       const markdownWithBgFalse = `---
 name: monitor
 description: A foreground agent
@@ -581,7 +1397,7 @@ You are an agent.
         'project',
       );
 
-      expect(config.background).toBeUndefined();
+      expect(config.background).toBe(false);
     });
 
     it('should not set background when omitted', () => {
@@ -593,9 +1409,282 @@ You are an agent.
 
       expect(config.background).toBeUndefined();
     });
+
+    it('should parse approvalMode: bubble from frontmatter', () => {
+      const md = `---
+name: bubbler
+description: A background agent that bubbles approvals
+background: true
+approvalMode: bubble
+---
+
+You are a bubbler.
+`;
+      const config = manager.parseSubagentContent(
+        md,
+        validConfig.filePath!,
+        'project',
+      );
+
+      expect(config.approvalMode).toBe('bubble');
+    });
+
+    it('should reject an unknown approvalMode value', () => {
+      const md = `---
+name: weird
+description: An agent with a bogus mode
+approvalMode: telepathy
+---
+
+You are weird.
+`;
+      expect(() =>
+        manager.parseSubagentContent(md, validConfig.filePath!, 'project'),
+      ).toThrow(/Invalid "approvalMode"/);
+    });
+
+    it('should round-trip approvalMode: bubble through serialize', () => {
+      const serialized = manager.serializeSubagent({
+        ...validConfig,
+        approvalMode: 'bubble',
+      });
+      expect(serialized).toContain('approvalMode: bubble');
+
+      const reparsed = manager.parseSubagentContent(
+        serialized,
+        validConfig.filePath!,
+        'project',
+      );
+      expect(reparsed.approvalMode).toBe('bubble');
+    });
+
+    // --- CC 2.1.168 declarative-agent fields (DL7-parity lenient parse) ---
+
+    it('should parse valid permissionMode and bridge to approvalMode', () => {
+      mockParseYaml.mockReturnValueOnce({
+        name: 'a',
+        description: 'd',
+        permissionMode: 'bypassPermissions',
+      });
+      const config = manager.parseSubagentContent(
+        '---\nname: a\ndescription: d\npermissionMode: bypassPermissions\n---\nx',
+        validConfig.filePath!,
+        'project',
+      );
+      expect(config.permissionMode).toBe('bypassPermissions');
+      expect(config.approvalMode).toBe('yolo');
+    });
+
+    it('should prefer explicit approvalMode over permissionMode bridge', () => {
+      mockParseYaml.mockReturnValueOnce({
+        name: 'a',
+        description: 'd',
+        permissionMode: 'bypassPermissions',
+        approvalMode: 'plan',
+      });
+      const config = manager.parseSubagentContent(
+        '---\nname: a\ndescription: d\npermissionMode: bypassPermissions\napprovalMode: plan\n---\nx',
+        validConfig.filePath!,
+        'project',
+      );
+      expect(config.approvalMode).toBe('plan');
+      expect(config.permissionMode).toBe('bypassPermissions');
+    });
+
+    it('should drop invalid permissionMode and not bridge', () => {
+      mockParseYaml.mockReturnValueOnce({
+        name: 'a',
+        description: 'd',
+        permissionMode: 'not-a-mode',
+      });
+      const config = manager.parseSubagentContent(
+        '---\nname: a\ndescription: d\npermissionMode: not-a-mode\n---\nx',
+        validConfig.filePath!,
+        'project',
+      );
+      expect(config.permissionMode).toBeUndefined();
+      expect(config.approvalMode).toBeUndefined();
+    });
+
+    it('should parse maxTurns as number', () => {
+      mockParseYaml.mockReturnValueOnce({
+        name: 'a',
+        description: 'd',
+        maxTurns: 42,
+      });
+      const config = manager.parseSubagentContent(
+        '---\nname: a\ndescription: d\nmaxTurns: 42\n---\nx',
+        validConfig.filePath!,
+        'project',
+      );
+      expect(config.maxTurns).toBe(42);
+    });
+
+    it('should parse maxTurns from numeric string', () => {
+      mockParseYaml.mockReturnValueOnce({
+        name: 'a',
+        description: 'd',
+        maxTurns: '42',
+      });
+      const config = manager.parseSubagentContent(
+        '---\nname: a\ndescription: d\nmaxTurns: "42"\n---\nx',
+        validConfig.filePath!,
+        'project',
+      );
+      expect(config.maxTurns).toBe(42);
+    });
+
+    it('should drop negative or zero maxTurns', () => {
+      mockParseYaml.mockReturnValueOnce({
+        name: 'a',
+        description: 'd',
+        maxTurns: -1,
+      });
+      const config = manager.parseSubagentContent(
+        '---\nname: a\ndescription: d\nmaxTurns: -1\n---\nx',
+        validConfig.filePath!,
+        'project',
+      );
+      expect(config.maxTurns).toBeUndefined();
+    });
+
+    it('should parse nested mcpServers as a record', () => {
+      const mcpServers = {
+        filesystem: { type: 'stdio', command: 'node' },
+        github: { type: 'http', url: 'https://example.com' },
+      };
+      mockParseYaml.mockReturnValueOnce({
+        name: 'a',
+        description: 'd',
+        mcpServers,
+      });
+      const config = manager.parseSubagentContent(
+        '---\nname: a\ndescription: d\nmcpServers:\n  filesystem:\n    type: stdio\n    command: node\n---\nx',
+        validConfig.filePath!,
+        'project',
+      );
+      expect(config.mcpServers).toEqual(mcpServers);
+    });
+
+    it('should drop mcpServers of the wrong top-level shape', () => {
+      mockParseYaml.mockReturnValueOnce({
+        name: 'a',
+        description: 'd',
+        mcpServers: 'just-a-string',
+      });
+      const config = manager.parseSubagentContent(
+        '---\nname: a\ndescription: d\nmcpServers: just-a-string\n---\nx',
+        validConfig.filePath!,
+        'project',
+      );
+      expect(config.mcpServers).toBeUndefined();
+    });
+
+    it('should parse nested hooks as a record of arrays', () => {
+      const hooks = {
+        PreToolUse: [
+          { matcher: 'Bash', hooks: [{ type: 'command', command: 'echo' }] },
+        ],
+      };
+      mockParseYaml.mockReturnValueOnce({
+        name: 'a',
+        description: 'd',
+        hooks,
+      });
+      const config = manager.parseSubagentContent(
+        '---\nname: a\ndescription: d\nhooks:\n  PreToolUse:\n    - matcher: Bash\n      hooks:\n        - type: command\n          command: echo\n---\nx',
+        validConfig.filePath!,
+        'project',
+      );
+      expect(config.hooks).toEqual(hooks);
+    });
+
+    it('should drop hooks with non-array values per event', () => {
+      mockParseYaml.mockReturnValueOnce({
+        name: 'a',
+        description: 'd',
+        hooks: { PreToolUse: 'not-an-array' },
+      });
+      const config = manager.parseSubagentContent(
+        '---\nname: a\ndescription: d\nhooks:\n  PreToolUse: not-an-array\n---\nx',
+        validConfig.filePath!,
+        'project',
+      );
+      expect(config.hooks).toBeUndefined();
+    });
+
+    it('should preserve color from allowlist', () => {
+      mockParseYaml.mockReturnValueOnce({
+        name: 'a',
+        description: 'd',
+        color: 'cyan',
+      });
+      const config = manager.parseSubagentContent(
+        '---\nname: a\ndescription: d\ncolor: cyan\n---\nx',
+        validConfig.filePath!,
+        'project',
+      );
+      expect(config.color).toBe('cyan');
+    });
+
+    it('should drop color not in allowlist (matches CC _Y silent drop)', () => {
+      mockParseYaml.mockReturnValueOnce({
+        name: 'a',
+        description: 'd',
+        color: 'magenta',
+      });
+      const config = manager.parseSubagentContent(
+        '---\nname: a\ndescription: d\ncolor: magenta\n---\nx',
+        validConfig.filePath!,
+        'project',
+      );
+      expect(config.color).toBeUndefined();
+    });
   });
 
   describe('serializeSubagent', () => {
+    it('preserves the executor through save and reload', async () => {
+      const yaml = await vi.importActual<
+        typeof import('../utils/yaml-parser.js')
+      >('../utils/yaml-parser.js');
+      mockStringifyYaml.mockImplementationOnce(yaml.stringify);
+      mockParseYaml.mockImplementationOnce(yaml.parse);
+      const executor = {
+        kind: 'acp' as const,
+        command: 'npx',
+        args: ['-y', 'adapter'],
+      };
+      const serialized = manager.serializeSubagent({
+        ...validConfig,
+        executor,
+      });
+      expect(
+        manager.parseSubagentContent(
+          serialized,
+          validConfig.filePath!,
+          'project',
+        ).executor,
+      ).toEqual(executor);
+    });
+
+    it.each([null, false, 0, '', { kind: 'acp', command: ' ' }])(
+      'refuses to save invalid executor %j without writing',
+      async (executor) => {
+        vi.mocked(fs.access).mockRejectedValue(new Error('File not found'));
+        const config = {
+          ...validConfig,
+          executor,
+        } as unknown as SubagentConfig;
+        expect(() => manager.serializeSubagent(config)).toThrow(
+          /executor block failed validation/,
+        );
+        await expect(
+          manager.createSubagent(config, { level: 'project' }),
+        ).rejects.toThrow(/executor block failed validation/);
+        expect(fs.writeFile).not.toHaveBeenCalled();
+      },
+    );
+
     it('should serialize basic configuration', () => {
       const serialized = manager.serializeSubagent(validConfig);
 
@@ -687,20 +1776,104 @@ You are an agent.
       expect(serialized).not.toContain('background');
     });
 
-    it('should roundtrip background through serialize and parse', () => {
-      const configWithBackground: SubagentConfig = {
-        ...validConfig,
-        background: true,
+    it('should include mcpServers in the frontmatter object passed to stringifyYaml', () => {
+      const mcpServers = {
+        filesystem: { type: 'stdio', command: 'node' },
       };
+      mockStringifyYaml.mockClear();
+      manager.serializeSubagent({ ...validConfig, mcpServers });
+      const frontmatterArg = mockStringifyYaml.mock.calls[0][0];
+      expect(frontmatterArg.mcpServers).toEqual(mcpServers);
+    });
 
-      const serialized = manager.serializeSubagent(configWithBackground);
-      const parsed = manager.parseSubagentContent(
-        serialized,
-        validConfig.filePath!,
-        'project',
-      );
+    it('should include hooks in the frontmatter object passed to stringifyYaml', () => {
+      const hooks = {
+        PreToolUse: [
+          { matcher: 'Bash', hooks: [{ type: 'command', command: 'echo' }] },
+        ],
+      };
+      mockStringifyYaml.mockClear();
+      manager.serializeSubagent({ ...validConfig, hooks });
+      const frontmatterArg = mockStringifyYaml.mock.calls[0][0];
+      expect(frontmatterArg.hooks).toEqual(hooks);
+    });
 
-      expect(parsed.background).toBe(true);
+    it('should omit mcpServers / hooks when the record is empty', () => {
+      mockStringifyYaml.mockClear();
+      manager.serializeSubagent({
+        ...validConfig,
+        mcpServers: {},
+        hooks: {},
+      });
+      const frontmatterArg = mockStringifyYaml.mock.calls[0][0];
+      expect(frontmatterArg.mcpServers).toBeUndefined();
+      expect(frontmatterArg.hooks).toBeUndefined();
+    });
+
+    it.each([true, false])(
+      'roundtrips background=%s through serialize and parse',
+      (background) => {
+        const configWithBackground: SubagentConfig = {
+          ...validConfig,
+          background,
+        };
+
+        const serialized = manager.serializeSubagent(configWithBackground);
+        const parsed = manager.parseSubagentContent(
+          serialized,
+          validConfig.filePath!,
+          'project',
+        );
+
+        expect(parsed.background).toBe(background);
+      },
+    );
+
+    // --- CC 2.1.168 declarative-agent fields serialization ---
+
+    it('should serialize permissionMode when set', () => {
+      const serialized = manager.serializeSubagent({
+        ...validConfig,
+        permissionMode: 'bypassPermissions',
+      });
+      expect(serialized).toContain('permissionMode: bypassPermissions');
+    });
+
+    it('should serialize maxTurns when set', () => {
+      const serialized = manager.serializeSubagent({
+        ...validConfig,
+        maxTurns: 25,
+      });
+      expect(serialized).toContain('maxTurns: 25');
+    });
+
+    it('should NOT emit permissionMode when approvalMode is also being emitted (avoid round-trip drift)', () => {
+      // Regression for PR #4842 round-2 review: if both fields land on the
+      // serialised frontmatter, the next parse takes approvalMode (explicit
+      // wins over bridge) and silently ignores any user edits to
+      // permissionMode in the file.
+      const serialized = manager.serializeSubagent({
+        ...validConfig,
+        permissionMode: 'bypassPermissions',
+        approvalMode: 'yolo',
+      });
+      expect(serialized).toContain('approvalMode: yolo');
+      expect(serialized).not.toContain('permissionMode:');
+    });
+
+    it('should still emit permissionMode when approvalMode is unset (faithful round-trip of the user intent)', () => {
+      const serialized = manager.serializeSubagent({
+        ...validConfig,
+        permissionMode: 'plan',
+      });
+      expect(serialized).toContain('permissionMode: plan');
+      expect(serialized).not.toContain('approvalMode:');
+    });
+
+    it('should not include new fields when undefined', () => {
+      const serialized = manager.serializeSubagent(validConfig);
+      expect(serialized).not.toContain('permissionMode:');
+      expect(serialized).not.toContain('maxTurns:');
     });
   });
 
@@ -724,6 +1897,22 @@ You are an agent.
         expect.stringContaining('name: test-agent'),
         'utf8',
       );
+    });
+
+    it('rejects creation at the commit boundary without writing', async () => {
+      const commitError = new Error('generation closed');
+
+      await expect(
+        manager.createSubagent(validConfig, {
+          level: 'project',
+          assertCanCommit: () => {
+            throw commitError;
+          },
+        }),
+      ).rejects.toBe(commitError);
+
+      expect(fs.mkdir).not.toHaveBeenCalled();
+      expect(fs.writeFile).not.toHaveBeenCalled();
     });
 
     it('should throw error if file already exists and overwrite is false', async () => {
@@ -778,6 +1967,86 @@ You are an agent.
   });
 
   describe('loadSubagent', () => {
+    it('applies the configured model only to the built-in Explore agent', async () => {
+      vi.mocked(fs.readdir).mockRejectedValue(new Error('Directory not found'));
+      const configuredManager = new SubagentManager(
+        makeFakeConfig({
+          agents: { builtin: { exploreModel: 'fast' } },
+        }),
+      );
+
+      expect((await configuredManager.loadSubagent('Explore'))?.model).toBe(
+        'fast',
+      );
+      expect(
+        (await configuredManager.loadSubagent('Explore', 'builtin'))?.model,
+      ).toBe('fast');
+
+      const builtins = await configuredManager.listSubagents({
+        level: 'builtin',
+        force: true,
+      });
+      expect(builtins.find((agent) => agent.name === 'Explore')?.model).toBe(
+        'fast',
+      );
+    });
+
+    it('does not apply the built-in Explore model to a same-name session agent', async () => {
+      const configuredManager = new SubagentManager(
+        makeFakeConfig({
+          agents: { builtin: { exploreModel: 'fast' } },
+        }),
+      );
+      configuredManager.loadSessionSubagents([
+        {
+          name: 'Explore',
+          description: 'Session Explore',
+          systemPrompt: 'Use the session agent.',
+          level: 'session',
+        },
+      ]);
+
+      const config = await configuredManager.loadSubagent('Explore');
+
+      expect(config?.level).toBe('session');
+      expect(config?.model).toBeUndefined();
+    });
+
+    it('ignores a non-string built-in Explore model setting', async () => {
+      const configuredManager = new SubagentManager(
+        makeFakeConfig({
+          agents: {
+            builtin: { exploreModel: 1 as unknown as string },
+          },
+        }),
+      );
+
+      const config = await configuredManager.loadSubagent('Explore', 'builtin');
+
+      expect(config?.model).toBeUndefined();
+    });
+
+    it.each([
+      { exploreModel: '   ', expectedModel: undefined },
+      { exploreModel: 'inherit', expectedModel: 'inherit' },
+    ])(
+      'resolves the built-in Explore model setting "$exploreModel"',
+      async ({ exploreModel, expectedModel }) => {
+        const configuredManager = new SubagentManager(
+          makeFakeConfig({
+            agents: { builtin: { exploreModel } },
+          }),
+        );
+
+        const config = await configuredManager.loadSubagent(
+          'Explore',
+          'builtin',
+        );
+
+        expect(config?.model).toBe(expectedModel);
+      },
+    );
+
     it('should load subagent from project level first', async () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       vi.mocked(fs.readdir).mockResolvedValue(['test-agent.md'] as any);
@@ -949,6 +2218,172 @@ You are a helpful assistant.`;
         path.normalize('/test/project/.qwen/agents/misnamed-file.md'),
       );
     });
+
+    it('refuses a by-name dispatch matching a skipped invalid-executor file instead of falling through to a builtin (R10-2)', async () => {
+      // A project file declares the builtin name 'Explore' with an invalid
+      // executor (typo'd `kind: ACP`), so discovery skips it with a warning.
+      // Without R10-2, loadSubagent('Explore') falls through
+      // session>project>user>extension>builtin and resolves the BUILTIN Explore
+      // — an in-process agent under a Qwen model — silently substituting it for
+      // the external agent the file asked for, with only a console.warn as the
+      // trace. loadSubagent must instead refuse with the recorded executor error.
+      // Reverting to skip-and-continue (no recorded refusal) turns this red: the
+      // call resolves the builtin instead of rejecting.
+      const yaml = await vi.importActual<
+        typeof import('../utils/yaml-parser.js')
+      >('../utils/yaml-parser.js');
+      mockParseYaml.mockImplementation(yaml.parse);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      vi.mocked(fs.readdir).mockResolvedValue(['explore.md'] as any);
+      vi.mocked(fs.readFile).mockResolvedValue(
+        '---\nname: Explore\ndescription: Test\nexecutor:\n  kind: ACP\n  command: npx\n---\nPrompt',
+      );
+      await expect(manager.loadSubagent('Explore')).rejects.toThrow(
+        /invalid executor block/,
+      );
+    });
+
+    it('clears a stale executor refusal when the directory later becomes unreadable (R12-4)', async () => {
+      const yaml = await vi.importActual<
+        typeof import('../utils/yaml-parser.js')
+      >('../utils/yaml-parser.js');
+      mockParseYaml.mockImplementation(yaml.parse);
+      // First scan: a malformed-executor file records a refusal for 'explore'.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      vi.mocked(fs.readdir).mockResolvedValue(['explore.md'] as any);
+      vi.mocked(fs.readFile).mockResolvedValue(
+        '---\nname: Explore\ndescription: Test\nexecutor:\n  kind: ACP\n  command: npx\n---\nPrompt',
+      );
+      await expect(manager.loadSubagent('Explore')).rejects.toThrow(
+        /invalid executor block/,
+      );
+      // The directory then disappears / becomes unreadable (git checkout of a
+      // branch with no agents dir, rm -rf, an unreadable dir). Without resetting
+      // the level's refusals on the scan-failure path, loadSubagent keeps
+      // throwing the stale refusal for a file that no longer exists, leaving the
+      // builtin permanently unreachable. With the reset, the scan returns [] and
+      // the dispatch falls through to the builtin again. Deleting the catch reset
+      // turns this red (the second call rejects with the stale error).
+      vi.mocked(fs.readdir).mockRejectedValue(
+        new Error('ENOENT: no such directory'),
+      );
+      const resolved = await manager.loadSubagent('Explore');
+      expect(resolved?.isBuiltin).toBe(true);
+    });
+
+    it('does not refuse an in-process definition whose block-scalar prose mentions executor: (R12-5)', async () => {
+      const yaml = await vi.importActual<
+        typeof import('../utils/yaml-parser.js')
+      >('../utils/yaml-parser.js');
+      mockParseYaml.mockImplementation(yaml.parse);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      vi.mocked(fs.readdir).mockResolvedValue(['foo.md'] as any);
+      // A `description: |` block scalar documents the executor syntax as prose; a
+      // duplicate `name:` key is a tolerated YAML quirk (control: it loads
+      // alone). The raw-text probe matches the prose `executor:` line, so without
+      // the block-scalar exclusion `claimsExecutor` is true and astLostExecutor
+      // refuses (the duplicate key makes has('executor') false). With the
+      // exclusion the prose match is not a claim, no refusal is recorded, and the
+      // in-process definition loads — reverting the exclusion turns this red
+      // (loadSubagent rejects /invalid executor block/).
+      vi.mocked(fs.readFile).mockResolvedValue(
+        '---\nname: foo\nname: foo\ndescription: |\n  Reviews code. To run externally use:\n  executor: acp\n  for details.\n---\nPrompt',
+      );
+      const config = await manager.loadSubagent('foo');
+      expect(config).not.toBeNull();
+      expect(config!.name).toBe('foo');
+      expect(config!.executor).toBeUndefined();
+    });
+
+    it('does not refuse an in-process definition whose folded-block-scalar prose mentions executor: (R12-5)', async () => {
+      const yaml = await vi.importActual<
+        typeof import('../utils/yaml-parser.js')
+      >('../utils/yaml-parser.js');
+      mockParseYaml.mockImplementation(yaml.parse);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      vi.mocked(fs.readdir).mockResolvedValue(['foo.md'] as any);
+      // Same as above but with a folded block scalar (`description: >`).
+      vi.mocked(fs.readFile).mockResolvedValue(
+        '---\nname: foo\nname: foo\ndescription: >\n  Reviews code. To run externally use:\n  executor: acp\n  for details.\n---\nPrompt',
+      );
+      const config = await manager.loadSubagent('foo');
+      expect(config).not.toBeNull();
+      expect(config!.executor).toBeUndefined();
+    });
+
+    it('refuses a by-name dispatch for an executor-claiming file that fails an earlier validation (R11-1)', async () => {
+      // A project file declares an executor but OMITS the description, so it
+      // fails the earlier required-field validation BEFORE the executor block is
+      // reached. Without hoisting the claim probe + declared name above those
+      // validations, the file is skipped with nothing recorded and loadSubagent
+      // falls through to the builtin Explore — the substitution R10-2 prevents.
+      // The catch now converts any load failure of an executor-claiming file into
+      // a named executor refusal. Reverting the catch conversion turns this red
+      // (loadSubagent resolves the builtin instead of rejecting).
+      const yaml = await vi.importActual<
+        typeof import('../utils/yaml-parser.js')
+      >('../utils/yaml-parser.js');
+      mockParseYaml.mockImplementation(yaml.parse);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      vi.mocked(fs.readdir).mockResolvedValue(['explore.md'] as any);
+      vi.mocked(fs.readFile).mockResolvedValue(
+        '---\nname: Explore\nexecutor:\n  kind: acp\n  command: npx\n---\nPrompt',
+      );
+      await expect(manager.loadSubagent('Explore')).rejects.toThrow(
+        /invalid executor block/,
+      );
+    });
+
+    it('keys the executor refusal by the AST-parsed name, so a quoted name still refuses the dispatch (R11-4)', async () => {
+      // parseSimple's parseValue strips only double quotes, so `name: 'Explore'`
+      // (single-quoted) would otherwise be recorded under "'explore'" and miss
+      // the 'explore' dispatch lookup. The refusal must be keyed by the name the
+      // real YAML AST sees. The colon in description forces the astLostExecutor
+      // refusal path; reverting `declaredName ?? name` to `name` turns this red.
+      const yaml = await vi.importActual<
+        typeof import('../utils/yaml-parser.js')
+      >('../utils/yaml-parser.js');
+      mockParseYaml.mockImplementation(yaml.parse);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      vi.mocked(fs.readdir).mockResolvedValue(['explore.md'] as any);
+      vi.mocked(fs.readFile).mockResolvedValue(
+        "---\nname: 'Explore'\ndescription: Reviews code: fast and careful\nexecutor:\n  kind: ACP\n  command: npx\n---\nPrompt",
+      );
+      await expect(manager.loadSubagent('Explore')).rejects.toThrow(
+        /invalid executor block/,
+      );
+    });
+
+    it('refuses a by-name dispatch for an extension-level executor refusal instead of falling through to a builtin (R10-2 extension leg)', async () => {
+      // Extension agents load via loadSubagentFromDir, which skips + warns on a
+      // refusal — so the directory-scan recording never ran for them and the
+      // R10-2 extension leg read an empty map (a no-op). The refusals are now
+      // carried on the loaded extension and merged into the 'extension' bucket,
+      // so the fall-through refuses. Reverting the merge (dropping the
+      // executorRefusals.set('extension', ...)) turns this red: loadSubagent
+      // resolves the builtin instead of rejecting.
+      vi.spyOn(mockConfig, 'getActiveExtensions').mockReturnValue([
+        {
+          agents: [],
+          agentExecutorRefusals: new Map([
+            [
+              'explore',
+              new SubagentError(
+                'Agent file /ext/agents/explore.md has an invalid executor block: it declares an executor but failed to load.',
+                SubagentErrorCode.INVALID_CONFIG,
+                'Explore',
+              ),
+            ],
+          ]),
+        } as never,
+      ]);
+      // No project/user file declares 'Explore' — only the extension refusal.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      vi.mocked(fs.readdir).mockResolvedValue([] as any);
+      await expect(manager.loadSubagent('Explore')).rejects.toThrow(
+        /invalid executor block/,
+      );
+    });
   });
 
   describe('updateSubagent', () => {
@@ -971,6 +2406,20 @@ You are a helpful assistant.`;
       );
     });
 
+    it('rejects updates at the commit boundary without writing', async () => {
+      const commitError = new Error('generation closed');
+
+      await expect(
+        manager.updateSubagent('test-agent', {}, undefined, {
+          assertCanCommit: () => {
+            throw commitError;
+          },
+        }),
+      ).rejects.toBe(commitError);
+
+      expect(fs.writeFile).not.toHaveBeenCalled();
+    });
+
     it('should throw error if subagent not found', async () => {
       vi.mocked(fs.readdir).mockRejectedValue(new Error('Directory not found'));
 
@@ -982,6 +2431,47 @@ You are a helpful assistant.`;
         /not found/,
       );
     });
+
+    it.each([undefined, 'extension'] as const)(
+      'should reject updates to extension-provided subagents when level is %s',
+      async (level) => {
+        vi.spyOn(mockConfig, 'getActiveExtensions').mockReturnValue([
+          {
+            id: 'test-extension',
+            name: 'test-extension',
+            version: '1.0.0',
+            isActive: true,
+            path: '/extension',
+            config: { name: 'test-extension', version: '1.0.0' },
+            contextFiles: [],
+            agents: [
+              {
+                name: 'extension-agent',
+                description: 'Provided by an extension',
+                systemPrompt: 'Review the code.',
+                level: 'extension',
+                filePath: '/extension/agents/extension-agent.md',
+              },
+            ],
+          },
+        ]);
+
+        await expect(
+          manager.updateSubagent(
+            'extension-agent',
+            { description: 'Updated description' },
+            level,
+          ),
+        ).rejects.toMatchObject({
+          code: SubagentErrorCode.INVALID_CONFIG,
+          subagentName: 'extension-agent',
+          message:
+            'Cannot update extension-provided subagent "extension-agent"',
+        });
+        expect(mockValidateOrThrow).not.toHaveBeenCalled();
+        expect(fs.writeFile).not.toHaveBeenCalled();
+      },
+    );
 
     it('should throw error on write failure', async () => {
       vi.mocked(fs.writeFile).mockRejectedValue(new Error('Write failed'));
@@ -997,6 +2487,74 @@ You are a helpful assistant.`;
   });
 
   describe('deleteSubagent', () => {
+    it.each([
+      ['codex', 'project'],
+      ['claude-code', 'project'],
+      ['codex', 'user'],
+      ['claude-code', 'user'],
+      ['codex', undefined],
+      ['claude-code', undefined],
+    ] as const)(
+      'deletes a custom %s definition at level %s despite its builtin name',
+      async (name, level) => {
+        vi.mocked(fs.readdir).mockResolvedValue([`${name}.md`] as never);
+        vi.mocked(fs.readFile).mockResolvedValue(
+          `---\nname: ${name}\ndescription: Custom native agent\n---\nInspect.`,
+        );
+        mockParseYaml.mockReturnValue({
+          name,
+          description: 'Custom native agent',
+        });
+        vi.mocked(fs.unlink).mockResolvedValue(undefined);
+        await manager.deleteSubagent(name, level);
+        expect(fs.unlink).toHaveBeenCalledTimes(level === undefined ? 2 : 1);
+        expect(
+          vi
+            .mocked(fs.unlink)
+            .mock.calls.every(([file]) => String(file).endsWith(`${name}.md`)),
+        ).toBe(true);
+      },
+    );
+
+    it.each(['codex', 'claude-code'])(
+      'protects the builtin %s definition from deletion',
+      async (name) => {
+        vi.mocked(fs.readdir).mockResolvedValue([]);
+        await expect(manager.deleteSubagent(name, 'builtin')).rejects.toThrow(
+          /Cannot delete built-in/,
+        );
+        await expect(manager.deleteSubagent(name)).rejects.toThrow(
+          /Cannot delete built-in/,
+        );
+        await expect(
+          manager.deleteSubagent(name, 'project'),
+        ).rejects.toMatchObject({
+          code: SubagentErrorCode.INVALID_CONFIG,
+        });
+        expect(fs.unlink).not.toHaveBeenCalled();
+      },
+    );
+
+    it('reports a file error when a custom builtin-name definition cannot be deleted', async () => {
+      vi.mocked(fs.readdir).mockResolvedValue(['codex.md'] as never);
+      vi.mocked(fs.readFile).mockResolvedValue(
+        '---\nname: codex\ndescription: Custom native agent\n---\nInspect.',
+      );
+      mockParseYaml.mockReturnValue({
+        name: 'codex',
+        description: 'Custom native agent',
+      });
+      vi.mocked(fs.unlink).mockRejectedValue(
+        Object.assign(new Error('permission denied'), { code: 'EACCES' }),
+      );
+      await expect(
+        manager.deleteSubagent('codex', 'project'),
+      ).rejects.toMatchObject({
+        code: SubagentErrorCode.FILE_ERROR,
+        message: expect.stringContaining('permission denied'),
+      });
+    });
+
     it('should delete subagent from specified level', async () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       vi.mocked(fs.readdir).mockResolvedValue(['test-agent.md'] as any);
@@ -1008,6 +2566,23 @@ You are a helpful assistant.`;
       expect(fs.unlink).toHaveBeenCalledWith(
         path.normalize('/test/project/.qwen/agents/test-agent.md'),
       );
+    });
+
+    it('rejects deletion at the commit boundary without unlinking', async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      vi.mocked(fs.readdir).mockResolvedValue(['test-agent.md'] as any);
+      vi.mocked(fs.readFile).mockResolvedValue(validMarkdown);
+      const commitError = new Error('generation closed');
+
+      await expect(
+        manager.deleteSubagent('test-agent', 'project', undefined, {
+          assertCanCommit: () => {
+            throw commitError;
+          },
+        }),
+      ).rejects.toBe(commitError);
+
+      expect(fs.unlink).not.toHaveBeenCalled();
     });
 
     it('should delete from both levels if no level specified', async () => {
@@ -1177,7 +2752,7 @@ System prompt 3`);
     it('should list subagents from both levels', async () => {
       const subagents = await manager.listSubagents();
 
-      expect(subagents).toHaveLength(6); // agent1 (project takes precedence), agent2, agent3, general-purpose, Explore, statusline-setup (built-in)
+      expect(subagents).toHaveLength(9);
       expect(subagents.map((s) => s.name)).toEqual([
         'agent1',
         'agent2',
@@ -1185,6 +2760,9 @@ System prompt 3`);
         'general-purpose',
         'Explore',
         'statusline-setup',
+        'review-agent',
+        'claude-code',
+        'codex',
       ]);
     });
 
@@ -1215,8 +2793,11 @@ System prompt 3`);
         'agent1',
         'agent2',
         'agent3',
+        'claude-code',
+        'codex',
         'Explore',
         'general-purpose',
+        'review-agent',
         'statusline-setup',
       ]);
     });
@@ -1229,11 +2810,14 @@ System prompt 3`);
 
       const subagents = await manager.listSubagents();
 
-      expect(subagents).toHaveLength(3); // Only built-in agents remain
+      expect(subagents).toHaveLength(6); // Only built-in agents remain
       expect(subagents.map((s) => s.name)).toEqual([
         'general-purpose',
         'Explore',
         'statusline-setup',
+        'review-agent',
+        'claude-code',
+        'codex',
       ]);
       expect(subagents.every((s) => s.level === 'builtin')).toBe(true);
     });
@@ -1245,12 +2829,70 @@ System prompt 3`);
 
       const subagents = await manager.listSubagents();
 
-      expect(subagents).toHaveLength(3); // Only built-in agents remain
+      expect(subagents).toHaveLength(6); // Only built-in agents remain
       expect(subagents.map((s) => s.name)).toEqual([
         'general-purpose',
         'Explore',
         'statusline-setup',
+        'review-agent',
+        'claude-code',
+        'codex',
       ]);
+      expect(subagents.every((s) => s.level === 'builtin')).toBe(true);
+    });
+  });
+
+  describe('safe mode', () => {
+    let safeManager: SubagentManager;
+
+    beforeEach(() => {
+      const safeConfig = makeFakeConfig({ safeMode: true });
+      vi.spyOn(safeConfig, 'getToolRegistry').mockReturnValue(mockToolRegistry);
+      vi.spyOn(safeConfig, 'getProjectRoot').mockReturnValue('/test/project');
+      safeManager = new SubagentManager(safeConfig);
+    });
+
+    it('listSubagents returns only builtin subagents', async () => {
+      // Even if project/user dirs have agents, safe mode must ignore them
+      vi.mocked(fs.readdir)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .mockResolvedValue(['evil-agent.md'] as any);
+      vi.mocked(fs.readFile).mockResolvedValue(`---
+name: evil-agent
+description: Injected via project
+---
+malicious prompt`);
+
+      const subagents = await safeManager.listSubagents();
+
+      expect(subagents.every((s) => s.level === 'builtin')).toBe(true);
+      expect(subagents.find((s) => s.name === 'evil-agent')).toBeUndefined();
+    });
+
+    it('listSubagents overrides explicit non-builtin level to builtin', async () => {
+      vi.mocked(fs.readdir)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .mockResolvedValue([] as any);
+
+      const subagents = await safeManager.listSubagents({ level: 'project' });
+
+      expect(subagents.every((s) => s.level === 'builtin')).toBe(true);
+    });
+
+    it('refreshCache only populates builtin level', async () => {
+      vi.mocked(fs.readdir)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .mockResolvedValue(['evil.md'] as any);
+      vi.mocked(fs.readFile).mockResolvedValue(`---
+name: evil
+description: bad
+---
+bad`);
+
+      await safeManager.refreshCache();
+
+      // After refresh, listing should only show builtin
+      const subagents = await safeManager.listSubagents();
       expect(subagents.every((s) => s.level === 'builtin')).toBe(true);
     });
   });
@@ -1326,6 +2968,26 @@ System prompt 3`);
 
   describe('Runtime Configuration Methods', () => {
     describe('convertToRuntimeConfig', () => {
+      it.each([{ kind: 'acp', command: 'npx' }, null, false, 0, ''])(
+        'refuses external executor %j before in-process conversion',
+        async (executor) => {
+          await expect(
+            manager.convertToRuntimeConfig({
+              ...validConfig,
+              tools: ['read_file'],
+              executor,
+            } as unknown as SubagentConfig),
+          ).rejects.toMatchObject({
+            code: SubagentErrorCode.INVALID_CONFIG,
+            message: expect.stringContaining(
+              'cannot be converted to an in-process agent',
+            ),
+          });
+          expect(mockToolRegistry.warmAll).not.toHaveBeenCalled();
+          expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+        },
+      );
+
       it('should convert basic configuration', async () => {
         const runtimeConfig = await manager.convertToRuntimeConfig(validConfig);
 
@@ -1370,6 +3032,35 @@ System prompt 3`);
           'grep', // 'Search Files' -> 'grep' (display name match)
           'unknown_tool', // 'unknown_tool' -> 'unknown_tool' (preserved as-is)
         ]);
+      });
+
+      it('fails closed when the allow-list is only the unavailable WebSearch', async () => {
+        // The unresolved name stays a dead, restrictive entry: the agent
+        // runs tool-less rather than inheriting shell/write it was not
+        // configured for. Deliberate — supersedes the earlier inherit-all
+        // compatibility fallback for converted Claude agents.
+        const configWithUnregistered: SubagentConfig = {
+          ...validConfig,
+          tools: ['WebSearch'],
+        };
+
+        const runtimeConfig = await manager.convertToRuntimeConfig(
+          configWithUnregistered,
+        );
+
+        expect(runtimeConfig.toolConfig?.tools).toEqual(['WebSearch']);
+      });
+
+      it('does not widen an allow-list whose names simply fail to resolve', async () => {
+        // A typo'd or temporarily-unavailable tool set must stay a dead,
+        // restrictive list — never silently become inherit-all (that would
+        // grant shell/write to an agent configured without them).
+        const runtimeConfig = await manager.convertToRuntimeConfig({
+          ...validConfig,
+          tools: ['Sheell'],
+        });
+
+        expect(runtimeConfig.toolConfig?.tools).toEqual(['Sheell']);
       });
 
       it('should set modelConfig.model from model selector and merge run configurations', async () => {
@@ -1445,6 +3136,38 @@ System prompt 3`);
 
         expect(runtimeConfig.modelConfig).toEqual({});
       });
+
+      // --- CC 2.1.168 maxTurns top-level promotion ---
+
+      it('should populate runConfig.max_turns from top-level maxTurns', async () => {
+        const cfg: SubagentConfig = { ...validConfig, maxTurns: 42 };
+        const runtimeConfig = await manager.convertToRuntimeConfig(cfg);
+        expect(runtimeConfig.runConfig.max_turns).toBe(42);
+      });
+
+      it('should prefer top-level maxTurns over nested runConfig.max_turns', async () => {
+        const cfg: SubagentConfig = {
+          ...validConfig,
+          maxTurns: 99,
+          runConfig: { max_turns: 5 },
+        };
+        const runtimeConfig = await manager.convertToRuntimeConfig(cfg);
+        expect(runtimeConfig.runConfig.max_turns).toBe(99);
+      });
+
+      it('should fall back to nested runConfig.max_turns when maxTurns is unset', async () => {
+        const cfg: SubagentConfig = {
+          ...validConfig,
+          runConfig: { max_turns: 7 },
+        };
+        const runtimeConfig = await manager.convertToRuntimeConfig(cfg);
+        expect(runtimeConfig.runConfig.max_turns).toBe(7);
+      });
+
+      it('should leave max_turns undefined when neither is set', async () => {
+        const runtimeConfig = await manager.convertToRuntimeConfig(validConfig);
+        expect(runtimeConfig.runConfig.max_turns).toBeUndefined();
+      });
     });
 
     describe('mergeConfigurations', () => {
@@ -1481,6 +3204,317 @@ System prompt 3`);
       });
     });
 
+    describe('createAgentHeadless — external executor dispatch', () => {
+      const executorConfig: SubagentConfig = {
+        name: 'external-agent',
+        description: 'Runs somewhere else',
+        systemPrompt: 'You are external.',
+        level: 'session' as const,
+        executor: { kind: 'acp', command: 'npx', args: ['-y', 'some-acp'] },
+      };
+
+      afterEach(() => {
+        mockAgentHeadlessCreate.mockReset();
+        vi.restoreAllMocks();
+      });
+
+      it.each([
+        { executor: executorConfig.executor },
+        { mcpServers: { remote: { command: 'node' } } },
+        { hooks: { Stop: [] } },
+      ])(
+        'rejects sandbox child overrides %j before invoking any executor',
+        async (overrides) => {
+          vi.spyOn(mockConfig, 'getShellExecutionSandbox').mockReturnValue(
+            {} as NonNullable<ReturnType<Config['getShellExecutionSandbox']>>,
+          );
+          const externalCreate = vi.fn();
+          vi.spyOn(mockConfig, 'getExternalAgentExecutor').mockReturnValue({
+            create: externalCreate,
+          });
+          await expect(
+            manager.createAgentHeadless(
+              {
+                ...executorConfig,
+                executor: undefined,
+                ...overrides,
+              } as SubagentConfig,
+              mockConfig,
+            ),
+          ).rejects.toThrow(
+            'does not support agent executors, MCP servers or hooks',
+          );
+          expect(externalCreate).not.toHaveBeenCalled();
+          expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+          expect(mockToolRegistry.warmAll).not.toHaveBeenCalled();
+        },
+      );
+
+      it('refuses to run in-process when no executor is registered', async () => {
+        vi.spyOn(mockConfig, 'getExternalAgentExecutor').mockReturnValue(
+          undefined,
+        );
+
+        await expect(
+          manager.createAgentHeadless(executorConfig, mockConfig),
+        ).rejects.toThrow(/registered no external agent executor/);
+
+        // The load-bearing assertion: it must NOT silently substitute the
+        // in-process executor. A definition that asked for an external agent
+        // and got AgentHeadless would bill the wrong provider and report the
+        // wrong agent, with no signal either way.
+        expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+        expect(mockToolRegistry.warmAll).not.toHaveBeenCalled();
+        expect(mockCreateContentGenerator).not.toHaveBeenCalled();
+      });
+
+      it.each([null, false, 0, '', {}, { kind: 'ACP', command: 'npx' }])(
+        'rejects injected executor %j without side effects',
+        async (executor) => {
+          const create = vi.fn();
+          vi.spyOn(mockConfig, 'getExternalAgentExecutor').mockReturnValue({
+            create,
+          });
+          manager.loadSessionSubagents([
+            { ...executorConfig, executor } as unknown as SubagentConfig,
+          ]);
+          const loaded = await manager.loadSubagent(
+            executorConfig.name,
+            'session',
+          );
+          await expect(
+            manager.createAgentHeadless(loaded!, mockConfig),
+          ).rejects.toThrow(/failed validation/);
+          expect(create).not.toHaveBeenCalled();
+          expect(mockToolRegistry.warmAll).not.toHaveBeenCalled();
+          expect(mockCreateContentGenerator).not.toHaveBeenCalled();
+          expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+        },
+      );
+
+      it.each([
+        { tools: [] },
+        { tools: ['read_file'] },
+        { disallowedTools: ['write_file'] },
+        { mcpServers: { server: { command: 'node' } } },
+        { hooks: { PreToolUse: [] } },
+        { model: 'anthropic:claude' },
+        { maxTurns: 3 },
+        { runConfig: { max_turns: 3 } },
+      ])(
+        'rejects unsupported definition %j before factory or setup',
+        async (constraint) => {
+          const create = vi.fn();
+          vi.spyOn(mockConfig, 'getExternalAgentExecutor').mockReturnValue({
+            create,
+          });
+          const hooks = vi.spyOn(mockConfig, 'getHookSystem');
+          await expect(
+            manager.createAgentHeadless(
+              { ...executorConfig, ...constraint },
+              mockConfig,
+            ),
+          ).rejects.toThrow(/does not support/);
+          expect(create).not.toHaveBeenCalled();
+          expect(hooks).not.toHaveBeenCalled();
+          expect(mockToolRegistry.warmAll).not.toHaveBeenCalled();
+          expect(mockCreateContentGenerator).not.toHaveBeenCalled();
+          expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+        },
+      );
+
+      it.each([
+        { toolConfigOverride: { tools: ['structured_output'] } },
+        { promptConfigOverrides: { initialMessages: [] } },
+        { promptConfigOverrides: { renderedSystemPrompt: 'schema' } },
+        { runtimeAuthOverrides: { authType: 'anthropic' } },
+        { modelConfigOverrides: { model: 'claude' } },
+        {
+          modelConfigOverrides: { temperature: 0.5 } as unknown as {
+            model?: string;
+          },
+        },
+        { hooks: { onStop: vi.fn() } },
+        { runConfigOverrides: { max_turns: 3 } },
+      ])('rejects unsupported options %j before factory', async (options) => {
+        const create = vi.fn();
+        vi.spyOn(mockConfig, 'getExternalAgentExecutor').mockReturnValue({
+          create,
+        });
+        await expect(
+          manager.createAgentHeadless(executorConfig, mockConfig, options),
+        ).rejects.toThrow(/does not support/);
+        expect(create).not.toHaveBeenCalled();
+        expect(mockCreateContentGenerator).not.toHaveBeenCalled();
+      });
+
+      it.each(['project', 'builtin'] as const)(
+        'refuses %s executables in an untrusted workspace',
+        async (level) => {
+          const create = vi.fn();
+          vi.spyOn(mockConfig, 'getExternalAgentExecutor').mockReturnValue({
+            create,
+          });
+          vi.spyOn(mockConfig, 'isTrustedFolder').mockReturnValue(false);
+          await expect(
+            manager.createAgentHeadless(
+              { ...executorConfig, level },
+              mockConfig,
+            ),
+          ).rejects.toThrow(/untrusted project/);
+          expect(create).not.toHaveBeenCalled();
+        },
+      );
+
+      it('refuses an external executor in safe mode even in a trusted folder (R8-2)', async () => {
+        const create = vi.fn();
+        vi.spyOn(mockConfig, 'getExternalAgentExecutor').mockReturnValue({
+          create,
+        });
+        vi.spyOn(mockConfig, 'isTrustedFolder').mockReturnValue(true);
+        vi.spyOn(mockConfig, 'isSafeMode').mockReturnValue(true);
+        // Safe mode promises only built-in subagents and no repo-supplied
+        // execution. Discovery filtering does not stop loadSubagent resolving a
+        // repo-shipped executor definition from disk, so the dispatch gate must
+        // refuse it — even at project level in a trusted folder.
+        await expect(
+          manager.createAgentHeadless(
+            { ...executorConfig, level: 'project' },
+            mockConfig,
+          ),
+        ).rejects.toThrow(/safe mode/);
+        expect(create).not.toHaveBeenCalled();
+        expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+      });
+
+      it.each(['executor', 'mcpServers', 'hooks'] as const)(
+        'refuses container-incompatible %s for direct manager callers',
+        async (field) => {
+          mockConfig.getExecutionEnvironment = () =>
+            ({}) as ExecutionEnvironment;
+          const definition = {
+            ...executorConfig,
+            executor: undefined,
+            [field]: field === 'executor' ? executorConfig.executor : {},
+          };
+          await expect(
+            manager.createAgentHeadless(definition, mockConfig),
+          ).rejects.toThrow('container execution does not support');
+          expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+        },
+      );
+
+      it('preserves external factory errors without AgentHeadless labeling', async () => {
+        const error = new Error('spawn ENOENT');
+        vi.spyOn(mockConfig, 'getExternalAgentExecutor').mockReturnValue({
+          create: vi.fn().mockRejectedValue(error),
+        });
+        await expect(
+          manager.createAgentHeadless(executorConfig, mockConfig),
+        ).rejects.toBe(error);
+      });
+
+      it('composes external disposal and propagates its error', async () => {
+        const error = new Error('dispose failed');
+        const dispose = vi.fn().mockRejectedValue(error);
+        const create = vi.fn().mockResolvedValue({ dispose });
+        vi.spyOn(mockConfig, 'getExternalAgentExecutor').mockReturnValue({
+          create,
+        });
+        const result = await manager.createAgentHeadless(
+          { ...executorConfig, model: 'inherit' },
+          mockConfig,
+          {
+            modelConfigOverrides: {},
+            runConfigOverrides: { max_time_minutes: 2 },
+          },
+        );
+        expect(create.mock.calls[0][0]).toMatchObject({
+          modelConfig: {},
+          runConfig: { max_time_minutes: 2 },
+          toolConfig: { disallowedTools: [ToolNames.ASK_USER_QUESTION] },
+        });
+        expect(mockCreateContentGenerator).not.toHaveBeenCalled();
+        await expect(result.dispose()).rejects.toBe(error);
+        expect(dispose).toHaveBeenCalledOnce();
+      });
+
+      it('derives the peer permission mode from the host-resolved approval policy, not the raw definition', async () => {
+        const create = vi.fn().mockResolvedValue({});
+        vi.spyOn(mockConfig, 'getExternalAgentExecutor').mockReturnValue({
+          create,
+        });
+        // The definition asks for the most permissive mode; the host has
+        // clamped the effective policy to DEFAULT (resolveSubagentApprovalMode
+        // stamps that onto the runtimeContext the Agent tool hands in).
+        vi.spyOn(mockConfig, 'getApprovalMode').mockReturnValue(
+          ApprovalMode.DEFAULT,
+        );
+        await manager.createAgentHeadless(
+          { ...executorConfig, approvalMode: 'yolo' },
+          mockConfig,
+        );
+        // The executor must receive the host's clamped policy, so a definition
+        // cannot escalate the external agent past the parent session's limit.
+        expect(create.mock.calls[0]![0]).toMatchObject({
+          approvalMode: ApprovalMode.DEFAULT,
+        });
+      });
+
+      it('re-validates the executor block at the consumption point', async () => {
+        // Session-level subagents are injected as plain objects and spread
+        // verbatim by loadSessionSubagents, bypassing frontmatter parsing — so
+        // an arbitrarily shaped executor can reach the dispatch.
+        const injected = {
+          ...executorConfig,
+          executor: { kind: 'acp', command: '   ' },
+        } as unknown as SubagentConfig;
+
+        await expect(
+          manager.createAgentHeadless(injected, mockConfig),
+        ).rejects.toThrow(/failed validation/);
+        expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+      });
+
+      it('dispatches to the registered executor with the validated spec', async () => {
+        const externalSubagent = { execute: vi.fn() };
+        const create = vi.fn().mockResolvedValue(externalSubagent as never);
+        vi.spyOn(mockConfig, 'getExternalAgentExecutor').mockReturnValue({
+          create,
+        });
+
+        const result = await manager.createAgentHeadless(
+          executorConfig,
+          mockConfig,
+        );
+
+        expect(result.subagent).toBe(externalSubagent);
+        expect(mockAgentHeadlessCreate).not.toHaveBeenCalled();
+        expect(create.mock.calls[0][0]).toMatchObject({
+          spec: { kind: 'acp', command: 'npx', args: ['-y', 'some-acp'] },
+          name: 'external-agent',
+        });
+      });
+
+      it('leaves the in-process path untouched when no executor is declared', async () => {
+        mockAgentHeadlessCreate.mockResolvedValue({
+          execute: vi.fn(),
+        } as never);
+        const create = vi.fn();
+        vi.spyOn(mockConfig, 'getExternalAgentExecutor').mockReturnValue({
+          create,
+        } as never);
+
+        await manager.createAgentHeadless(
+          { ...executorConfig, executor: undefined },
+          mockConfig,
+        );
+
+        expect(mockAgentHeadlessCreate).toHaveBeenCalled();
+        expect(create).not.toHaveBeenCalled();
+      });
+    });
+
     describe('createAgentHeadless model override', () => {
       const agentConfig: SubagentConfig = {
         name: 'model-test-agent',
@@ -1505,12 +3539,32 @@ System prompt 3`);
         });
         vi.spyOn(mockConfig, 'getModelsConfig').mockReturnValue({
           getResolvedModel: vi.fn().mockReturnValue(undefined),
+          getGenerationConfig: vi.fn().mockReturnValue({}),
         } as unknown as ReturnType<Config['getModelsConfig']>);
       });
 
       afterEach(() => {
         mockAgentHeadlessCreate.mockReset();
         mockCreateContentGenerator.mockReset();
+      });
+
+      it('removes the interactive question tool from regular subagents', async () => {
+        await manager.createAgentHeadless(
+          {
+            ...agentConfig,
+            tools: [ToolNames.READ_FILE, ToolNames.ASK_USER_QUESTION],
+            disallowedTools: [ToolNames.EDIT],
+          },
+          mockConfig,
+        );
+
+        const { toolConfig } = destructureAgentHeadlessCall(
+          mockAgentHeadlessCreate.mock.calls[0],
+        );
+        expect(toolConfig).toEqual({
+          tools: [ToolNames.READ_FILE, ToolNames.ASK_USER_QUESTION],
+          disallowedTools: [ToolNames.EDIT, ToolNames.ASK_USER_QUESTION],
+        });
       });
 
       it('should create a new ContentGenerator for bare model IDs', async () => {
@@ -1549,10 +3603,186 @@ System prompt 3`);
         expect(mockCreateContentGenerator).not.toHaveBeenCalled();
       });
 
+      it('should snapshot the launch provider when inherit receives a concrete model override', async () => {
+        const config = { ...agentConfig, model: 'inherit' };
+
+        await manager.createAgentHeadless(config, mockConfig, {
+          modelConfigOverrides: { model: 'launch-model' },
+          runtimeAuthOverrides: {
+            authType: AuthType.USE_ANTHROPIC,
+            baseUrl: 'https://launch-provider.example.com',
+          },
+        });
+
+        expect(mockCreateContentGenerator).toHaveBeenCalledWith(
+          expect.objectContaining({
+            model: 'launch-model',
+            authType: AuthType.USE_ANTHROPIC,
+            baseUrl: 'https://launch-provider.example.com',
+          }),
+          mockConfig,
+        );
+      });
+
       it('should NOT create a new ContentGenerator when model is omitted', async () => {
         await manager.createAgentHeadless(agentConfig, mockConfig);
 
         expect(mockCreateContentGenerator).not.toHaveBeenCalled();
+      });
+
+      // A per-agent reasoning effort needs its own content generator even on
+      // the parent's model: the tier goes onto the agent's copy of the
+      // config, and the session config the agent would otherwise share must
+      // never receive it.
+      it('should create a ContentGenerator on the parent model for a reasoning effort alone', async () => {
+        const parent = mockConfig.getContentGeneratorConfig();
+
+        await manager.createAgentHeadless(agentConfig, mockConfig, {
+          modelConfigOverrides: { reasoningEffort: 'low' },
+        });
+
+        expect(mockCreateContentGenerator).toHaveBeenCalledWith(
+          expect.objectContaining({
+            model: 'parent-model',
+            reasoning: { effort: 'low' },
+          }),
+          mockConfig,
+          true,
+        );
+        const { runtimeView } = destructureAgentHeadlessCall(
+          mockAgentHeadlessCreate.mock.calls[0],
+        );
+        expect(runtimeView).toBeDefined();
+        expect(parent.reasoning).toBeUndefined();
+      });
+
+      // A tier the session's model cannot take changes nothing, so it must not
+      // cost the agent a ContentGenerator of its own.
+      it('should NOT create a ContentGenerator for a tier the model cannot take', async () => {
+        vi.spyOn(mockConfig, 'getModelsConfig').mockReturnValue({
+          getResolvedModel: vi.fn().mockReturnValue({
+            capabilities: {
+              reasoning: {
+                thinking: true,
+                toggleOnly: true,
+                disableField: 'enable_thinking',
+              },
+            },
+          }),
+          getGenerationConfig: vi.fn().mockReturnValue({}),
+        } as unknown as ReturnType<Config['getModelsConfig']>);
+
+        await manager.createAgentHeadless(agentConfig, mockConfig, {
+          modelConfigOverrides: { reasoningEffort: 'low' },
+        });
+
+        expect(mockCreateContentGenerator).not.toHaveBeenCalled();
+        const { runtimeView } = destructureAgentHeadlessCall(
+          mockAgentHeadlessCreate.mock.calls[0],
+        );
+        expect(runtimeView).toBeUndefined();
+      });
+
+      // A tier alone is no reason to log in, and no reason to fail the
+      // dispatch: a failed build leaves the agent on the session's generator.
+      it('should run an effort-only agent on the session generator when its own cannot be built', async () => {
+        mockCreateContentGenerator.mockRejectedValueOnce(
+          new Error('Qwen OAuth credentials expired.'),
+        );
+
+        await manager.createAgentHeadless(agentConfig, mockConfig, {
+          modelConfigOverrides: { reasoningEffort: 'low' },
+        });
+
+        expect(mockCreateContentGenerator).toHaveBeenCalledWith(
+          expect.anything(),
+          mockConfig,
+          true,
+        );
+        const { runtimeView } = destructureAgentHeadlessCall(
+          mockAgentHeadlessCreate.mock.calls[0],
+        );
+        expect(runtimeView).toBeUndefined();
+      });
+
+      it('should carry a reasoning effort alongside a model override', async () => {
+        await manager.createAgentHeadless(
+          { ...agentConfig, model: 'custom-model' },
+          mockConfig,
+          { modelConfigOverrides: { reasoningEffort: 'max' } },
+        );
+
+        expect(mockCreateContentGenerator).toHaveBeenCalledWith(
+          expect.objectContaining({
+            model: 'custom-model',
+            reasoning: { effort: 'max' },
+          }),
+          mockConfig,
+        );
+      });
+
+      // A deny that matches nothing silently leaves the agent the tool. Only an
+      // entry that is neither an MCP pattern, a built-in tool (registered here
+      // or not), nor a registered tool's name or display name comes back.
+      it('finds the deny entries that match no tool', async () => {
+        await expect(
+          manager.findUnmatchedToolNames([
+            'Write File',
+            'grep',
+            'edit',
+            'Shell',
+            'mcp__github',
+            'mcp__github__*',
+            'Bash',
+            'run_shell',
+          ]),
+        ).resolves.toEqual(['Bash', 'run_shell']);
+      });
+
+      // An allowlist holds exact names, so its caller asks for mcp__ entries
+      // to be looked up too rather than waved through as patterns.
+      it('looks up mcp__ entries when asked to check MCP names', async () => {
+        vi.mocked(mockToolRegistry.getAllTools).mockReturnValue([
+          { name: 'read_file', displayName: 'Read File' },
+          {
+            name: 'mcp__warehouse__query',
+            displayName: 'query (warehouse MCP Server)',
+          },
+        ] as unknown as ReturnType<ToolRegistry['getAllTools']>);
+
+        await expect(
+          manager.findUnmatchedToolNames(
+            [
+              'mcp__warehouse__query',
+              'query (warehouse MCP Server)',
+              'mcp__warehouse__drop',
+              'Shell',
+            ],
+            { checkMcpNames: true },
+          ),
+        ).resolves.toEqual(['mcp__warehouse__drop']);
+        await expect(
+          manager.findUnmatchedToolNames(['mcp__warehouse__drop']),
+        ).resolves.toEqual([]);
+      });
+
+      // Callers that narrow a pool resolve their lists the way the agent's own
+      // config does: tool name first, then display name, anything else as given.
+      it('resolves tool and display names to tool names and keeps the rest', async () => {
+        await expect(
+          manager.resolveToolNames([
+            'read_file',
+            'Write File',
+            'mcp__github__*',
+            'Bash',
+          ]),
+        ).resolves.toEqual([
+          'read_file',
+          'write_file',
+          'mcp__github__*',
+          'Bash',
+        ]);
+        expect(mockToolRegistry.warmAll).toHaveBeenCalled();
       });
 
       it('should pass the agent runtimeView to AgentHeadless.create', async () => {
@@ -1565,8 +3795,8 @@ System prompt 3`);
         const { runtimeContext, runtimeView } = destructureAgentHeadlessCall(
           mockAgentHeadlessCreate.mock.calls[0],
         );
-        // Subagents always get an `Object.create(parent)` wrapper for
-        // FileReadCache isolation — distinct instance, prototype === parent.
+        // Subagents always get a derived wrapper for child-local state.
+        // It remains a distinct instance whose prototype is the parent.
         expect(runtimeContext).not.toBe(mockConfig);
         expect(Object.getPrototypeOf(runtimeContext)).toBe(mockConfig);
         expect(runtimeView).toBeDefined();
@@ -1657,6 +3887,216 @@ System prompt 3`);
           mockAgentHeadlessCreate.mock.calls[0],
         );
         expect(runtimeView).toBeUndefined();
+      });
+    });
+
+    describe('createAgentHeadless — caller-driven dispose contract', () => {
+      // Regression for self-inflicted leaks (review #4996 round 1):
+      //   1. `wrapAgentHooksForCleanup` relied on `AgentHeadless.execute()`'s
+      //      inner finally firing `onStop`. Two execute() early-exit paths
+      //      (`createChat()` → null and `prepareTools()` throwing) bypass
+      //      that finally, so ephemeral hook entries leaked into the global
+      //      registry for the rest of the session.
+      //   2. The forced tool-registry rebuild for per-agent `mcpServers`
+      //      spawned real MCP client connections (stdio child processes,
+      //      sockets) on a registry distinct from the parent's, but nothing
+      //      stopped it — every subagent invocation declaring `mcpServers`
+      //      orphaned its server processes.
+      //
+      // The unified fix is to return `{ subagent, dispose }` from
+      // `createAgentHeadless` and have callers run `dispose()` in a
+      // `finally` that they already own around `subagent.execute()`. These
+      // tests assert that contract.
+
+      const baseConfig: SubagentConfig = {
+        name: 'cleanup-agent',
+        description: 'dispose contract test',
+        systemPrompt: 'You are a test agent.',
+        level: 'session' as const,
+      };
+
+      beforeEach(() => {
+        mockAgentHeadlessCreate.mockResolvedValue({
+          execute: vi.fn(),
+          getResult: vi.fn(),
+        });
+      });
+
+      afterEach(() => {
+        mockAgentHeadlessCreate.mockReset();
+      });
+
+      it('returns { subagent, dispose }; dispose unregisters per-agent hooks', async () => {
+        const unregisterSpy = vi.fn();
+        const addAgentHooksSpy = vi.fn().mockReturnValue(unregisterSpy);
+        vi.spyOn(mockConfig, 'getHookSystem').mockReturnValue({
+          getRegistry: () => ({ addAgentHooks: addAgentHooksSpy }),
+        } as unknown as ReturnType<Config['getHookSystem']>);
+
+        const result = await manager.createAgentHeadless(
+          {
+            ...baseConfig,
+            hooks: {
+              PreToolUse: [
+                {
+                  matcher: 'Bash',
+                  hooks: [{ type: 'command', command: 'echo' }],
+                },
+              ],
+            },
+          },
+          mockConfig,
+        );
+
+        // The whole point: callers need an explicit cleanup handle they can
+        // invoke from the outer `finally`. A return shape of just
+        // `AgentHeadless` (the pre-fix contract) gives them no way to do
+        // that, because the inner onStop wrap doesn't fire on every
+        // execute() exit path.
+        expect(result).toHaveProperty('subagent');
+        expect(result).toHaveProperty('dispose');
+        expect(typeof result.dispose).toBe('function');
+        expect(addAgentHooksSpy).toHaveBeenCalledTimes(1);
+        expect(unregisterSpy).not.toHaveBeenCalled();
+
+        await result.dispose();
+
+        expect(unregisterSpy).toHaveBeenCalledTimes(1);
+      });
+
+      it('does not register hooks for a project-level subagent in an untrusted folder', async () => {
+        const addAgentHooksSpy = vi.fn().mockReturnValue(vi.fn());
+        vi.spyOn(mockConfig, 'getHookSystem').mockReturnValue({
+          getRegistry: () => ({ addAgentHooks: addAgentHooksSpy }),
+        } as unknown as ReturnType<Config['getHookSystem']>);
+        vi.spyOn(mockConfig, 'isTrustedFolder').mockReturnValue(false);
+
+        const result = await manager.createAgentHeadless(
+          {
+            ...baseConfig,
+            level: 'project',
+            hooks: {
+              PreToolUse: [
+                {
+                  matcher: 'Bash',
+                  hooks: [{ type: 'command', command: 'echo' }],
+                },
+              ],
+            },
+          },
+          mockConfig,
+        );
+
+        expect(addAgentHooksSpy).not.toHaveBeenCalled();
+        // The agent itself is still created — only the hooks are gated.
+        expect(result).toHaveProperty('subagent');
+        await result.dispose();
+      });
+
+      it('registers hooks for a project-level subagent in a trusted folder', async () => {
+        const addAgentHooksSpy = vi.fn().mockReturnValue(vi.fn());
+        vi.spyOn(mockConfig, 'getHookSystem').mockReturnValue({
+          getRegistry: () => ({ addAgentHooks: addAgentHooksSpy }),
+        } as unknown as ReturnType<Config['getHookSystem']>);
+        vi.spyOn(mockConfig, 'isTrustedFolder').mockReturnValue(true);
+
+        const result = await manager.createAgentHeadless(
+          {
+            ...baseConfig,
+            level: 'project',
+            hooks: {
+              PreToolUse: [
+                {
+                  matcher: 'Bash',
+                  hooks: [{ type: 'command', command: 'echo' }],
+                },
+              ],
+            },
+          },
+          mockConfig,
+        );
+
+        expect(addAgentHooksSpy).toHaveBeenCalledTimes(1);
+        await result.dispose();
+      });
+
+      it('dispose unregisters even when execute() never runs (early-exit leak fix)', async () => {
+        // Caller pattern:
+        //   const { subagent, dispose } = await createAgentHeadless(...);
+        //   try { await subagent.execute(...); } finally { await dispose(); }
+        // We never call execute() in this test — that simulates the
+        // createChat-returns-null and prepareTools-throws paths where the
+        // pre-fix `onStop` wrapping never fired its cleanup.
+        const unregisterSpy = vi.fn();
+        vi.spyOn(mockConfig, 'getHookSystem').mockReturnValue({
+          getRegistry: () => ({
+            addAgentHooks: vi.fn().mockReturnValue(unregisterSpy),
+          }),
+        } as unknown as ReturnType<Config['getHookSystem']>);
+
+        const { dispose } = await manager.createAgentHeadless(
+          {
+            ...baseConfig,
+            hooks: {
+              PreToolUse: [
+                {
+                  matcher: '*',
+                  hooks: [{ type: 'command', command: 'echo' }],
+                },
+              ],
+            },
+          },
+          mockConfig,
+        );
+
+        await dispose();
+        expect(unregisterSpy).toHaveBeenCalledTimes(1);
+      });
+
+      it('dispose is a safe no-op when neither hooks nor mcpServers are declared', async () => {
+        const result = await manager.createAgentHeadless(
+          baseConfig,
+          mockConfig,
+        );
+        expect(typeof result.dispose).toBe('function');
+        // Must not throw — the caller's `finally` always invokes dispose,
+        // even for agents that triggered no cleanup-bearing setup.
+        await expect(result.dispose()).resolves.toBeUndefined();
+      });
+
+      it('runs cleanup when AgentHeadless.create throws — caller never gets dispose', async () => {
+        // Constructor-failure path inside createAgentHeadless: the caller
+        // never receives `{ subagent, dispose }`, so the inner catch must
+        // run the same cleanup itself. Without that, a transient
+        // AgentHeadless.create failure (e.g. ContentGenerator init blows
+        // up) would orphan the hook entries we just registered.
+        const unregisterSpy = vi.fn();
+        vi.spyOn(mockConfig, 'getHookSystem').mockReturnValue({
+          getRegistry: () => ({
+            addAgentHooks: vi.fn().mockReturnValue(unregisterSpy),
+          }),
+        } as unknown as ReturnType<Config['getHookSystem']>);
+        mockAgentHeadlessCreate.mockRejectedValueOnce(
+          new Error('synthetic constructor failure'),
+        );
+
+        await expect(
+          manager.createAgentHeadless(
+            {
+              ...baseConfig,
+              hooks: {
+                PreToolUse: [
+                  {
+                    matcher: '*',
+                    hooks: [{ type: 'command', command: 'echo' }],
+                  },
+                ],
+              },
+            },
+            mockConfig,
+          ),
+        ).rejects.toThrow(/synthetic constructor failure/);
+        expect(unregisterSpy).toHaveBeenCalledTimes(1);
       });
     });
   });

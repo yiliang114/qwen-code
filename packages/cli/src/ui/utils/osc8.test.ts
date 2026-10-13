@@ -6,6 +6,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  BARE_URL_PATTERN,
   HYPERLINK_ENV_KEYS,
   isSafeOscScheme,
   labelMayDeceive,
@@ -294,6 +295,46 @@ describe('osc8 helpers', () => {
     });
   });
 
+  describe('BARE_URL_PATTERN', () => {
+    it.each([
+      'https://ja.wikipedia.org/wiki/人々',
+      'https://ja.wikipedia.org/wiki/〆切',
+      'https://example.com/二〇二六年報',
+      'https://ja.example.com/〼道と〻次',
+      'https://example.com/〱〢',
+      'https://example.com/a︳b︴c',
+      'https://zh.wikipedia.org/wiki/北京',
+    ])('keeps word-forming CJK characters in %s', (url) => {
+      expect(new RegExp(BARE_URL_PATTERN).exec(url)?.[0]).toBe(url);
+    });
+
+    it.each([
+      'https://en.wikipedia.org/wiki/Mexico–United_States_border',
+      'https://example.com/it’s',
+      'https://example.com/thing…',
+    ])('keeps typographic punctuation inside %s', (url) => {
+      expect(new RegExp(BARE_URL_PATTERN).exec(url)?.[0]).toBe(url);
+    });
+
+    it.each([
+      ['https://example.com/page。下一步', 'https://example.com/page'],
+      ['https://example.com/page、続き', 'https://example.com/page'],
+      ['https://example.com/page：説明', 'https://example.com/page'],
+      ['https://example.com/page？質問', 'https://example.com/page'],
+      ['https://example.com/page！注意', 'https://example.com/page'],
+    ])('stops before CJK punctuation in %s', (input, expected) => {
+      expect(new RegExp(BARE_URL_PATTERN).exec(input)?.[0]).toBe(expected);
+    });
+
+    it.each([
+      ['https://example.com/x﹙備註﹚', 'https://example.com/x'],
+      ['https://example.com/a︒後続', 'https://example.com/a'],
+      ['https://example.com/p﹖説明', 'https://example.com/p'],
+    ])('stops before CJK compat/vertical forms in %s', (input, expected) => {
+      expect(new RegExp(BARE_URL_PATTERN).exec(input)?.[0]).toBe(expected);
+    });
+  });
+
   describe('supportsHyperlinks', () => {
     function setTTY(value: boolean) {
       Object.defineProperty(process.stdout, 'isTTY', {
@@ -502,9 +543,36 @@ describe('osc8 helpers', () => {
       expect(supportsHyperlinks()).toBe(true);
     });
 
-    it('mintty is enabled via TERM_PROGRAM=mintty', () => {
+    it('mintty ≥ 3.3 is enabled, < 3.3 is not, missing version refuses', () => {
+      // Older mintty builds (still shipping in some Git-for-Windows distros
+      // and dev environments like Laragon) print raw OSC 8 escape bytes as
+      // visible garbage instead of ignoring them — see issue #4420. mintty
+      // has set TERM_PROGRAM_VERSION since 2.7 (2017), so a missing version
+      // implies an ancient build and we refuse.
       setTTY(true);
       process.env['TERM_PROGRAM'] = 'mintty';
+      process.env['TERM_PROGRAM_VERSION'] = '4.0.0';
+      expect(supportsHyperlinks()).toBe(true);
+      process.env['TERM_PROGRAM_VERSION'] = '3.7.1';
+      expect(supportsHyperlinks()).toBe(true);
+      process.env['TERM_PROGRAM_VERSION'] = '3.3.0';
+      expect(supportsHyperlinks()).toBe(true);
+      process.env['TERM_PROGRAM_VERSION'] = '3.2.9';
+      expect(supportsHyperlinks()).toBe(false);
+      process.env['TERM_PROGRAM_VERSION'] = '3.1.0';
+      expect(supportsHyperlinks()).toBe(false);
+      process.env['TERM_PROGRAM_VERSION'] = '2.9.8';
+      expect(supportsHyperlinks()).toBe(false);
+      process.env['TERM_PROGRAM_VERSION'] = '';
+      expect(supportsHyperlinks()).toBe(false);
+      delete process.env['TERM_PROGRAM_VERSION'];
+      expect(supportsHyperlinks()).toBe(false);
+      // Users on mintty 3.1–3.2 who know their build's OSC 8 implementation
+      // works can opt back in via FORCE_HYPERLINK=1 — same escape hatch the
+      // Warp and Hyper tests above assert. Pin the contract so a future
+      // refactor that reorders early-exit checks can't silently break it.
+      process.env['TERM_PROGRAM_VERSION'] = '3.2.9';
+      process.env['FORCE_HYPERLINK'] = '1';
       expect(supportsHyperlinks()).toBe(true);
     });
 
@@ -545,6 +613,27 @@ describe('osc8 helpers', () => {
       process.env['TERM_PROGRAM_VERSION'] = '3.5.0';
       process.env['FORCE_HYPERLINK'] = '0';
       expect(supportsHyperlinks()).toBe(false);
+    });
+
+    it('does not force hyperlinks for non-numeric FORCE_HYPERLINK values', () => {
+      setTTY(true);
+      process.env['TERM_PROGRAM'] = 'iTerm.app';
+      process.env['TERM_PROGRAM_VERSION'] = '3.5.0';
+
+      for (const value of ['false', 'off', '1abc']) {
+        process.env['FORCE_HYPERLINK'] = value;
+        expect(supportsHyperlinks()).toBe(false);
+      }
+    });
+
+    it('forces hyperlinks for empty and non-zero numeric FORCE_HYPERLINK values', () => {
+      setTTY(true);
+      process.env['TERM'] = 'dumb';
+
+      for (const value of ['', '1', '+1', '-1']) {
+        process.env['FORCE_HYPERLINK'] = value;
+        expect(supportsHyperlinks()).toBe(true);
+      }
     });
 
     it('hard opt-outs (NO_COLOR/QWEN_DISABLE_HYPERLINKS) win over FORCE_HYPERLINK', () => {

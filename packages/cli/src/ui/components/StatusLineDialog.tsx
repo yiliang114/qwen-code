@@ -13,7 +13,7 @@ import { SettingScope } from '../../config/settings.js';
 import type { UseHistoryManagerReturn } from '../hooks/useHistoryManager.js';
 import { useKeypress } from '../hooks/useKeypress.js';
 import { theme } from '../semantic-colors.js';
-import { MessageType } from '../types.js';
+import { MessageType, type HistoryItemWithoutId } from '../types.js';
 import type { UIState } from '../contexts/UIStateContext.js';
 import { MultiSelect, type MultiSelectItem } from './shared/MultiSelect.js';
 import {
@@ -22,6 +22,7 @@ import {
   buildStatusLinePresetLines,
   DEFAULT_STATUS_LINE_PRESET_CONFIG,
   normalizeStatusLinePresetConfig,
+  orderStatusLinePresetItems,
   STATUS_LINE_PRESET_ITEMS,
   type StatusLinePresetConfig,
   type StatusLinePresetItemId,
@@ -44,6 +45,28 @@ interface StatusLineDialogProps {
 
 const THEME_COLORS_KEY = 'theme-colors';
 const DESCRIPTION_COLUMN = 24;
+// border + paddingY + title + subtitle + search + margins + preview + footer
+const STATUS_LINE_DIALOG_FIXED_ROWS = 15;
+
+const STATUS_LINE_OPTIONS: Array<MultiSelectItem<StatusLineOption>> = [
+  {
+    key: THEME_COLORS_KEY,
+    value: { kind: 'theme-colors' },
+    label: `${'Use theme colors'.padEnd(DESCRIPTION_COLUMN)} Apply colors from the active /theme`,
+  },
+  {
+    key: 'statusline-separator',
+    value: { kind: 'separator' },
+    label: '─'.repeat(23),
+    disabled: true,
+    separator: true,
+  },
+  ...STATUS_LINE_PRESET_ITEMS.map((item) => ({
+    key: item.id,
+    value: { kind: 'item' as const, id: item.id },
+    label: `${item.label.padEnd(DESCRIPTION_COLUMN)} ${item.description}`,
+  })),
+];
 
 function buildInitialSelectedKeys(settings: LoadedSettings): string[] {
   const preset =
@@ -57,19 +80,11 @@ function buildInitialSelectedKeys(settings: LoadedSettings): string[] {
 
 function buildConfigFromKeys(keys: readonly string[]): StatusLinePresetConfig {
   const selected = new Set(keys);
-  const validItemIds = new Set(STATUS_LINE_PRESET_ITEMS.map((item) => item.id));
-  const items = [
-    ...new Set(
-      keys.filter((key): key is StatusLinePresetItemId =>
-        validItemIds.has(key as StatusLinePresetItemId),
-      ),
-    ),
-  ];
 
   return {
     type: 'preset',
     useThemeColors: selected.has(THEME_COLORS_KEY),
-    items,
+    items: orderStatusLinePresetItems(keys),
   };
 }
 
@@ -86,31 +101,20 @@ function getEffectiveStatusLineScope(settings: LoadedSettings): SettingScope {
   return SettingScope.User;
 }
 
-function getOptionSearchText(
-  option: MultiSelectItem<StatusLineOption>,
-): string {
-  const value =
-    option.value.kind === 'theme-colors'
-      ? 'theme colors active theme'
-      : option.value.kind === 'separator'
-        ? ''
-        : option.value.id;
-  return `${option.label} ${value}`.toLowerCase();
-}
-
 function getPreviewData(config: Config, uiState: UIState) {
   const stats = uiState.sessionStats;
   const metrics = stats.metrics;
   const { totalInputTokens, totalOutputTokens } = aggregateModelTokens(metrics);
+  const contentGeneratorConfig = config.getContentGeneratorConfig();
 
   return buildStatusLinePresetData({
     sessionId: stats.sessionId,
     version: config.getCliVersion(),
-    modelDisplayName: uiState.currentModel || config.getModel(),
+    modelDisplayName: config.getModelDisplayName(),
+    reasoning: contentGeneratorConfig?.reasoning,
     currentDir: config.getTargetDir(),
     branch: uiState.branchName,
-    contextWindowSize:
-      config.getContentGeneratorConfig()?.contextWindowSize || 0,
+    contextWindowSize: contentGeneratorConfig?.contextWindowSize || 0,
     currentUsage: stats.lastPromptTokenCount,
     totalInputTokens,
     totalOutputTokens,
@@ -134,38 +138,19 @@ export function StatusLineDialog({
     buildInitialSelectedKeys(settings),
   );
 
-  const options = useMemo<Array<MultiSelectItem<StatusLineOption>>>(
-    () => [
-      {
-        key: THEME_COLORS_KEY,
-        value: { kind: 'theme-colors' },
-        label: `${'Use theme colors'.padEnd(DESCRIPTION_COLUMN)} Apply colors from the active /theme`,
-      },
-      {
-        key: 'statusline-separator',
-        value: { kind: 'separator' },
-        label: '───────────────────────',
-        disabled: true,
-        separator: true,
-      },
-      ...STATUS_LINE_PRESET_ITEMS.map((item) => ({
-        key: item.id,
-        value: { kind: 'item' as const, id: item.id },
-        label: `${item.label.padEnd(DESCRIPTION_COLUMN)} ${item.description}`,
-      })),
-    ],
-    [],
-  );
+  const terminalHeight = availableTerminalHeight ?? 18;
+  const hasFullLayout = terminalHeight >= STATUS_LINE_DIALOG_FIXED_ROWS + 1;
 
   const filteredOptions = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
-    if (!normalizedQuery) {
-      return options;
+    if (!hasFullLayout || !normalizedQuery) {
+      return STATUS_LINE_OPTIONS;
     }
-    return options.filter((option) =>
-      getOptionSearchText(option).includes(normalizedQuery),
+    return STATUS_LINE_OPTIONS.filter(
+      ({ key, label, separator }) =>
+        !separator && `${label} ${key}`.toLowerCase().includes(normalizedQuery),
     );
-  }, [options, query]);
+  }, [hasFullLayout, query]);
 
   const presetConfig = useMemo(
     () => buildConfigFromKeys(selectedKeys),
@@ -182,22 +167,37 @@ export function StatusLineDialog({
 
   const handleConfirm = useCallback(() => {
     const effectiveScope = getEffectiveStatusLineScope(settings);
-    settings.setValue(effectiveScope, 'ui.statusLine', presetConfig);
-    onSaved?.(presetConfig);
-    addItem(
-      {
-        type: MessageType.INFO,
-        text: `Status line preset saved to ${effectiveScope.toLowerCase()} settings.`,
-      },
-      Date.now(),
-    );
+    const statusLine =
+      settings.forScope(effectiveScope).settings.ui?.statusLine;
+    const hideContextIndicator =
+      statusLine && typeof statusLine === 'object'
+        ? statusLine.hideContextIndicator
+        : undefined;
+    const savedConfig = {
+      ...presetConfig,
+      ...(typeof hideContextIndicator === 'boolean'
+        ? { hideContextIndicator }
+        : {}),
+    };
+    settings.setValue(effectiveScope, 'ui.statusLine', savedConfig);
+    onSaved?.(savedConfig);
+    const feedbackItem: HistoryItemWithoutId & Record<string, unknown> = {
+      type: MessageType.INFO,
+      text: `Status line preset saved to ${effectiveScope.toLowerCase()} settings.`,
+    };
+    addItem(feedbackItem, Date.now());
+    config.getChatRecordingService?.()?.recordSlashCommand({
+      phase: 'result',
+      rawCommand: '/statusline',
+      outputHistoryItems: [feedbackItem],
+    });
     onClose();
-  }, [addItem, onClose, onSaved, presetConfig, settings]);
+  }, [addItem, config, onClose, onSaved, presetConfig, settings]);
 
   useKeypress(
     (key) => {
       if (key.name === 'escape') {
-        if (query) {
+        if (hasFullLayout && query) {
           setQuery('');
           return;
         }
@@ -205,7 +205,10 @@ export function StatusLineDialog({
         return;
       }
 
-      if (key.name === 'backspace' || key.name === 'delete') {
+      if (
+        hasFullLayout &&
+        (key.name === 'backspace' || key.name === 'delete')
+      ) {
         setQuery((current) => current.slice(0, -1));
         return;
       }
@@ -221,6 +224,7 @@ export function StatusLineDialog({
       }
 
       if (
+        hasFullLayout &&
         !key.ctrl &&
         !key.meta &&
         key.sequence.length === 1 &&
@@ -234,30 +238,43 @@ export function StatusLineDialog({
   );
 
   const maxItemsToShow = Math.max(
-    5,
-    Math.min(10, (availableTerminalHeight ?? 18) - 8),
+    1,
+    Math.min(
+      10,
+      hasFullLayout
+        ? terminalHeight - STATUS_LINE_DIALOG_FIXED_ROWS
+        : terminalHeight,
+    ),
   );
 
   return (
     <Box
-      borderStyle="round"
+      borderStyle={hasFullLayout ? 'round' : undefined}
       borderColor={theme.border.default}
       flexDirection="column"
       paddingX={1}
-      paddingY={1}
+      paddingY={hasFullLayout ? 1 : 0}
       width="100%"
     >
-      <Text bold>Configure Status Line</Text>
-      <Text color={theme.text.secondary}>
-        Select which items to display in the status line.
-      </Text>
+      {hasFullLayout && (
+        <>
+          <Text bold wrap="truncate">
+            Configure Status Line
+          </Text>
+          <Text color={theme.text.secondary} wrap="truncate">
+            Select which items to display in the status line.
+          </Text>
 
-      <Box marginTop={1} flexDirection="column">
-        <Text color={theme.text.secondary}>Type to search</Text>
-        <Text>{query ? `> ${query}` : '>'}</Text>
-      </Box>
+          <Box marginTop={1} flexDirection="column">
+            <Text color={theme.text.secondary} wrap="truncate">
+              Type to search
+            </Text>
+            <Text wrap="truncate">{query ? `> ${query}` : '>'}</Text>
+          </Box>
+        </>
+      )}
 
-      <Box marginTop={1} flexDirection="column">
+      <Box marginTop={hasFullLayout ? 1 : 0} flexDirection="column">
         {filteredOptions.length > 0 ? (
           <MultiSelect
             items={filteredOptions}
@@ -267,41 +284,50 @@ export function StatusLineDialog({
             showNumbers={false}
             checkedText="[x]"
             showActiveMarker
+            truncateLabels
             maxItemsToShow={maxItemsToShow}
           />
         ) : (
-          <Text color={theme.text.secondary}>No preset items match.</Text>
-        )}
-      </Box>
-
-      <Box marginTop={1} flexDirection="column">
-        <Text color={theme.text.secondary}>Preview</Text>
-        {previewLines.length > 0 ? (
-          previewLines.map((line, index) => (
-            <Text
-              key={`${line}-${index}`}
-              color={
-                presetConfig.useThemeColors ? theme.text.accent : undefined
-              }
-              dimColor={!presetConfig.useThemeColors}
-              wrap="truncate"
-            >
-              {line}
-            </Text>
-          ))
-        ) : (
-          <Text color={theme.text.secondary}>
-            Select at least one item to show a status line.
+          <Text color={theme.text.secondary} wrap="truncate">
+            No preset items match.
           </Text>
         )}
       </Box>
 
-      <Box marginTop={1}>
-        <Text color={theme.text.secondary}>
-          Use up/down to navigate, space to select, enter to confirm, esc to
-          cancel
-        </Text>
-      </Box>
+      {hasFullLayout && (
+        <>
+          <Box marginTop={1} flexDirection="column">
+            <Text color={theme.text.secondary} wrap="truncate">
+              Preview
+            </Text>
+            {previewLines.length > 0 ? (
+              previewLines.map((line, index) => (
+                <Text
+                  key={`${line}-${index}`}
+                  color={
+                    presetConfig.useThemeColors ? theme.text.accent : undefined
+                  }
+                  dimColor={!presetConfig.useThemeColors}
+                  wrap="truncate"
+                >
+                  {line}
+                </Text>
+              ))
+            ) : (
+              <Text color={theme.text.secondary} wrap="truncate">
+                Select at least one item to show a status line.
+              </Text>
+            )}
+          </Box>
+
+          <Box marginTop={1}>
+            <Text color={theme.text.secondary} wrap="truncate">
+              Use up/down to navigate, space to select, enter to confirm, esc to
+              cancel
+            </Text>
+          </Box>
+        </>
+      )}
     </Box>
   );
 }
