@@ -13,9 +13,73 @@ import type {
 import { CommandKind } from './types.js';
 import { t } from '../../i18n/index.js';
 import type {
+  Config,
   HookRegistryEntry,
   SessionHookEntry,
+  HookEventName,
 } from '@qwen-code/qwen-code-core';
+import { createDebugLogger } from '@qwen-code/qwen-code-core/utils/debugLogger.js';
+import { supportsMatchers } from '../components/hooks/constants.js';
+import { normalizeMatcher } from '../components/hooks/matcherGrouping.js';
+import { SettingScope, type LoadedSettings } from '../../config/settings.js';
+import { MessageType } from '../types.js';
+import { resolveHookSettingsForConfig } from '../../config/hook-settings.js';
+
+const debugLogger = createDebugLogger('HOOKS_COMMAND');
+
+/**
+ * Re-reads the settings files and reloads the hook registry, so hooks added,
+ * changed or removed since startup run without a restart. The hook fields are
+ * resolved exactly as at startup (bare and safe mode load none; project hooks
+ * only in a trusted folder). Session hooks registered by skills, the SDK or
+ * `/goal` live outside the registry and are unaffected.
+ */
+async function reloadHooksFromSettings(
+  config: Config,
+  settings: LoadedSettings,
+): Promise<void> {
+  const hookSystem = config.getHookSystem();
+  if (!hookSystem) {
+    return;
+  }
+  // Keep the startup settings paths after --worktree changes cwd, and never
+  // run startup corruption recovery while refreshing an active session.
+  if (
+    !settings.reloadScopesFromDiskAtomically([
+      SettingScope.User,
+      SettingScope.Workspace,
+    ])
+  ) {
+    throw new Error(
+      'Settings could not be read; the previous hooks are still active.',
+    );
+  }
+  // The system files are reloaded on their own: a user usually cannot repair
+  // an administrator's file, so a broken one must not block the user's own
+  // edits. On failure their previous snapshot stays in effect.
+  const systemScopes = [SettingScope.System, SettingScope.SystemDefaults];
+  const systemReloaded = settings.reloadScopesFromDiskAtomically(systemScopes);
+  config.setHooksFromSettings(
+    resolveHookSettingsForConfig(
+      settings.merged.hooks,
+      {
+        systemHooks: settings.getSystemHooks(),
+        userHooks: settings.getUserHooks(),
+        projectHooks: settings.getProjectHooks(),
+      },
+      config.getBareMode() || config.isSafeMode(),
+    ),
+  );
+  await hookSystem.reload();
+  if (!systemReloaded) {
+    const paths = systemScopes
+      .map((scope) => settings.forScope(scope).path)
+      .join(', ');
+    throw new Error(
+      `System settings could not be read (${paths}); hooks from them are unchanged, and other hook edits were applied.`,
+    );
+  }
+}
 
 /**
  * Format hook source for display
@@ -43,7 +107,7 @@ const listCommand: SlashCommand = {
     return t('List all configured hooks');
   },
   kind: CommandKind.BUILT_IN,
-  supportedModes: ['interactive'] as const,
+  supportedModes: ['interactive', 'non_interactive', 'acp'] as const,
   action: async (
     context: CommandContext,
     _args: string,
@@ -71,7 +135,6 @@ const listCommand: SlashCommand = {
     const registry = hookSystem.getRegistry();
     const configHooks = registry.getAllHooks();
 
-    // Get session hooks
     const sessionId = config.getSessionId();
     const sessionHooksManager = hookSystem.getSessionHooksManager();
     const sessionHooks = sessionId
@@ -90,86 +153,94 @@ const listCommand: SlashCommand = {
       };
     }
 
-    // Group hooks by event
-    const hooksByEvent = new Map<
-      string,
-      Array<{ hook: HookRegistryEntry | SessionHookEntry; isSession: boolean }>
-    >();
-
-    // Add config hooks
-    for (const hook of configHooks) {
-      const eventName = hook.eventName;
-      if (!hooksByEvent.has(eventName)) {
-        hooksByEvent.set(eventName, []);
-      }
-      hooksByEvent.get(eventName)!.push({ hook, isSession: false });
+    interface FlattenedHook {
+      name: string;
+      source: string;
     }
 
-    // Add session hooks
-    for (const hook of sessionHooks) {
-      const eventName = hook.eventName;
-      if (!hooksByEvent.has(eventName)) {
-        hooksByEvent.set(eventName, []);
+    const hooksByEvent = new Map<string, Map<string, FlattenedHook[]>>();
+
+    const addHook = (
+      eventName: string,
+      matcher: string,
+      hook: FlattenedHook,
+    ): void => {
+      const matcherKey = supportsMatchers(eventName as HookEventName)
+        ? matcher
+        : '*';
+      let matcherMap = hooksByEvent.get(eventName);
+      if (!matcherMap) {
+        matcherMap = new Map<string, FlattenedHook[]>();
+        hooksByEvent.set(eventName, matcherMap);
       }
-      hooksByEvent.get(eventName)!.push({ hook, isSession: true });
+      let bucket = matcherMap.get(matcherKey);
+      if (!bucket) {
+        bucket = [];
+        matcherMap.set(matcherKey, bucket);
+      }
+      bucket.push(hook);
+    };
+
+    const extractName = (config: {
+      type: string;
+      command?: string;
+      url?: string;
+      name?: string;
+    }): string =>
+      config.name ||
+      (config.type === 'command' ? config.command : undefined) ||
+      (config.type === 'http' ? config.url : undefined) ||
+      'unnamed';
+
+    for (const hook of configHooks) {
+      const configHook = hook as HookRegistryEntry;
+      const config = configHook.config as {
+        type: string;
+        command?: string;
+        url?: string;
+        name?: string;
+      };
+      addHook(configHook.eventName, normalizeMatcher(configHook.matcher), {
+        name: extractName(config),
+        source: formatHookSource(configHook.source),
+      });
+    }
+
+    for (const hook of sessionHooks) {
+      const sessionHook = hook as SessionHookEntry;
+      const config = sessionHook.config as {
+        type: string;
+        command?: string;
+        url?: string;
+        name?: string;
+      };
+      addHook(sessionHook.eventName, normalizeMatcher(sessionHook.matcher), {
+        name: extractName(config),
+        source: formatHookSource('session'),
+      });
     }
 
     let output = `**Configured Hooks (${totalHooks} total)**\n\n`;
 
-    for (const [eventName, hooks] of hooksByEvent) {
-      output += `### ${eventName}\n`;
-      for (const { hook, isSession } of hooks) {
-        let name: string;
-        let source: string;
-        let matcher: string;
-        let config: {
-          type: string;
-          command?: string;
-          url?: string;
-          name?: string;
-        };
-
-        if (isSession) {
-          // Session hook
-          const sessionHook = hook as SessionHookEntry;
-          config = sessionHook.config as {
-            type: string;
-            command?: string;
-            url?: string;
-            name?: string;
-          };
-          name =
-            config.name ||
-            (config.type === 'command' ? config.command : undefined) ||
-            (config.type === 'http' ? config.url : undefined) ||
-            'unnamed';
-          source = formatHookSource('session');
-          matcher = sessionHook.matcher
-            ? ` (matcher: ${sessionHook.matcher})`
-            : '';
-        } else {
-          // Config hook
-          const configHook = hook as HookRegistryEntry;
-          config = configHook.config as {
-            type: string;
-            command?: string;
-            url?: string;
-            name?: string;
-          };
-          name =
-            config.name ||
-            (config.type === 'command' ? config.command : undefined) ||
-            (config.type === 'http' ? config.url : undefined) ||
-            'unnamed';
-          source = formatHookSource(configHook.source);
-          matcher = configHook.matcher
-            ? ` (matcher: ${configHook.matcher})`
-            : '';
+    for (const [eventName, matcherMap] of hooksByEvent) {
+      output += `### ${eventName}\n\n`;
+      const useMatchers = supportsMatchers(eventName as HookEventName);
+      if (useMatchers) {
+        for (const [matcher, hookList] of matcherMap) {
+          output += `#### ${t('Matcher:')} ${matcher}\n`;
+          for (const hook of hookList) {
+            output += `- **${hook.name}** [${hook.source}]\n`;
+          }
+          output += '\n';
         }
-
-        output += `- **${name}** [${source}]${matcher}\n`;
+      } else {
+        for (const hookList of matcherMap.values()) {
+          for (const hook of hookList) {
+            output += `- **${hook.name}** [${hook.source}]\n`;
+          }
+        }
+        output += '\n';
       }
-      output += '\n';
     }
 
     return {
@@ -186,21 +257,38 @@ export const hooksCommand: SlashCommand = {
     return t('Manage Qwen Code hooks');
   },
   kind: CommandKind.BUILT_IN,
-  supportedModes: ['interactive'] as const,
+  supportedModes: ['interactive', 'non_interactive', 'acp'] as const,
+  canRunDuringStreaming: true,
   action: async (
     context: CommandContext,
     args: string,
   ): Promise<SlashCommandActionReturn> => {
-    // In interactive mode, open the hooks dialog
     const executionMode = context.executionMode ?? 'interactive';
     if (executionMode === 'interactive') {
+      const { config, settings } = context.services;
+      if (config) {
+        try {
+          await reloadHooksFromSettings(config, settings);
+        } catch (error) {
+          // The menu still opens on the hooks loaded so far.
+          debugLogger.warn(`Failed to reload hooks for /hooks: ${error}`);
+          context.ui.addItem(
+            {
+              type: MessageType.ERROR,
+              text: t('Failed to reload hook definitions: {{error}}', {
+                error: error instanceof Error ? error.message : String(error),
+              }),
+            },
+            Date.now(),
+          );
+        }
+      }
       return {
         type: 'dialog',
         dialog: 'hooks',
       };
     }
 
-    // In non-interactive mode, list hooks
     const result = await listCommand.action?.(context, args);
     return result ?? { type: 'message', messageType: 'info', content: '' };
   },

@@ -22,9 +22,15 @@ import type {
 } from '@qwen-code/qwen-code-core';
 import {
   CoreToolScheduler,
+  compactToolResultDisplayForHistory,
+  convertToFunctionErrorResponse,
   createDebugLogger,
-  isAutoMemPath,
+  getToolResponseDisplayText,
+  isAnyAutoMemPath,
+  isShellProgressData,
+  ToolErrorType,
 } from '@qwen-code/qwen-code-core';
+import type { ResolvedGeneratorForModel } from '@qwen-code/qwen-code-core/core/baseLlmClient.js';
 import * as path from 'node:path';
 import { useCallback, useState, useMemo } from 'react';
 import type {
@@ -32,23 +38,26 @@ import type {
   IndividualToolCallDisplay,
 } from '../types.js';
 import { ToolCallStatus } from '../types.js';
+import { isCollapsibleTool } from '../components/messages/CompactToolGroupDisplay.js';
+import { collectInlineImages } from '../utils/inline-image-parts.js';
 
 const debugLogger = createDebugLogger('REACT_TOOL_SCHEDULER');
 
 export type ScheduleFn = (
   request: ToolCallRequestInfo | ToolCallRequestInfo[],
   signal: AbortSignal,
+  modelOverride?: string,
 ) => void;
 export type MarkToolsAsSubmittedFn = (callIds: string[]) => void;
 
 export type TrackedScheduledToolCall = ScheduledToolCall & {
-  responseSubmittedToGemini?: boolean;
+  responseSubmittedToLlm?: boolean;
 };
 export type TrackedValidatingToolCall = ValidatingToolCall & {
-  responseSubmittedToGemini?: boolean;
+  responseSubmittedToLlm?: boolean;
 };
 export type TrackedWaitingToolCall = WaitingToolCall & {
-  responseSubmittedToGemini?: boolean;
+  responseSubmittedToLlm?: boolean;
 };
 /**
  * NOTE on inherited fields: `pid?` and `promoteAbortController?` come
@@ -82,13 +91,13 @@ const _ASSERT_INHERITED_FIELDS_PRESENT: _AssertExecutingHasPid &
 void _ASSERT_INHERITED_FIELDS_PRESENT;
 
 export type TrackedExecutingToolCall = ExecutingToolCall & {
-  responseSubmittedToGemini?: boolean;
+  responseSubmittedToLlm?: boolean;
 };
 export type TrackedCompletedToolCall = CompletedToolCall & {
-  responseSubmittedToGemini?: boolean;
+  responseSubmittedToLlm?: boolean;
 };
 export type TrackedCancelledToolCall = CancelledToolCall & {
-  responseSubmittedToGemini?: boolean;
+  responseSubmittedToLlm?: boolean;
 };
 
 export type TrackedToolCall =
@@ -104,6 +113,7 @@ export function useReactToolScheduler(
   config: Config,
   getPreferredEditor: () => EditorType | undefined,
   onEditorClose: () => void,
+  onToolResultFullTurnModel?: (model: string) => boolean,
 ): [TrackedToolCall[], ScheduleFn, MarkToolsAsSubmittedFn] {
   const [toolCallsForDisplay, setToolCallsForDisplay] = useState<
     TrackedToolCall[]
@@ -111,11 +121,18 @@ export function useReactToolScheduler(
 
   const outputUpdateHandler: OutputUpdateHandler = useCallback(
     (toolCallId, outputChunk) => {
+      // Shell liveness heartbeats are for headless consumers; the TUI
+      // already shows a spinner and must not replace accumulated live
+      // output with a stats object.
+      if (isShellProgressData(outputChunk)) {
+        return;
+      }
+      const compactOutput = compactToolResultDisplayForHistory(outputChunk);
       setToolCallsForDisplay((prevCalls) =>
         prevCalls.map((tc) => {
           if (tc.request.callId === toolCallId && tc.status === 'executing') {
             const executingTc = tc as TrackedExecutingToolCall;
-            return { ...executingTc, liveOutput: outputChunk };
+            return { ...executingTc, liveOutput: compactOutput };
           }
           return tc;
         }),
@@ -140,8 +157,8 @@ export function useReactToolScheduler(
           );
           // Start with the new core state, then layer on the existing UI state
           // to ensure UI-only properties like pid are preserved.
-          const responseSubmittedToGemini =
-            existingTrackedCall?.responseSubmittedToGemini ?? false;
+          const responseSubmittedToLlm =
+            existingTrackedCall?.responseSubmittedToLlm ?? false;
 
           if (coreTc.status === 'executing') {
             // `...coreTc` already spreads `pid` and
@@ -151,7 +168,7 @@ export function useReactToolScheduler(
             // version of this call.
             return {
               ...coreTc,
-              responseSubmittedToGemini,
+              responseSubmittedToLlm,
               liveOutput: (existingTrackedCall as TrackedExecutingToolCall)
                 ?.liveOutput,
             };
@@ -170,7 +187,7 @@ export function useReactToolScheduler(
           // tool call).
           return {
             ...coreTc,
-            responseSubmittedToGemini,
+            responseSubmittedToLlm,
             liveOutput: undefined,
             pid: undefined,
             promoteAbortController: undefined,
@@ -185,12 +202,12 @@ export function useReactToolScheduler(
     () =>
       new CoreToolScheduler({
         config,
-        chatRecordingService: config.getChatRecordingService(),
         outputUpdateHandler,
         onAllToolCallsComplete: allToolCallsCompleteHandler,
         onToolCallsUpdate: toolCallsUpdateHandler,
         getPreferredEditor,
         onEditorClose,
+        onToolResultFullTurnModel,
       }),
     [
       config,
@@ -199,6 +216,7 @@ export function useReactToolScheduler(
       toolCallsUpdateHandler,
       getPreferredEditor,
       onEditorClose,
+      onToolResultFullTurnModel,
     ],
   );
 
@@ -206,10 +224,153 @@ export function useReactToolScheduler(
     (
       request: ToolCallRequestInfo | ToolCallRequestInfo[],
       signal: AbortSignal,
+      modelOverride?: string,
     ) => {
-      void scheduler.schedule(request, signal);
+      const requests = Array.isArray(request) ? request : [request];
+      const isQueuedCancellation = (error: unknown) =>
+        signal.aborted &&
+        error instanceof Error &&
+        error.message === 'Tool call cancelled while in queue.';
+      const completeAsCancelled = async () => {
+        const reason =
+          '[Operation Cancelled] Reason: Tool call cancelled before execution.';
+        const cancelledCalls: CompletedToolCall[] = requests.map(
+          (toolRequest) => ({
+            status: 'cancelled',
+            request: toolRequest,
+            response: {
+              callId: toolRequest.callId,
+              responseParts: convertToFunctionErrorResponse(
+                toolRequest.name,
+                toolRequest.callId,
+                reason,
+                reason,
+              ),
+              resultDisplay: undefined,
+              error: undefined,
+              errorType: undefined,
+              executionStatus: 'not_started',
+              contentLength: reason.length,
+            },
+            durationMs: 0,
+          }),
+        );
+        await allToolCallsCompleteHandler(cancelledCalls);
+      };
+
+      if (!modelOverride?.endsWith('\0')) {
+        void scheduler.schedule(request, signal).catch((error: unknown) => {
+          if (isQueuedCancellation(error)) {
+            void completeAsCancelled().catch((completionError: unknown) => {
+              debugLogger.error(
+                'Tool cancellation completion failed:',
+                completionError,
+              );
+            });
+            return;
+          }
+          if (signal.aborted) return;
+          debugLogger.error(
+            `Tool scheduling failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        });
+        return;
+      }
+      // Declared outside the detached task so the terminal handler below can
+      // name the batch it failed to complete.
+      void (async () => {
+        const completeAsSchedulingError = async (error: unknown) => {
+          debugLogger.error(
+            `Full-turn tool scheduling failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          const message =
+            'Full-turn tool scheduling failed. The tool was not executed.';
+          const completedCalls: CompletedToolCall[] = requests.map(
+            (toolRequest) => {
+              const toolError = new Error(message);
+              const responseParts = convertToFunctionErrorResponse(
+                toolRequest.name,
+                toolRequest.callId,
+                message,
+                message,
+              );
+              return {
+                status: 'error',
+                request: toolRequest,
+                response: {
+                  callId: toolRequest.callId,
+                  responseParts,
+                  resultDisplay: message,
+                  error: toolError,
+                  errorType: ToolErrorType.UNHANDLED_EXCEPTION,
+                  executionStatus: 'not_started',
+                  contentLength: message.length,
+                },
+              };
+            },
+          );
+          setToolCallsForDisplay((prev) => [...prev, ...completedCalls]);
+          await allToolCallsCompleteHandler(completedCalls);
+        };
+
+        // A fail-closed runtime-model resolution is a scheduling failure,
+        // never a user cancellation, so it gets its own `try`: even when the
+        // signal aborts in the same window it must still land on the error
+        // path (and its log line) rather than vanish into the cancellation
+        // branch below.
+        let runtimeView: ResolvedGeneratorForModel;
+        try {
+          runtimeView = await config
+            .getBaseLlmClient()
+            .resolveForModel(modelOverride.slice(0, -1), {
+              failClosed: true,
+            });
+        } catch (error) {
+          await completeAsSchedulingError(error);
+          return;
+        }
+
+        try {
+          await scheduler.schedule(request, signal, runtimeView);
+        } catch (error) {
+          // The busy scheduler rejects a queued request once its signal
+          // aborts, which is a cancellation rather than a scheduling failure.
+          // Completing it as `cancelled` — instead of returning early — still
+          // runs the caller's completion path, the only place that releases
+          // the batch and continuation ownership registered for these
+          // callIds. An aborted signal alone is not enough: any other
+          // rejection is a real scheduling failure and must keep its
+          // `errorType`, so this matches the exact Core queue rejection
+          // (see `CoreToolScheduler.schedule`).
+          if (isQueuedCancellation(error)) {
+            await completeAsCancelled();
+            return;
+          }
+          await completeAsSchedulingError(error);
+        }
+      })().catch((error: unknown) => {
+        // Terminal handler for the detached task: the completion callbacks
+        // above are caller-supplied and may reject. Containing that here
+        // keeps a rejected completion from surfacing as an unhandled
+        // rejection, and deliberately does not retry or complete the batch a
+        // second time. Keep the stack and the callIds in the line: they are
+        // the only way to tie it back to a turn.
+        const detail =
+          error instanceof Error
+            ? (error.stack ?? error.message)
+            : String(error);
+        debugLogger.error(
+          `Full-turn tool completion failed for callIds ${requests
+            .map((toolRequest) => toolRequest.callId)
+            .join(', ')}: ${detail}`,
+        );
+      });
     },
-    [scheduler],
+    [allToolCallsCompleteHandler, config, scheduler],
   );
 
   const markToolsAsSubmitted: MarkToolsAsSubmittedFn = useCallback(
@@ -217,7 +378,7 @@ export function useReactToolScheduler(
       setToolCallsForDisplay((prevCalls) =>
         prevCalls.map((tc) =>
           callIdsToMark.includes(tc.request.callId)
-            ? { ...tc, responseSubmittedToGemini: true }
+            ? { ...tc, responseSubmittedToLlm: true }
             : tc,
         ),
       );
@@ -269,7 +430,7 @@ function detectMemoryOp(
   const filePath = args?.['file_path'] as string | undefined;
   if (!filePath) return undefined;
   const resolved = path.resolve(filePath);
-  if (!isAutoMemPath(resolved, projectRoot)) return undefined;
+  if (!isAnyAutoMemPath(resolved, projectRoot)) return undefined;
   if (WRITE_TOOLS.has(toolName)) return 'write';
   if (READ_TOOLS.has(toolName)) return 'read';
   return undefined;
@@ -290,7 +451,11 @@ export function mapToDisplay(
       let description: string;
       let renderOutputAsMarkdown = false;
 
-      if (trackedCall.status === 'error') {
+      if (
+        trackedCall.status === 'error' ||
+        trackedCall.tool === undefined ||
+        trackedCall.invocation === undefined
+      ) {
         displayName =
           trackedCall.tool === undefined
             ? trackedCall.request.name
@@ -309,6 +474,9 @@ export function mapToDisplay(
         callId: trackedCall.request.callId,
         name: displayName,
         description,
+        // Same object reference the scheduler already holds — rendered only
+        // when `ui.showToolCallArgs` is on (see ToolMessage's args row).
+        args: trackedCall.request.args as Record<string, unknown>,
         renderOutputAsMarkdown,
         isMemoryOp:
           projectRoot && trackedCall.status !== 'error'
@@ -320,28 +488,73 @@ export function mapToDisplay(
             : undefined,
       };
 
+      const inlineImageCollection =
+        trackedCall.status === 'success' ||
+        trackedCall.status === 'error' ||
+        trackedCall.status === 'cancelled'
+          ? collectInlineImages(trackedCall.response.responseParts)
+          : null;
+
       switch (trackedCall.status) {
-        case 'success':
+        case 'success': {
           return {
             ...baseDisplayProperties,
             status: mapCoreStatusToDisplayStatus(trackedCall.status),
-            resultDisplay: trackedCall.response.resultDisplay,
+            resultDisplay: compactToolResultDisplayForHistory(
+              trackedCall.response.resultDisplay,
+            ),
+            ...(trackedCall.response.visionBridgeNotice !== undefined
+              ? {
+                  visionBridgeNotice: trackedCall.response.visionBridgeNotice,
+                }
+              : {}),
+            // Full detail for the Ctrl+O transcript (§4.9): derived from the
+            // already-persisted functionResponse parts; NOT char-capped (the
+            // bound is whatever core already applied). Consumed ONLY by the
+            // transcript's fullDetail render for collapsible (read/search/list)
+            // tools whose summary resultDisplay is just a count — so gate the
+            // extraction on `isCollapsibleTool(displayName)` to avoid storing a
+            // large (~25K char) string on every edit/write/command/agent call
+            // that the renderer would never use. Mirrors ToolMessage's
+            // `usingDetailedDisplay` gate, which also keys off the display name.
+            detailedDisplay: isCollapsibleTool(displayName)
+              ? getToolResponseDisplayText(trackedCall.response.responseParts)
+              : undefined,
+            ...(inlineImageCollection?.images.length
+              ? { images: inlineImageCollection.images }
+              : {}),
+            ...(inlineImageCollection?.omittedImageCount
+              ? {
+                  omittedImageCount: inlineImageCollection.omittedImageCount,
+                }
+              : {}),
             confirmationDetails: undefined,
           };
+        }
         case 'error':
+        case 'cancelled': {
           return {
             ...baseDisplayProperties,
             status: mapCoreStatusToDisplayStatus(trackedCall.status),
-            resultDisplay: trackedCall.response.resultDisplay,
+            resultDisplay: compactToolResultDisplayForHistory(
+              trackedCall.response.resultDisplay,
+            ),
+            ...(trackedCall.response.visionBridgeNotice !== undefined
+              ? {
+                  visionBridgeNotice: trackedCall.response.visionBridgeNotice,
+                }
+              : {}),
+            ...(inlineImageCollection?.images.length
+              ? { images: inlineImageCollection.images }
+              : {}),
+            ...(inlineImageCollection?.omittedImageCount
+              ? {
+                  omittedImageCount: inlineImageCollection.omittedImageCount,
+                }
+              : {}),
             confirmationDetails: undefined,
           };
-        case 'cancelled':
-          return {
-            ...baseDisplayProperties,
-            status: mapCoreStatusToDisplayStatus(trackedCall.status),
-            resultDisplay: trackedCall.response.resultDisplay,
-            confirmationDetails: undefined,
-          };
+        }
         case 'awaiting_approval':
           return {
             ...baseDisplayProperties,
@@ -350,6 +563,7 @@ export function mapToDisplay(
             confirmationDetails: trackedCall.confirmationDetails,
           };
         case 'executing':
+          // React stores compacted live output when handling raw update chunks.
           return {
             ...baseDisplayProperties,
             status: mapCoreStatusToDisplayStatus(trackedCall.status),

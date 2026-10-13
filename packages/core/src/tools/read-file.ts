@@ -4,32 +4,52 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import type { Stats } from 'node:fs';
 import { makeRelative, shortenPath, unescapePath } from '../utils/paths.js';
-import type { ToolInvocation, ToolLocation, ToolResult } from './tools.js';
+import type {
+  ToolInvocation,
+  ToolLocation,
+  ToolResult,
+  ToolResultDisplay,
+} from './tools.js';
 import { BaseDeclarativeTool, BaseToolInvocation, Kind } from './tools.js';
 import { ToolNames, ToolDisplayNames } from './tool-names.js';
+import { getCurrentToolCallSource } from '../code-mode/tool-call-runtime.js';
 
-import type { PartUnion } from '@google/genai';
+import type { PartListUnion, FunctionDeclaration } from '@google/genai';
 import type { PermissionDecision } from '../permissions/types.js';
 import {
   processSingleFileContent,
   getSpecificMimeType,
+  isCacheableReadResult,
+  type PDFVisionBridgeCandidate,
+  type ProcessedFileReadResult,
 } from '../utils/fileUtils.js';
-import { parsePDFPageRange } from '../utils/pdf.js';
+import { parsePDFPageRange, PDF_MAX_PAGES_PER_READ } from '../utils/pdf.js';
 import type { Config } from '../config/config.js';
+import type { InputModalities } from '../core/contentGenerator.js';
 import { FileOperation } from '../telemetry/metrics.js';
 import { getProgrammingLanguage } from '../telemetry/telemetry-utils.js';
 import { logFileOperation } from '../telemetry/loggers.js';
 import { FileOperationEvent } from '../telemetry/types.js';
-import { isSubpaths } from '../utils/paths.js';
-import { Storage } from '../config/storage.js';
-import { isAutoMemPath } from '../memory/paths.js';
+import { isAnyAutoMemPath } from '../memory/paths.js';
 import { memoryFreshnessNote } from '../memory/memoryAge.js';
 import { createDebugLogger } from '../utils/debugLogger.js';
+import { getFileReadDefaultPermission } from './file-read-permission.js';
+import {
+  formatVisionBridgeNotice,
+  runVisionBridge,
+  shouldRunVisionBridge,
+  type VisionBridgeNoticeDisplay,
+  type VisionBridgePdfSourceContext,
+} from '../services/visionBridge/vision-bridge-service.js';
+import {
+  hasImageParts,
+  normalizeParts,
+  splitImageParts,
+} from '../services/visionBridge/image-part-utils.js';
 
 const debugLogger = createDebugLogger('READ_FILE_CACHE');
 
@@ -45,19 +65,18 @@ export interface ReadFileToolParams {
   /**
    * The line number to start reading from (optional)
    */
-  offset?: number;
+  offset?: number | null;
 
   /**
    * The number of lines to read (optional)
    */
-  limit?: number;
+  limit?: number | null;
 
   /**
    * For PDF files, the page range to extract as text (e.g. "1-5", "3", "10-20").
-   * Pages are 1-indexed. Max 20 pages per request. Open-ended ranges like "3-"
-   * are not supported.
+   * Pages are 1-indexed. Open-ended ranges like "3-" are not supported.
    */
-  pages?: string;
+  pages?: string | null;
 }
 
 class ReadFileToolInvocation extends BaseToolInvocation<
@@ -82,7 +101,8 @@ class ReadFileToolInvocation extends BaseToolInvocation<
       return `${shortPath} (pages ${this.params.pages})`;
     }
 
-    const { offset, limit } = this.params;
+    const offset = this.params.offset ?? undefined;
+    const limit = this.params.limit ?? undefined;
     if (offset !== undefined && limit !== undefined) {
       return `${shortPath} (lines ${offset + 1}-${offset + limit})`;
     } else if (offset !== undefined) {
@@ -95,42 +115,22 @@ class ReadFileToolInvocation extends BaseToolInvocation<
   }
 
   override toolLocations(): ToolLocation[] {
-    return [{ path: this.params.file_path, line: this.params.offset }];
+    return [
+      { path: this.params.file_path, line: this.params.offset ?? undefined },
+    ];
   }
 
   /**
    * Returns 'ask' for paths outside the workspace/temp/userSkills directories,
    * so that external file reads require user confirmation.
    */
-  override async getDefaultPermission(): Promise<PermissionDecision> {
-    const filePath = path.resolve(this.params.file_path);
-    const workspaceContext = this.config.getWorkspaceContext();
-
-    const allowedRoots = [
-      this.config.storage.getProjectTempDir(),
-      // Background subagent transcripts live under <projectDir>/subagents/ and
-      // are advertised to the model as polling targets via read_file.
-      path.join(this.config.storage.getProjectDir(), 'subagents'),
-      Storage.getGlobalTempDir(),
-      os.tmpdir(),
-      ...this.config.storage.getUserSkillsDirs(),
-      Storage.getUserExtensionsDir(),
-    ];
-
-    if (
-      workspaceContext.isPathWithinWorkspace(filePath) ||
-      isSubpaths(allowedRoots, filePath) ||
-      // isAutoMemPath uses the narrower managed auto-memory root for this
-      // project — not the broad getMemoryBaseDir() — to avoid exposing
-      // sensitive ~/.qwen files such as settings.json or OAuth credentials.
-      isAutoMemPath(filePath, this.config.getTargetDir())
-    ) {
-      return 'allow';
-    }
-    return 'ask';
+  override getDefaultPermission(): Promise<PermissionDecision> {
+    return Promise.resolve(
+      getFileReadDefaultPermission(this.config, this.params.file_path),
+    );
   }
 
-  async execute(): Promise<ToolResult> {
+  async execute(signal: AbortSignal): Promise<ToolResult> {
     const absPath = path.resolve(this.params.file_path);
     const projectRoot = this.config.getTargetDir();
     // Auto-memory files (AGENTS.md and friends under the auto-memory
@@ -140,7 +140,7 @@ class ReadFileToolInvocation extends BaseToolInvocation<
     // file_unchanged placeholder would skip that prepend, silently
     // dropping the staleness warning for the rest of the session.
     // These files are small; re-emit them on every read.
-    const isAutoMem = isAutoMemPath(absPath, projectRoot);
+    const isAutoMem = isAnyAutoMemPath(absPath, projectRoot);
     // The cache can be disabled at the Config level (escape hatch for
     // sessions where the "model has already seen the prior tool result"
     // assumption breaks down — e.g. after context compaction or
@@ -154,7 +154,8 @@ class ReadFileToolInvocation extends BaseToolInvocation<
     // per-read freshness `<system-reminder>` that must be re-emitted
     // on every read.
     const cacheEnabled = !this.config.getFileReadCacheDisabled();
-    const useFastPath = cacheEnabled && !isAutoMem;
+    const nestedRead = getCurrentToolCallSource()?.kind === 'code_mode';
+    const useFastPath = cacheEnabled && !isAutoMem && !nestedRead;
     const cache = this.config.getFileReadCache();
     // A request-level "full" Read asks for the whole file: no offset,
     // no limit, no PDF page range. The cache entry is only marked as
@@ -197,18 +198,28 @@ class ReadFileToolInvocation extends BaseToolInvocation<
       debugLogger.debug('miss', { path: absPath, state: status.state });
     }
 
-    const result = await processSingleFileContent(
+    const prepareForVisionBridge = shouldRunVisionBridge(this.config);
+    let result = await processSingleFileContent(
       this.params.file_path,
       this.config,
-      this.params.offset,
-      this.params.limit,
-      this.params.pages,
+      {
+        offset: this.params.offset ?? undefined,
+        limit: this.params.limit ?? undefined,
+        pages: this.params.pages ?? undefined,
+        preserveUnsupportedImage: prepareForVisionBridge,
+        preparePdfForVisionBridge: prepareForVisionBridge,
+        signal,
+      },
     );
+
+    if (result.pdfVisionBridgeCandidate) {
+      result = await this.transcribePdfCandidate(result, signal);
+    }
 
     if (result.error) {
       return {
         llmContent: result.llmContent,
-        returnDisplay: result.returnDisplay || 'Error reading file',
+        returnDisplay: this.toToolResultDisplay(result, 'Error reading file'),
         error: {
           message: result.error,
           type: result.errorType,
@@ -264,17 +275,17 @@ class ReadFileToolInvocation extends BaseToolInvocation<
     // hash on the read pipeline (deferred follow-up — see Risk
     // section in the PR description).
     if (cacheEnabled && (result.stats ?? stats)) {
-      const cacheable =
-        typeof result.llmContent === 'string' &&
-        result.originalLineCount !== undefined;
+      const cacheable = isCacheableReadResult(result);
       const recordStats: Stats = result.stats ?? stats!;
       cache.recordRead(absPath, recordStats, {
         full: isFullRead && !result.isTruncated,
         cacheable,
       });
+      // Reading into a program does not prove the full text reached history.
+      if (nestedRead) cache.markReadEvictedFromHistory(recordStats);
     }
 
-    let llmContent: PartUnion;
+    let llmContent: PartListUnion;
     if (
       result.isTruncated &&
       result.linesShown &&
@@ -282,7 +293,9 @@ class ReadFileToolInvocation extends BaseToolInvocation<
     ) {
       const [start, end] = result.linesShown!;
       const total = result.originalLineCount!;
-      llmContent = `Showing lines ${start}-${end} of ${total} total lines.\n\n---\n\n${result.llmContent}`;
+      const totalLabel =
+        result.originalLineCountExact === false ? `at least ${total}` : total;
+      llmContent = `Showing lines ${start}-${end} of ${totalLabel} total lines.\n\n---\n\n${result.llmContent}`;
     } else {
       llmContent = result.llmContent || '';
     }
@@ -326,8 +339,152 @@ class ReadFileToolInvocation extends BaseToolInvocation<
 
     return {
       llmContent,
-      returnDisplay: result.returnDisplay || '',
+      returnDisplay: this.toToolResultDisplay(result),
     };
+  }
+
+  private async transcribePdfCandidate(
+    result: ProcessedFileReadResult,
+    signal: AbortSignal,
+  ): Promise<ProcessedFileReadResult> {
+    const candidate = result.pdfVisionBridgeCandidate;
+    if (!candidate) return result;
+
+    const { imageParts } = splitImageParts(result.llmContent);
+    if (imageParts.length === 0 || !hasImageParts(imageParts)) {
+      debugLogger.debug('pdf vision bridge candidate contained no images');
+      return this.restorePdfFallback(result, 'Vision bridge could not run.');
+    }
+
+    const sourceContext: VisionBridgePdfSourceContext = {
+      displayName: candidate.displayName,
+      renderedRange: candidate.renderedRange,
+      ...(candidate.continuation && {
+        continuation: candidate.continuation,
+      }),
+    };
+
+    try {
+      const bridgeResult = await runVisionBridge({
+        config: this.config,
+        parts: imageParts,
+        signal,
+        sourceContext,
+      });
+      signal.throwIfAborted();
+      const notice = formatVisionBridgeNotice(bridgeResult);
+      if (
+        bridgeResult.status === 'ok' &&
+        bridgeResult.applied &&
+        bridgeResult.parts != null
+      ) {
+        if (
+          bridgeResult.convertedCount !== imageParts.length ||
+          bridgeResult.omittedCount !== 0
+        ) {
+          debugLogger.debug('pdf vision bridge omitted candidate pages');
+          return this.restorePdfFallback(
+            result,
+            `${notice} The transcription was discarded because the bridge did not transcribe every rendered PDF page.`,
+          );
+        }
+        const bridgedParts = normalizeParts(bridgeResult.parts);
+        if (
+          bridgedParts.some(
+            (part) => part.inlineData != null || part.fileData != null,
+          )
+        ) {
+          debugLogger.debug('pdf vision bridge returned media data');
+          return this.restorePdfFallback(
+            result,
+            `${notice} The transcription was discarded because the bridge returned an unsafe media payload.`,
+          );
+        }
+        return {
+          ...result,
+          llmContent: bridgedParts,
+          returnDisplay: `${result.returnDisplay} (${this.formatPdfBridgeRange(candidate, 'transcribed')})`,
+          pdfVisionBridgeNotice: notice,
+          pdfVisionBridgeCandidate: undefined,
+        };
+      }
+      return this.restorePdfFallback(
+        result,
+        bridgeResult.status === 'ok'
+          ? formatVisionBridgeNotice({
+              applied: false,
+              status: 'failed',
+              convertedCount: 0,
+              omittedCount: 0,
+              ...(bridgeResult.modelId !== undefined && {
+                modelId: bridgeResult.modelId,
+              }),
+              ...(bridgeResult.modelEndpoint !== undefined && {
+                modelEndpoint: bridgeResult.modelEndpoint,
+              }),
+              ...(bridgeResult.egressOccurred !== undefined && {
+                egressOccurred: bridgeResult.egressOccurred,
+              }),
+            })
+          : notice,
+      );
+    } catch (error) {
+      signal.throwIfAborted();
+      debugLogger.debug(
+        `pdf vision bridge failed before replacement: ${String(error instanceof Error ? error.message : error)}`,
+      );
+      return this.restorePdfFallback(
+        result,
+        'Vision bridge failed before producing a transcription.',
+      );
+    }
+  }
+
+  private restorePdfFallback(
+    result: ProcessedFileReadResult,
+    notice: string,
+  ): ProcessedFileReadResult {
+    const candidate = result.pdfVisionBridgeCandidate;
+    if (!candidate) return result;
+    const fallback = candidate.fallback;
+    return {
+      ...result,
+      llmContent: fallback.llmContent,
+      returnDisplay: `${fallback.returnDisplay} (${this.formatPdfBridgeRange(candidate, 'rendered')})`,
+      error: fallback.error,
+      errorType: fallback.errorType,
+      pdfVisionBridgeNotice: notice,
+      pdfVisionBridgeCandidate: undefined,
+    };
+  }
+
+  private formatPdfBridgeRange(
+    candidate: PDFVisionBridgeCandidate,
+    action: 'rendered' | 'transcribed',
+  ): string {
+    const processed = `${action} PDF pages ${candidate.renderedRange.firstPage}-${candidate.renderedRange.lastPage}`;
+    if (!candidate.continuation) return processed;
+    if (candidate.continuation.certainty === 'known') {
+      return `${processed}; remaining pages ${candidate.continuation.firstPage}-${candidate.continuation.lastPage}`;
+    }
+    const requestedEnd = candidate.continuation.requestedLastPage
+      ? ` through page ${candidate.continuation.requestedLastPage}`
+      : '';
+    return `${processed}; additional pages may exist from page ${candidate.continuation.firstPage}${requestedEnd}`;
+  }
+
+  private toToolResultDisplay(
+    result: ProcessedFileReadResult,
+    fallback = '',
+  ): ToolResultDisplay {
+    const summary = result.returnDisplay || fallback;
+    if (!result.pdfVisionBridgeNotice) return summary;
+    const display: VisionBridgeNoticeDisplay = {
+      type: 'vision_bridge_notice',
+      summary,
+      notice: result.pdfVisionBridgeNotice,
+    };
+    return display;
   }
 
   /**
@@ -371,6 +528,48 @@ class ReadFileToolInvocation extends BaseToolInvocation<
 }
 
 /**
+ * Build the model-facing read_file description, tailored to the model's actual
+ * input modalities. Audio/video are advertised — and the "read the clip you
+ * just produced" contract stated — ONLY when the selected model can perceive
+ * them. A text-only model must not be told it can "watch a video", or it will
+ * call read_file expecting to see a clip it cannot ingest (the exact failure
+ * behind fine-detail video QA where the model clips but never re-reads). The
+ * PDF/text/image handling and the vision-bridge fallback are model-agnostic and
+ * always stated. Recomputed live in {@link ReadFileTool.schema} so it tracks a
+ * mid-session `/model` switch, not just the modalities at construction time.
+ */
+export function buildReadFileDescription(modalities: InputModalities): string {
+  const preamble = `Reads and returns the content of a specified file. The file_path argument MUST be an absolute path. Always construct it by combining the project root with the file's relative path (e.g. project root '/path/to/project/' + relative 'foo/bar.txt' = '/path/to/project/foo/bar.txt'). If the user provides a relative path, resolve it against the project root first. If the file is large, the content will be truncated. For text files, the tool's response will clearly indicate if truncation has occurred and will provide details on how to read more of the file using the 'offset' and 'limit' parameters. `;
+  const trailer = ` For text files, it can read specific line ranges. For PDF files, use the 'pages' parameter to extract specific page ranges as text (e.g. '1-5'). Max ${PDF_MAX_PAGES_PER_READ} pages per request. Large PDFs cannot be read all at once when the model does not support native PDF input; retry with narrower page ranges if the tool reports a PDF is too large. With a configured vision bridge, failed PDF text extraction or an irreducibly large single page may be transcribed automatically, at most four pages per call; this transcription is lossy and marked as untrusted. This tool can read Jupyter notebooks (.ipynb) and returns structured cell content with outputs. For notebooks, provide 'file_path' and omit 'offset', 'limit', and 'pages' or set them to null.`;
+
+  const nouns: string[] = [];
+  const formats: string[] = [];
+  if (modalities.audio) {
+    nouns.push('audio');
+    formats.push('audio (MP3, M4A, WAV, FLAC, OGG, AAC)');
+  }
+  if (modalities.video) {
+    nouns.push('video');
+    formats.push('video (MP4, MOV, MKV, WEBM, AVI)');
+  }
+
+  if (nouns.length === 0) {
+    // Text-only (or image/PDF-only) model: never advertise audio/video.
+    return `${preamble}Handles text, images (PNG, JPG, GIF, WEBP, SVG, BMP), PDF files, and Jupyter notebooks (.ipynb).${trailer}`;
+  }
+
+  const perceive =
+    modalities.video && modalities.audio
+      ? 'watch a video (frames + audio) or listen to an audio file'
+      : modalities.video
+        ? 'watch a video (frames + audio)'
+        : 'listen to an audio file';
+  const viewHear = modalities.video ? 'view/hear' : 'hear';
+
+  return `${preamble}Handles text, images (PNG, JPG, GIF, WEBP, SVG, BMP), ${nouns.join(', ')}, PDF files, and Jupyter notebooks (.ipynb); ${formats.join(' and ')} require the selected model to support the corresponding modality. When multimodal support is enabled, ${nouns.join(' and ')} files are delivered to you for DIRECT perception — you can actually ${perceive} by reading it. In particular, after you cut or downscale a media segment with a clip/extract tool, call read_file on the resulting clip to actually ${viewHear} that segment yourself before answering — do not assume its contents.${trailer}`;
+}
+
+/**
  * Implementation of the ReadFile tool logic
  */
 export class ReadFileTool extends BaseDeclarativeTool<
@@ -379,11 +578,19 @@ export class ReadFileTool extends BaseDeclarativeTool<
 > {
   static readonly Name: string = ToolNames.READ_FILE;
 
+  // Self-managed: ReadFile controls its own size via line-based paging
+  // (offset/limit, default truncateToolOutputLines setting), so it is exempt from the scheduler's
+  // char-based truncation. Oversized reads are bounded by the per-message
+  // batch budget instead.
+  override get maxOutputChars(): number {
+    return Number.POSITIVE_INFINITY;
+  }
+
   constructor(private config: Config) {
     super(
       ReadFileTool.Name,
       ToolDisplayNames.READ_FILE,
-      `Reads and returns the content of a specified file. If the file is large, the content will be truncated. The tool's response will clearly indicate if truncation has occurred and will provide details on how to read more of the file using the 'offset' and 'limit' parameters. Handles text, images (PNG, JPG, GIF, WEBP, SVG, BMP), PDF files, and Jupyter notebooks (.ipynb). For text files, it can read specific line ranges. For PDF files, use the 'pages' parameter to extract specific page ranges as text (e.g. '1-5'). Max 20 pages per request. This tool can read Jupyter notebooks (.ipynb) and returns structured cell content with outputs.`,
+      buildReadFileDescription(config.getEffectiveInputModalities?.() ?? {}),
       Kind.Read,
       {
         properties: {
@@ -394,24 +601,38 @@ export class ReadFileTool extends BaseDeclarativeTool<
           },
           offset: {
             description:
-              "Optional: For text files, the 0-based line number to start reading from. Requires 'limit' to be set. Use for paginating through large files.",
-            type: 'number',
+              "Optional: For text files, the 0-based line number to start reading from. Requires 'limit' to be set. Use for paginating through large files. Omit or set to null for Jupyter notebooks (.ipynb); null is treated as omitted.",
+            type: ['integer', 'null'],
           },
           limit: {
             description:
-              "Optional: For text files, maximum number of lines to read. Use with 'offset' to paginate through large files. If omitted, reads the entire file (if feasible, up to a default limit).",
-            type: 'number',
+              "Optional: For text files, maximum number of lines to read. Use with 'offset' to paginate through large files. If omitted, reads the entire file (if feasible, up to a default limit). Omit or set to null for Jupyter notebooks (.ipynb); null is treated as omitted.",
+            type: ['integer', 'null'],
           },
           pages: {
-            description:
-              "Optional: For PDF files, the page range to extract as text (e.g., '1-5', '3', '10-20'). Pages are 1-indexed. Max 20 pages per request. Open-ended ranges like '3-' are not supported. When provided, PDF content is extracted as text regardless of model capabilities.",
-            type: 'string',
+            description: `Optional: For PDF files, the page range to extract as text (e.g., '1-5', '3', '10-20'). Pages are 1-indexed. Max ${PDF_MAX_PAGES_PER_READ} pages per request. Open-ended ranges like '3-' are not supported. Use this for large PDFs or when the model does not support native PDF input. Omit or set to null for Jupyter notebooks (.ipynb); null is treated as omitted.`,
+            type: ['string', 'null'],
           },
         },
         required: ['file_path'],
         type: 'object',
       },
     );
+  }
+
+  // Recompute the model-facing description from the model's CURRENT input
+  // modalities each time the declaration is assembled, so a mid-session
+  // `/model` switch (e.g. to a text-only model) is reflected — the constructor
+  // value only captures the modalities at build time. See
+  // {@link buildReadFileDescription}.
+  override get schema(): FunctionDeclaration {
+    return {
+      name: this.name,
+      description: buildReadFileDescription(
+        this.config.getEffectiveInputModalities?.() ?? {},
+      ),
+      parametersJsonSchema: this.parameterSchema,
+    };
   }
 
   protected override validateToolParamValues(
@@ -430,28 +651,35 @@ export class ReadFileTool extends BaseDeclarativeTool<
       return `File path must be absolute, but was relative: ${filePath}. You must provide an absolute path.`;
     }
 
-    if (params.offset !== undefined && params.offset < 0) {
-      return 'Offset must be a non-negative number';
-    }
-    if (params.limit !== undefined && params.limit <= 0) {
-      return 'Limit must be a positive number';
-    }
+    params.offset ??= undefined;
+    params.limit ??= undefined;
+    params.pages ??= undefined;
 
     if (params.pages !== undefined) {
       const pages = params.pages.trim();
       params.pages = pages.length > 0 ? pages : undefined;
     }
 
-    const ext = path.extname(filePath).toLowerCase();
     if (
-      (params.offset !== undefined || params.limit !== undefined) &&
-      ext === '.ipynb'
+      path.extname(filePath).toLowerCase() === '.ipynb' &&
+      (params.offset !== undefined ||
+        params.limit !== undefined ||
+        params.pages !== undefined)
     ) {
-      return 'offset and limit are not supported for Jupyter notebook (.ipynb) files. Notebooks are always read in full with structured cell output.';
+      return `For Jupyter notebooks (.ipynb), omit 'offset', 'limit', and 'pages' or set them to null. Retry with: ${JSON.stringify({ file_path: filePath, offset: null, limit: null, pages: null })}`;
     }
 
-    if (params.pages !== undefined && ext === '.ipynb') {
-      return 'pages is not supported for Jupyter notebook (.ipynb) files. Notebooks are always read in full with structured cell output.';
+    if (
+      params.offset !== undefined &&
+      (!Number.isInteger(params.offset) || params.offset < 0)
+    ) {
+      return 'Offset must be a non-negative integer';
+    }
+    if (
+      params.limit !== undefined &&
+      (!Number.isInteger(params.limit) || params.limit <= 0)
+    ) {
+      return 'Limit must be a positive integer';
     }
 
     if (params.pages) {
@@ -460,9 +688,9 @@ export class ReadFileTool extends BaseDeclarativeTool<
         return `Invalid pages parameter: '${params.pages}'. Use formats like '5' or '1-10'.`;
       }
       if (parsed.lastPage === Infinity) {
-        return `Open-ended page ranges (e.g. '3-') are not supported; specify an explicit end page within the 20-page limit (e.g. '3-22').`;
+        return `Open-ended page ranges (e.g. '3-') are not supported; specify an explicit end page within the ${PDF_MAX_PAGES_PER_READ}-page limit (e.g. '3-22').`;
       }
-      const maxPages = 20;
+      const maxPages = PDF_MAX_PAGES_PER_READ;
       if (parsed.lastPage - parsed.firstPage + 1 > maxPages) {
         return `Pages range exceeds maximum of ${maxPages} pages per request.`;
       }
@@ -470,7 +698,7 @@ export class ReadFileTool extends BaseDeclarativeTool<
 
     const fileService = this.config.getFileService();
     if (fileService.shouldQwenIgnoreFile(params.file_path)) {
-      return `File path '${filePath}' is ignored by .qwenignore pattern(s).`;
+      return `File path '${filePath}' is ignored by ${fileService.getQwenIgnoreFileDisplayForPath(params.file_path)} pattern(s).`;
     }
 
     return null;

@@ -19,6 +19,16 @@ import type {
 } from '../agents/runtime/agent-types.js';
 
 /**
+ * Subagent-only permission mode. NOT a member of the global `ApprovalMode`
+ * enum (adding it there would surface it in the session model/approval
+ * pickers, where it has no meaning). Valid only on a subagent definition's
+ * {@link SubagentConfig.approvalMode}: it resolves to `'default'` run behavior
+ * (tool calls require confirmation) and, for an interactive background run,
+ * surfaces those confirmations to the parent session instead of auto-denying.
+ */
+export const BUBBLE_APPROVAL_MODE = 'bubble';
+
+/**
  * Represents the storage level for a subagent configuration.
  * - 'session': Session-level agents provided at runtime, read-only (highest priority)
  * - 'project': Stored in `.qwen/agents/` within the project directory
@@ -32,6 +42,26 @@ export type SubagentLevel =
   | 'user'
   | 'extension'
   | 'builtin';
+
+/**
+ * Declares that a subagent's turn is executed by an external agent process
+ * speaking ACP or Codex app-server, rather than the in-process reasoning loop.
+ *
+ * `parseAgentExecutor` validates this strictly: an unrecognized `kind`, a
+ * missing/blank `command`, or a malformed `args` yields `undefined`. The
+ * frontmatter loader then **rejects the whole definition** rather than dropping
+ * the field — a dropped field would leave the definition running in-process,
+ * silently substituting a different agent for the one it asked for. This is a
+ * deliberate divergence from the lenient drop used for `mcpServers` and `hooks`.
+ */
+export interface SubagentExecutorSpec {
+  /** Protocol used by the external executable. */
+  kind: 'acp' | 'codex';
+  /** Executable to run, resolved on PATH. */
+  command: string;
+  /** Arguments passed to `command`. Omitted when the definition declares none. */
+  args?: string[];
+}
 
 /**
  * Core configuration for a subagent as stored in Markdown files.
@@ -62,9 +92,16 @@ export interface SubagentConfig {
   /**
    * Optional permission mode for this subagent.
    * Controls how tool calls are approved during execution.
-   * Valid values: 'default', 'plan', 'auto-edit', 'yolo'.
+   * Valid values: 'default', 'plan', 'auto-edit', 'yolo', 'bubble'.
    * If omitted, the resolved mode depends on the parent's mode
    * (permissive parent modes win; otherwise defaults to 'auto-edit').
+   *
+   * `'bubble'` is a subagent-only mode (not a session-level ApprovalMode):
+   * it runs like 'default' (tool calls require confirmation), but when the
+   * agent runs in the background in an interactive session, a confirmation
+   * it needs is surfaced ("bubbled") to the parent session's UI as a queued
+   * approval prompt instead of being auto-denied. Non-interactive sessions
+   * (and foreground runs, which prompt inline) treat it as plain 'default'.
    */
   approvalMode?: string;
 
@@ -103,11 +140,65 @@ export interface SubagentConfig {
   color?: string;
 
   /**
-   * When true, this agent always runs as a background task when spawned.
-   * OR'd with the `run_in_background` tool parameter — if either is true,
-   * the agent runs in the background.
+   * When true, this agent defaults to a background task when spawned.
+   * An explicit `run_in_background` tool parameter takes precedence.
    */
   background?: boolean;
+
+  /**
+   * Optional Claude-Code-compatible permission mode (`acceptEdits`, `auto`,
+   * `bypassPermissions`, `default`, `dontAsk`, `plan`). Carried through from
+   * frontmatter for parity with `.claude/agents/*.md` files. At parse time it
+   * is normalised to {@link approvalMode} via
+   * `claudePermissionModeToApprovalMode()`; if both `permissionMode` and
+   * `approvalMode` are present in frontmatter, `approvalMode` wins.
+   */
+  permissionMode?: string;
+
+  /**
+   * Optional maximum number of turns before the agent halts. Positive integer.
+   * Top-level promotion of the legacy `runConfig.max_turns` field; when both
+   * are set, top-level `maxTurns` wins.
+   */
+  maxTurns?: number;
+
+  /**
+   * Optional per-agent MCP server overrides. CC 2.1.168 declarative-agent
+   * field `mcpServers` (`gS8`); carried verbatim so `.claude/agents/*.md`
+   * round-trips. Validated shallowly at parse time (record-of-records shape,
+   * see `parseAgentMcpServers`); the per-spec union (`stdio` / `sse` / `http`
+   * / ...) is enforced by the runtime MCP loader when the subagent spawns.
+   */
+  mcpServers?: Record<string, unknown>;
+
+  /**
+   * Optional per-agent hook overrides. CC 2.1.168 declarative-agent field
+   * `hooks` (`TKO`); carried verbatim so `.claude/agents/*.md` round-trips.
+   * Validated shallowly at parse time (record-of-arrays shape, see
+   * `parseAgentHooks`); the per-matcher discriminated union is enforced by
+   * `SessionHooksManager` when the subagent spawns. Keys are
+   * `HookEventName` literals (`PreToolUse`, `PostToolUse`, ...).
+   */
+  hooks?: Record<string, unknown>;
+
+  /**
+   * Optional external executor. When present, the subagent's turn is run by an
+   * external agent process instead of the in-process `AgentCore` reasoning
+   * loop; `SubagentManager.createAgentHeadless` dispatches to the executor
+   * injected via `Config.setExternalAgentExecutor`.
+   *
+   * Absent (the default) keeps the in-process executor. A definition that
+   * declares an executor while none is injected fails loudly rather than
+   * silently falling back to in-process.
+   *
+   * `command` is resolved on PATH. Project-level executors require a trusted
+   * workspace. Declared host tool restrictions, MCP servers, hooks and
+   * model/provider overrides are unsupported and rejected before spawning.
+   */
+  executor?: SubagentExecutorSpec;
+
+  /** Requires container execution; cannot lower the operator's backend policy. */
+  executionBackend?: 'container';
 
   /**
    * Indicates whether this is a built-in agent.
@@ -119,6 +210,20 @@ export interface SubagentConfig {
    * For extension-level subagents: the name of the providing extension
    */
   extensionName?: string;
+}
+
+/**
+ * Concrete model route a subagent definition's `model:` selector resolves
+ * to: the model ID plus the auth type a dedicated ContentGenerator must be
+ * created with. Returned by `SubagentManager.resolveSubagentModelRoute`
+ * for spawn paths that need the definition's provider route (e.g. Agent
+ * Team teammates, #10071).
+ */
+export interface SubagentModelRoute {
+  /** Concrete model ID the selector resolved to. */
+  modelId: string;
+  /** Auth type that hosts the model on this route. */
+  authType: string;
 }
 
 /**
@@ -185,6 +290,9 @@ export interface CreateSubagentOptions {
 
   /** Custom directory path (overrides default level-based path) */
   customPath?: string;
+
+  /** Reject the mutation immediately before writing the agent file. */
+  assertCanCommit?: () => void;
 }
 
 /**

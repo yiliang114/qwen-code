@@ -77,6 +77,18 @@ function parseTokenCounts(text: string): {
     };
   }
 
+  // DashScope: "Range of input length should be [1, 196608]" — the upper
+  // bound is the server's REAL input ceiling (observed to differ from the
+  // configured context window), so parse it out for the retry paths.
+  const rangeMatch = text.match(
+    /range of input length should be\s*\[\s*\d[\d,]*\s*,\s*(\d[\d,]*)\s*\]/i,
+  );
+  if (rangeMatch) {
+    return {
+      limitTokens: parseInteger(rangeMatch[1]!),
+    };
+  }
+
   return {};
 }
 
@@ -100,6 +112,32 @@ function tryParseEmbeddedJson(text: string): unknown | undefined {
     return JSON.parse(text.slice(start, end + 1)) as unknown;
   } catch {
     return undefined;
+  }
+}
+
+function safeReadProperty(value: object, key: string): unknown {
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function enumerableValues(value: object): unknown[] {
+  try {
+    return Object.values(value);
+  } catch {
+    try {
+      const descriptors = Object.getOwnPropertyDescriptors(value);
+      return Object.values(descriptors)
+        .filter(
+          (descriptor): descriptor is PropertyDescriptor & { value: unknown } =>
+            'value' in descriptor && descriptor.enumerable === true,
+        )
+        .map((descriptor) => descriptor.value);
+    } catch {
+      return [];
+    }
   }
 }
 
@@ -135,11 +173,21 @@ function collectStrings(
 
   const strings: string[] = [];
   if (value instanceof Error) {
-    strings.push(value.name, value.message);
-    strings.push(...collectStrings(value.cause, seen, depth + 1));
+    const name = safeReadProperty(value, 'name');
+    const message = safeReadProperty(value, 'message');
+
+    if (typeof name === 'string') {
+      strings.push(name);
+    }
+    if (typeof message === 'string') {
+      strings.push(message);
+    }
+    strings.push(
+      ...collectStrings(safeReadProperty(value, 'cause'), seen, depth + 1),
+    );
   }
 
-  for (const [, nested] of Object.entries(value)) {
+  for (const nested of enumerableValues(value)) {
     strings.push(...collectStrings(nested, seen, depth + 1));
   }
 
@@ -165,12 +213,19 @@ export function getContextLengthExceededInfo(
 ): ContextLengthExceededInfo {
   const fragments = uniqueNonEmpty(collectStrings(error, new Set<object>()));
   const message = fragments.join('\n');
-  const isTimeout = TIMEOUT_PATTERNS.some((pattern) => pattern.test(message));
-  const isExceeded =
-    !isTimeout &&
-    fragments.some((fragment) =>
-      CONTEXT_LENGTH_PATTERNS.some((pattern) => pattern.test(fragment)),
-    );
+  // The timeout veto is applied per fragment, alongside the context-length
+  // test it is vetoing. Testing it against the joined message instead let a
+  // timeout phrase anywhere in the error object suppress detection for the
+  // whole error -- and provider SDKs routinely attach retry/attempt metadata,
+  // so an overflow arriving with `previous attempt: request timed out` in a
+  // sibling field was reported as not-an-overflow and never reached the
+  // compaction path. A fragment counts as evidence only if it names a
+  // context-length failure and is not itself a timeout message.
+  const isExceeded = fragments.some(
+    (fragment) =>
+      CONTEXT_LENGTH_PATTERNS.some((pattern) => pattern.test(fragment)) &&
+      !TIMEOUT_PATTERNS.some((pattern) => pattern.test(fragment)),
+  );
   const counts = isExceeded ? parseTokenCounts(message) : {};
 
   return {

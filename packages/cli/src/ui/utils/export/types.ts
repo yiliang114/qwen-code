@@ -5,6 +5,32 @@
  */
 
 import type { GenerateContentResponseUsageMetadata } from '@google/genai';
+import type { GoalStateRecordPayloadV2 } from '@qwen-code/qwen-code-core';
+
+export interface ExportToolLocation {
+  path: string;
+  line?: number | null;
+}
+
+export interface ExportToolInvocation {
+  getDescription(): string;
+  toolLocations(): ExportToolLocation[];
+}
+
+export interface ExportToolDefinition {
+  displayName?: string;
+  kind?: unknown;
+  build?: (args: Record<string, unknown>) => ExportToolInvocation;
+}
+
+export interface ExportToolRegistry {
+  getTool?: (toolName: string) => ExportToolDefinition | null | undefined;
+}
+
+export interface ExportConfig {
+  getChannel?: () => string | undefined;
+  getToolRegistry?: () => ExportToolRegistry | undefined;
+}
 
 /**
  * Universal export message format - SSOT for all export formats.
@@ -37,6 +63,7 @@ export interface ExportMessage {
     title: string | object;
     status: 'pending' | 'in_progress' | 'completed' | 'failed';
     rawInput?: string | object;
+    rawOutput?: unknown;
     content?: Array<{
       type: string;
       [key: string]: unknown;
@@ -47,6 +74,15 @@ export interface ExportMessage {
     }>;
     timestamp?: number;
   };
+
+  /**
+   * For system messages that record a Goal transition: the journaled
+   * `goal_state` record, including the bookkeeping ones the transcript view
+   * hides, so an export shows every verdict and stop the Goal went through.
+   * The payload is carried whole: the blocked audit and a pending checkpoint
+   * are part of why a Goal continued or stopped.
+   */
+  goalState?: GoalStateRecordPayloadV2;
 }
 
 /**

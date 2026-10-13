@@ -9,6 +9,7 @@ import { memo, useMemo } from 'react';
 import { Box, Text } from 'ink';
 import { t } from '../../i18n/index.js';
 import { Colors } from '../colors.js';
+import { ICON } from '../constants.js';
 import { theme } from '../semantic-colors.js';
 import {
   getOrderedStickyTodos,
@@ -24,9 +25,9 @@ interface StickyTodoListProps {
 }
 
 const STATUS_ICONS = {
-  pending: '○',
-  in_progress: '◐',
-  completed: '●',
+  pending: ICON.CIRCLE_EMPTY,
+  in_progress: ICON.CIRCLE_LEFT_HALF,
+  completed: ICON.CIRCLE_FILLED,
 } as const;
 
 function clampVisibleTodoCount(value: number): number {
@@ -45,20 +46,26 @@ const StickyTodoListComponent: React.FC<StickyTodoListProps> = ({
   width,
   maxVisibleItems = STICKY_TODO_MAX_VISIBLE_ITEMS,
 }) => {
-  const orderedTodos = useMemo(() => getOrderedStickyTodos(todos), [todos]);
+  const orderedOpenTodos = useMemo(
+    () =>
+      getOrderedStickyTodos(todos).filter(
+        (todo) => todo.status !== 'completed',
+      ),
+    [todos],
+  );
   const todoNumberById = useMemo(
     () =>
       new Map(todos.map((todo, index) => [todo.id, `${index + 1}.`] as const)),
     [todos],
   );
 
-  if (todos.length === 0) {
+  if (orderedOpenTodos.length === 0) {
     return null;
   }
 
   const visibleTodoCount = clampVisibleTodoCount(maxVisibleItems);
-  const visibleTodos = orderedTodos.slice(0, visibleTodoCount);
-  const hiddenTodoCount = orderedTodos.length - visibleTodos.length;
+  const visibleTodos = orderedOpenTodos.slice(0, visibleTodoCount);
+  const hiddenTodoCount = orderedOpenTodos.length - visibleTodos.length;
   const numberColumnWidth =
     Math.max(
       ...visibleTodos.map(

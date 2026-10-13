@@ -6,7 +6,11 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { HookRegistry, HookRegistryEntry } from './hookRegistry.js';
-import { getHookMatcherTarget, HookPlanner } from './hookPlanner.js';
+import {
+  getHookMatcherTarget,
+  getToolMatcherTargets,
+  HookPlanner,
+} from './hookPlanner.js';
 import { HookEventName, HookType, HooksConfigSource } from './types.js';
 
 describe('HookPlanner', () => {
@@ -31,6 +35,13 @@ describe('HookPlanner', () => {
         kind: 'toolName',
         target: '',
       });
+      expect(
+        getHookMatcherTarget(HookEventName.PermissionDenied, {
+          toolName: 'Bash',
+        }),
+      ).toEqual({ kind: 'toolName', target: 'Bash' });
+      // PermissionDenied is permission-related, so it uses the same tool-name
+      // matcher as PermissionRequest rather than a classifier-reason matcher.
     });
 
     it('returns agent type targets for subagent events', () => {
@@ -76,8 +87,32 @@ describe('HookPlanner', () => {
       });
     });
 
+    it('returns file path targets for instruction load events', () => {
+      expect(
+        getHookMatcherTarget(HookEventName.InstructionsLoaded, {
+          filePath: '/repo/.qwen/QWEN.local.md',
+        }),
+      ).toEqual({
+        kind: 'filePath',
+        target: '/repo/.qwen/QWEN.local.md',
+      });
+    });
+
+    it('returns command name targets for user prompt expansion events', () => {
+      expect(
+        getHookMatcherTarget(HookEventName.UserPromptExpansion, {
+          commandName: 'goal',
+        }),
+      ).toEqual({ kind: 'commandName', target: 'goal' });
+    });
+
     it('returns undefined for events without matcher semantics', () => {
       expect(getHookMatcherTarget(HookEventName.UserPromptSubmit)).toBe(
+        undefined,
+      );
+      expect(getHookMatcherTarget(HookEventName.PostToolBatch)).toBe(undefined);
+      expect(getHookMatcherTarget(HookEventName.SessionDelete)).toBe(undefined);
+      expect(getHookMatcherTarget(HookEventName.MessageDisplay)).toBe(
         undefined,
       );
     });
@@ -202,6 +237,44 @@ describe('HookPlanner', () => {
       expect(result!.hookConfigs).toHaveLength(2);
       expect(result!.hookConfigs).toEqual([entry1.config, entry2.config]);
     });
+
+    it('matches user prompt expansion hooks by command name', () => {
+      const entry: HookRegistryEntry = {
+        config: { type: HookType.Command, command: 'echo test' },
+        source: HooksConfigSource.Project,
+        eventName: HookEventName.UserPromptExpansion,
+        matcher: 'goal',
+        enabled: true,
+      };
+      vi.mocked(mockRegistry.getHooksForEvent).mockReturnValue([entry]);
+
+      const result = planner.createExecutionPlan(
+        HookEventName.UserPromptExpansion,
+        { commandName: 'goal' },
+      );
+
+      expect(result).not.toBeNull();
+      expect(result!.hookConfigs).toEqual([entry.config]);
+    });
+
+    it('matches user prompt expansion command names with invalid-regex fallback', () => {
+      const entry: HookRegistryEntry = {
+        config: { type: HookType.Command, command: 'echo test' },
+        source: HooksConfigSource.Project,
+        eventName: HookEventName.UserPromptExpansion,
+        matcher: '[invalid(regex',
+        enabled: true,
+      };
+      vi.mocked(mockRegistry.getHooksForEvent).mockReturnValue([entry]);
+
+      const result = planner.createExecutionPlan(
+        HookEventName.UserPromptExpansion,
+        { commandName: '[invalid(regex' },
+      );
+
+      expect(result).not.toBeNull();
+      expect(result!.hookConfigs).toEqual([entry.config]);
+    });
   });
 
   describe('matchesContext', () => {
@@ -285,6 +358,173 @@ describe('HookPlanner', () => {
       });
 
       expect(result).not.toBeNull();
+    });
+
+    it('matches built-in tool display names against runtime tool ids', () => {
+      const entry: HookRegistryEntry = {
+        config: { type: HookType.Command, command: 'echo test' },
+        source: HooksConfigSource.Project,
+        eventName: HookEventName.PreToolUse,
+        matcher: 'WriteFile',
+        enabled: true,
+      };
+      vi.mocked(mockRegistry.getHooksForEvent).mockReturnValue([entry]);
+
+      const result = planner.createExecutionPlan(HookEventName.PreToolUse, {
+        toolName: 'write_file',
+      });
+
+      expect(result).not.toBeNull();
+    });
+
+    it('matches pipe-separated display names against runtime tool ids', () => {
+      const entry: HookRegistryEntry = {
+        config: { type: HookType.Command, command: 'echo test' },
+        source: HooksConfigSource.Project,
+        eventName: HookEventName.PreToolUse,
+        matcher: 'WriteFile|Edit',
+        enabled: true,
+      };
+      vi.mocked(mockRegistry.getHooksForEvent).mockReturnValue([entry]);
+
+      const result = planner.createExecutionPlan(HookEventName.PreToolUse, {
+        toolName: 'write_file',
+      });
+
+      expect(result).not.toBeNull();
+    });
+
+    it('matches legacy tool aliases against runtime tool ids', () => {
+      const entry: HookRegistryEntry = {
+        config: { type: HookType.Command, command: 'echo test' },
+        source: HooksConfigSource.Project,
+        eventName: HookEventName.PreToolUse,
+        matcher: 'SearchFiles',
+        enabled: true,
+      };
+      vi.mocked(mockRegistry.getHooksForEvent).mockReturnValue([entry]);
+
+      const result = planner.createExecutionPlan(HookEventName.PreToolUse, {
+        toolName: 'grep_search',
+      });
+
+      expect(result).not.toBeNull();
+    });
+
+    it('matches legacy runtime aliases against runtime tool ids', () => {
+      const entry: HookRegistryEntry = {
+        config: { type: HookType.Command, command: 'echo test' },
+        source: HooksConfigSource.Project,
+        eventName: HookEventName.PreToolUse,
+        matcher: 'search_file_content',
+        enabled: true,
+      };
+      vi.mocked(mockRegistry.getHooksForEvent).mockReturnValue([entry]);
+
+      const result = planner.createExecutionPlan(HookEventName.PreToolUse, {
+        toolName: 'grep_search',
+      });
+
+      expect(result).not.toBeNull();
+    });
+
+    it.each([
+      ['Bash', 'run_shell_command'],
+      ['Read', 'read_file'],
+      ['Write', 'write_file'],
+      ['Write|Edit', 'write_file'],
+    ])(
+      'matches the Claude Code tool name %s against %s',
+      (matcher, toolName) => {
+        const entry: HookRegistryEntry = {
+          config: { type: HookType.Command, command: 'echo test' },
+          source: HooksConfigSource.Project,
+          eventName: HookEventName.PreToolUse,
+          matcher,
+          enabled: true,
+        };
+        vi.mocked(mockRegistry.getHooksForEvent).mockReturnValue([entry]);
+
+        const result = planner.createExecutionPlan(HookEventName.PreToolUse, {
+          toolName,
+        });
+
+        expect(result).not.toBeNull();
+      },
+    );
+
+    it.each([
+      ['Read', 'grep_search'],
+      ['Read', 'list_directory'],
+      ['Edit', 'write_file'],
+      ['Bash', 'monitor'],
+    ])(
+      'does not expand the Claude Code tool name %s to %s',
+      (matcher, toolName) => {
+        const entry: HookRegistryEntry = {
+          config: { type: HookType.Command, command: 'echo test' },
+          source: HooksConfigSource.Project,
+          eventName: HookEventName.PreToolUse,
+          matcher,
+          enabled: true,
+        };
+        vi.mocked(mockRegistry.getHooksForEvent).mockReturnValue([entry]);
+
+        const result = planner.createExecutionPlan(HookEventName.PreToolUse, {
+          toolName,
+        });
+
+        expect(result).toBeNull();
+      },
+    );
+
+    it('lists each tool matcher target once', () => {
+      const targets = getToolMatcherTargets('run_shell_command');
+
+      expect(targets).toEqual(
+        expect.arrayContaining(['run_shell_command', 'Shell', 'Bash']),
+      );
+      expect(new Set(targets).size).toBe(targets.length);
+    });
+
+    it('does not match regex against tool aliases', () => {
+      const entry: HookRegistryEntry = {
+        config: { type: HookType.Command, command: 'echo test' },
+        source: HooksConfigSource.Project,
+        eventName: HookEventName.PreToolUse,
+        matcher: 'Edit',
+        enabled: true,
+      };
+      vi.mocked(mockRegistry.getHooksForEvent).mockReturnValue([entry]);
+
+      const result = planner.createExecutionPlan(HookEventName.PreToolUse, {
+        toolName: 'notebook_edit',
+      });
+
+      expect(result).toBeNull();
+    });
+
+    it('does not let alias expansion bypass runtime id regex exclusions', () => {
+      const entry: HookRegistryEntry = {
+        config: { type: HookType.Command, command: 'echo test' },
+        source: HooksConfigSource.Project,
+        eventName: HookEventName.PreToolUse,
+        matcher: '^(?!write_file).*$',
+        enabled: true,
+      };
+      vi.mocked(mockRegistry.getHooksForEvent).mockReturnValue([entry]);
+
+      const result = planner.createExecutionPlan(HookEventName.PreToolUse, {
+        toolName: 'write_file',
+      });
+
+      expect(result).toBeNull();
+    });
+
+    it('passes through unknown tool ids without aliases', () => {
+      expect(getToolMatcherTargets('third_party__click')).toEqual([
+        'third_party__click',
+      ]);
     });
 
     it('should not match tool name with different exact string', () => {
@@ -509,6 +749,46 @@ describe('HookPlanner', () => {
       });
 
       expect(result).not.toBeNull();
+    });
+
+    it('should match instruction loaded file paths with regex', () => {
+      const entry: HookRegistryEntry = {
+        config: { type: HookType.Command, command: 'echo test' },
+        source: HooksConfigSource.Project,
+        eventName: HookEventName.InstructionsLoaded,
+        matcher: '\\.qwen/QWEN\\.local\\.md$',
+        enabled: true,
+      };
+      vi.mocked(mockRegistry.getHooksForEvent).mockReturnValue([entry]);
+
+      const result = planner.createExecutionPlan(
+        HookEventName.InstructionsLoaded,
+        {
+          filePath: '/repo/.qwen/QWEN.local.md',
+        },
+      );
+
+      expect(result).not.toBeNull();
+    });
+
+    it('should not match unrelated instruction loaded file paths', () => {
+      const entry: HookRegistryEntry = {
+        config: { type: HookType.Command, command: 'echo test' },
+        source: HooksConfigSource.Project,
+        eventName: HookEventName.InstructionsLoaded,
+        matcher: '\\.qwen/QWEN\\.local\\.md$',
+        enabled: true,
+      };
+      vi.mocked(mockRegistry.getHooksForEvent).mockReturnValue([entry]);
+
+      const result = planner.createExecutionPlan(
+        HookEventName.InstructionsLoaded,
+        {
+          filePath: '/repo/QWEN.md',
+        },
+      );
+
+      expect(result).toBeNull();
     });
 
     it('should match auth_success notification type', () => {
@@ -877,6 +1157,89 @@ describe('HookPlanner', () => {
       });
 
       expect(result).not.toBeNull();
+    });
+
+    it('matches a pipe-separated list of notification types', () => {
+      const entry: HookRegistryEntry = {
+        config: { type: HookType.Command, command: 'echo test' },
+        source: HooksConfigSource.Project,
+        eventName: HookEventName.Notification,
+        matcher: 'permission_prompt|idle_prompt',
+        enabled: true,
+      };
+      vi.mocked(mockRegistry.getHooksForEvent).mockReturnValue([entry]);
+
+      expect(
+        planner.createExecutionPlan(HookEventName.Notification, {
+          notificationType: 'idle_prompt',
+        }),
+      ).not.toBeNull();
+      expect(
+        planner.createExecutionPlan(HookEventName.Notification, {
+          notificationType: 'auth_success',
+        }),
+      ).toBeNull();
+    });
+
+    it('matches notification types with a regex', () => {
+      const entry: HookRegistryEntry = {
+        config: { type: HookType.Command, command: 'echo test' },
+        source: HooksConfigSource.Project,
+        eventName: HookEventName.Notification,
+        matcher: '^elicitation_',
+        enabled: true,
+      };
+      vi.mocked(mockRegistry.getHooksForEvent).mockReturnValue([entry]);
+
+      expect(
+        planner.createExecutionPlan(HookEventName.Notification, {
+          notificationType: 'elicitation_dialog',
+        }),
+      ).not.toBeNull();
+      expect(
+        planner.createExecutionPlan(HookEventName.Notification, {
+          notificationType: 'idle_prompt',
+        }),
+      ).toBeNull();
+    });
+
+    it('matches a pipe-separated list of compact triggers', () => {
+      const entry: HookRegistryEntry = {
+        config: { type: HookType.Command, command: 'echo test' },
+        source: HooksConfigSource.Project,
+        eventName: HookEventName.PreCompact,
+        matcher: 'manual|auto',
+        enabled: true,
+      };
+      vi.mocked(mockRegistry.getHooksForEvent).mockReturnValue([entry]);
+
+      expect(
+        planner.createExecutionPlan(HookEventName.PreCompact, {
+          trigger: 'auto',
+        }),
+      ).not.toBeNull();
+    });
+
+    it('matches a pipe-separated list of stop failure error types', () => {
+      const entry: HookRegistryEntry = {
+        config: { type: HookType.Command, command: 'echo test' },
+        source: HooksConfigSource.Project,
+        eventName: HookEventName.StopFailure,
+        matcher: 'rate_limit|server_error',
+        enabled: true,
+      };
+      vi.mocked(mockRegistry.getHooksForEvent).mockReturnValue([entry]);
+
+      expect(
+        planner.createExecutionPlan(HookEventName.StopFailure, {
+          error: 'server_error',
+        }),
+      ).not.toBeNull();
+      expect(
+        planner.createExecutionPlan(HookEventName.StopFailure, {
+          error: 'unknown',
+        }),
+      ).toBeNull();
     });
 
     // PostCompact matcher tests

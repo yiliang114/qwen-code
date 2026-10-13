@@ -21,16 +21,25 @@ type ContentGeneratorConfig =
 export const MODEL_GENERATION_CONFIG_FIELDS = [
   'samplingParams',
   'timeout',
+  'streamIdleTimeoutMs',
   'maxRetries',
+  'retryInitialDelayMs',
+  'retryMaxDelayMs',
   'retryErrorCodes',
   'enableCacheControl',
+  'enableRequestMetadata',
+  'forceGlobalCacheScope',
+  'cacheRetention',
+  'cacheRetentionByBlock',
   'schemaCompliance',
   'reasoning',
   'contextWindowSize',
   'customHeaders',
   'extra_body',
+  'thinkingMandatory',
   'modalities',
   'splitToolMedia',
+  'toolResultContentFormat',
 ] as const satisfies ReadonlyArray<keyof ContentGeneratorConfig>;
 
 /**
@@ -68,6 +77,11 @@ export const AUTH_ENV_MAPPINGS = {
     baseUrl: ['OPENAI_BASE_URL'],
     model: ['OPENAI_MODEL', 'QWEN_MODEL'],
   },
+  'openai-responses': {
+    apiKey: ['OPENAI_API_KEY'],
+    baseUrl: ['OPENAI_BASE_URL'],
+    model: ['OPENAI_MODEL'],
+  },
   anthropic: {
     apiKey: ['ANTHROPIC_API_KEY'],
     baseUrl: ['ANTHROPIC_BASE_URL'],
@@ -104,7 +118,7 @@ export const QWEN_OAUTH_MODELS: ModelConfig[] = [
     id: 'coder-model',
     name: 'coder-model',
     description:
-      'Qwen 3.6 Plus — efficient hybrid model with leading coding performance',
+      'Qwen 3.7 Max — efficient hybrid model with leading coding performance',
     capabilities: { vision: true },
   },
 ];

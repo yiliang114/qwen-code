@@ -6,6 +6,10 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { PromptHookRunner } from './promptHookRunner.js';
+import {
+  DEFAULT_PROMPT_HOOK_TIMEOUT_SECONDS,
+  describeHookTimeout,
+} from './hook-timeout.js';
 import { HookEventName, HookType } from './types.js';
 import type { PromptHookConfig, HookInput } from './types.js';
 import type { Config } from '../config/config.js';
@@ -15,12 +19,20 @@ describe('PromptHookRunner', () => {
   let promptRunner: PromptHookRunner;
   let mockConfig: Config;
   let mockGenerateContent: ReturnType<typeof vi.fn>;
+  let mockResolveForModel: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     vi.clearAllMocks();
 
     // Create mock generateContent function
     mockGenerateContent = vi.fn();
+    mockResolveForModel = vi.fn().mockResolvedValue({
+      contentGenerator: {
+        generateContent: mockGenerateContent,
+      },
+      contentGeneratorConfig: { model: 'qwen-max' },
+      model: 'qwen-max',
+    });
 
     // Create mock config
     mockConfig = {
@@ -32,9 +44,10 @@ describe('PromptHookRunner', () => {
       getContentGenerator: vi.fn().mockReturnValue({
         generateContent: mockGenerateContent,
         generateContentStream: vi.fn(),
-        countTokens: vi.fn(),
         embedContent: vi.fn(),
-        useSummarizedThinking: vi.fn().mockReturnValue(false),
+      }),
+      getBaseLlmClient: vi.fn().mockReturnValue({
+        resolveForModel: mockResolveForModel,
       }),
     } as unknown as Config;
 
@@ -201,6 +214,31 @@ describe('PromptHookRunner', () => {
 
       const callArg = mockGenerateContent.mock.calls[0][0];
       expect(callArg.model).toBe('qwen-max');
+      expect(mockResolveForModel).toHaveBeenCalledWith('qwen-max', {
+        failClosed: true,
+      });
+    });
+
+    it('should shape requests for the resolved override model', async () => {
+      mockResolveForModel.mockResolvedValue({
+        contentGenerator: { generateContent: mockGenerateContent },
+        contentGeneratorConfig: {
+          model: 'qwen-max',
+          reasoning: { effort: 'high' },
+        },
+        model: 'qwen-max',
+      });
+      mockGenerateContent.mockResolvedValue(createMockResponse('{"ok": true}'));
+
+      await promptRunner.execute(
+        createMockConfig({ model: 'fast' }),
+        HookEventName.PreToolUse,
+        createMockInput(),
+      );
+
+      const callArg = mockGenerateContent.mock.calls[0][0];
+      expect(callArg.model).toBe('qwen-max');
+      expect(callArg.config?.temperature).toBeUndefined();
     });
 
     it('should handle response wrapped in markdown code block', async () => {
@@ -330,7 +368,40 @@ describe('PromptHookRunner', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.outcome).toBe('cancelled');
+      expect(result.outcome).toBe('timeout');
+    });
+
+    it('should time out while resolving an override model', async () => {
+      vi.useFakeTimers();
+      let finishResolution: (() => void) | undefined;
+      mockResolveForModel.mockReturnValue(
+        new Promise((resolve) => {
+          finishResolution = () =>
+            resolve({
+              contentGenerator: { generateContent: mockGenerateContent },
+              contentGeneratorConfig: { model: 'qwen-max' },
+              model: 'qwen-max',
+            });
+        }),
+      );
+
+      try {
+        const execution = promptRunner.execute(
+          createMockConfig({ model: 'qwen-max', timeout: 0.1 }),
+          HookEventName.PreToolUse,
+          createMockInput(),
+        );
+
+        await vi.advanceTimersByTimeAsync(100);
+        const result = await execution;
+
+        expect(result.outcome).toBe('timeout');
+        finishResolution?.();
+        await Promise.resolve();
+        expect(mockGenerateContent).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('should handle abort signal (already aborted)', async () => {
@@ -575,6 +646,172 @@ describe('PromptHookRunner', () => {
 
       expect(result.success).toBe(true);
       expect(result.output?.decision).toBe('allow');
+    });
+  });
+
+  describe('outcome', () => {
+    /** A generateContent that settles only when its request is aborted. */
+    const rejectOnRequestAbort = (message: string) =>
+      mockGenerateContent.mockImplementation(
+        (request: { config: { abortSignal: AbortSignal } }) =>
+          new Promise((_, reject) => {
+            request.config.abortSignal.addEventListener('abort', () =>
+              reject(new Error(message)),
+            );
+          }),
+      );
+
+    it('reports its own timeout as timeout', async () => {
+      vi.useFakeTimers();
+      try {
+        mockGenerateContent.mockReturnValue(new Promise(() => {}));
+
+        const execution = promptRunner.execute(
+          createMockConfig({ timeout: 0.1 }),
+          HookEventName.PreToolUse,
+          createMockInput(),
+        );
+        await vi.advanceTimersByTimeAsync(100);
+        const result = await execution;
+
+        expect(result.outcome).toBe('timeout');
+        expect(result.success).toBe(false);
+        expect(result.error?.message).toBe('Prompt hook timed out after 100ms');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('reports a timeout as timeout even when the aborted request rejects first', async () => {
+      vi.useFakeTimers();
+      try {
+        rejectOnRequestAbort('Request was aborted.');
+
+        const execution = promptRunner.execute(
+          createMockConfig({ timeout: 0.1 }),
+          HookEventName.PreToolUse,
+          createMockInput(),
+        );
+        await vi.advanceTimersByTimeAsync(100);
+        const result = await execution;
+
+        expect(result.outcome).toBe('timeout');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('reports a caller abort during the request as cancelled', async () => {
+      rejectOnRequestAbort('Request was aborted.');
+      const controller = new AbortController();
+
+      const execution = promptRunner.execute(
+        createMockConfig({ timeout: 60 }),
+        HookEventName.PreToolUse,
+        createMockInput(),
+        controller.signal,
+      );
+      await vi.waitFor(() => expect(mockGenerateContent).toHaveBeenCalled());
+      controller.abort();
+      const result = await execution;
+
+      expect(result.outcome).toBe('cancelled');
+      expect(result.success).toBe(false);
+    });
+
+    it('reports a provider error that mentions an abort as a failure, not a cancel', async () => {
+      mockGenerateContent.mockRejectedValue(
+        new Error('Request aborted by server'),
+      );
+
+      const result = await promptRunner.execute(
+        createMockConfig(),
+        HookEventName.PreToolUse,
+        createMockInput(),
+        new AbortController().signal,
+      );
+
+      expect(result.outcome).toBe('non_blocking_error');
+    });
+
+    it('reports a provider error that mentions a timeout as a failure, not a timeout', async () => {
+      mockGenerateContent.mockRejectedValue(new Error('upstream timed out'));
+
+      const result = await promptRunner.execute(
+        createMockConfig(),
+        HookEventName.PreToolUse,
+        createMockInput(),
+      );
+
+      expect(result.outcome).toBe('non_blocking_error');
+    });
+  });
+
+  describe('timeout matches describeHookTimeout', () => {
+    const runUntil = async (
+      config: PromptHookConfig,
+      pendingMs: number,
+    ): Promise<{ pendingAfter: boolean; outcome: string | undefined }> => {
+      mockGenerateContent.mockReturnValue(new Promise(() => {}));
+      let settled = false;
+      const execution = promptRunner
+        .execute(config, HookEventName.PreToolUse, createMockInput())
+        .then((result) => {
+          settled = true;
+          return result;
+        });
+      await vi.advanceTimersByTimeAsync(pendingMs);
+      const pendingAfter = !settled;
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await execution;
+      return { pendingAfter, outcome: result.outcome };
+    };
+
+    it('times out a configured value in seconds at the described delay', async () => {
+      const described = describeHookTimeout(HookType.Prompt, 1);
+      expect(described.timeoutMs).toBe(1000);
+      vi.useFakeTimers();
+      try {
+        const run = await runUntil(createMockConfig({ timeout: 1 }), 999);
+        expect(run).toEqual({ pendingAfter: true, outcome: 'timeout' });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('times out an unconfigured hook at the described default', async () => {
+      const described = describeHookTimeout(HookType.Prompt, undefined);
+      expect(described.timeoutMs).toBe(
+        DEFAULT_PROMPT_HOOK_TIMEOUT_SECONDS * 1000,
+      );
+      vi.useFakeTimers();
+      try {
+        const run = await runUntil(
+          createMockConfig(),
+          DEFAULT_PROMPT_HOOK_TIMEOUT_SECONDS * 1000 - 1,
+        );
+        expect(run).toEqual({ pendingAfter: true, outcome: 'timeout' });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('times out a negative timeout at once, as described', async () => {
+      // Real timers: Node runs a negative delay after 1 ms.
+      expect(describeHookTimeout(HookType.Prompt, -1)).toEqual({
+        timeoutMs: 1,
+        source: 'unusable',
+        ignoredConfiguredValue: false,
+      });
+      mockGenerateContent.mockReturnValue(new Promise(() => {}));
+      const started = Date.now();
+      const result = await promptRunner.execute(
+        createMockConfig({ timeout: -1 }),
+        HookEventName.PreToolUse,
+        createMockInput(),
+      );
+      expect(result.outcome).toBe('timeout');
+      expect(Date.now() - started).toBeLessThan(1000);
     });
   });
 

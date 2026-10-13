@@ -7,7 +7,9 @@
 import { Box, Text } from 'ink';
 import { useUIState } from '../../contexts/UIStateContext.js';
 import { ExtensionUpdateState } from '../../state/extensions.js';
-import { createDebugLogger } from '@qwen-code/qwen-code-core';
+import { getExtensionDisplayName } from '@qwen-code/qwen-code-core/extension/i18n.js';
+import { createDebugLogger } from '@qwen-code/qwen-code-core/utils/debugLogger.js';
+import { getCurrentLanguage } from '../../../i18n/index.js';
 
 const debugLogger = createDebugLogger('EXTENSIONS_LIST');
 
@@ -39,6 +41,7 @@ export const ExtensionsList = () => {
               break;
             case ExtensionUpdateState.UPDATE_AVAILABLE:
             case ExtensionUpdateState.UPDATED_NEEDS_RESTART:
+            case ExtensionUpdateState.UPDATED_WITH_WARNINGS:
               stateColor = 'yellow';
               break;
             case ExtensionUpdateState.ERROR:
@@ -57,7 +60,7 @@ export const ExtensionsList = () => {
           return (
             <Box key={ext.name} flexDirection="column" marginBottom={1}>
               <Text>
-                <Text color="cyan">{`${ext.name} (v${ext.version})`}</Text>
+                <Text color="cyan">{`${getExtensionDisplayName(ext, getCurrentLanguage())} (v${ext.version})`}</Text>
                 <Text color={activeColor}>{` - ${activeString}`}</Text>
                 {<Text color={stateColor}>{` (${stateText})`}</Text>}
               </Text>

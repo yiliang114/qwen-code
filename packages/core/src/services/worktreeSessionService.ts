@@ -4,10 +4,23 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import nodeFs from 'node:fs';
 import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
 import * as path from 'node:path';
+import { Storage } from '../config/storage.js';
 import { isNodeError } from '../utils/errors.js';
 import { atomicWriteJSON } from '../utils/atomicFileWrite.js';
+import { readRuntimeStatus } from '../utils/runtimeStatus.js';
+
+const RUNTIME_STATUS_SCAN_MAX_DIRS = 5000;
+const WORKTREE_SESSION_SIDECAR_MAX_BYTES = 64 * 1024;
+const RUNTIME_STATUS_SCAN_SKIP_DIRS = new Set([
+  '.git',
+  '.hg',
+  '.svn',
+  'node_modules',
+]);
 
 /**
  * Persisted state for an active user worktree session. Written when the
@@ -22,21 +35,20 @@ export interface WorktreeSession {
   worktreePath: string;
   worktreeBranch: string;
   /**
-   * The repo top-level (output of `GitWorktreeService.getRepoTopLevel()`)
-   * captured when the worktree was created — NOT the user's launch cwd.
+   * The root used by the worktree service that created this checkout.
    *
    * Named `originalCwd` for on-disk back-compat with sidecars written
-   * by earlier Phase C builds; semantically this is the value to pass
-   * back to `new GitWorktreeService(...)` for any subsequent cleanup
-   * (e.g. `handleWorktreeExit`'s remove path), because the worktree
-   * always lives under `<repoTopLevel>/.qwen/worktrees/`. When the
-   * CLI is launched from a monorepo subdirectory, `process.cwd()` and
-   * `getRepoTopLevel()` differ — this field stores the latter.
+   * by earlier Phase C builds. Tool and startup flows store the Git repo
+   * top-level here, while legacy daemon-created worktrees may store the
+   * registered workspace root. Consumers should use it only to resolve the
+   * worktree service, not as proof of daemon workspace ownership.
    *
    * Consumers expecting `process.cwd()` semantics should NOT use this
    * field; capture cwd separately at the time of need.
    */
   originalCwd: string;
+  /** Registered daemon workspace root for route-owned worktree attestation. */
+  workspaceCwd?: string;
   originalBranch: string;
   /**
    * HEAD commit SHA captured at the moment the worktree was created.
@@ -45,7 +57,25 @@ export interface WorktreeSession {
    * treat empty as "unknown" and skip the commit-count display.
    */
   originalHeadCommit: string;
+  /**
+   * Set on the superseded session's sidecar by a worktree reset: the
+   * replacement session this session's worktree ownership moved to. Readers
+   * redirect to it (and self-heal their registry) instead of restoring the
+   * superseded session.
+   */
+  supersededBy?: string;
+  /**
+   * Set on the replacement session's sidecar by a worktree reset: the
+   * session it took the worktree from. Cross-checked against the old
+   * session's `supersededBy` to classify an interrupted transfer.
+   */
+  supersedes?: string;
 }
+
+export type StrictWorktreeSession =
+  | { state: 'missing' }
+  | { state: 'valid'; session: WorktreeSession }
+  | { state: 'invalid'; reason: string };
 
 /**
  * Runtime shape check for a parsed sidecar object. Returns true only when
@@ -62,8 +92,13 @@ function isValidWorktreeSession(value: unknown): value is WorktreeSession {
     typeof v['worktreePath'] === 'string' &&
     typeof v['worktreeBranch'] === 'string' &&
     typeof v['originalCwd'] === 'string' &&
+    (v['workspaceCwd'] === undefined ||
+      typeof v['workspaceCwd'] === 'string') &&
     typeof v['originalBranch'] === 'string' &&
-    typeof v['originalHeadCommit'] === 'string'
+    typeof v['originalHeadCommit'] === 'string' &&
+    (v['supersededBy'] === undefined ||
+      typeof v['supersededBy'] === 'string') &&
+    (v['supersedes'] === undefined || typeof v['supersedes'] === 'string')
   );
 }
 
@@ -84,29 +119,128 @@ function isValidWorktreeSession(value: unknown): value is WorktreeSession {
  */
 export async function readWorktreeSession(
   filePath: string,
+  options: { signal?: AbortSignal } = {},
 ): Promise<WorktreeSession | null> {
   let raw: string;
   try {
-    raw = await fs.readFile(filePath, 'utf-8');
+    options.signal?.throwIfAborted();
+    raw = options.signal
+      ? await fs.readFile(filePath, {
+          encoding: 'utf-8',
+          signal: options.signal,
+        })
+      : await fs.readFile(filePath, 'utf-8');
   } catch (error) {
+    options.signal?.throwIfAborted();
     if (isNodeError(error) && error.code === 'ENOENT') return null;
     throw error;
   }
+  options.signal?.throwIfAborted();
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
     return null;
   }
+  options.signal?.throwIfAborted();
   if (!isValidWorktreeSession(parsed)) return null;
   return parsed;
 }
 
-/**
- * Atomically writes the sidecar. Uses `atomicWriteJSON` (write-to-temp +
- * rename) so a crash mid-write can never leave a half-written file that
- * subsequent reads would reject as malformed.
- */
+/** Strict daemon-only sidecar read that preserves corruption for recovery. */
+export async function readWorktreeSessionStrict(
+  filePath: string,
+): Promise<StrictWorktreeSession> {
+  let handle: fs.FileHandle | undefined;
+  let observedSidecar = false;
+  try {
+    const flags =
+      nodeFs.constants.O_RDONLY |
+      (nodeFs.constants.O_NOFOLLOW ?? 0) |
+      (nodeFs.constants.O_NONBLOCK ?? 0);
+    const before = await fs.lstat(filePath, { bigint: true });
+    observedSidecar = true;
+    if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1n) {
+      return { state: 'invalid', reason: 'unsafe sidecar file type' };
+    }
+    if (
+      before.ino === 0n ||
+      before.size > BigInt(WORKTREE_SESSION_SIDECAR_MAX_BYTES)
+    ) {
+      return { state: 'invalid', reason: 'unsafe sidecar size or identity' };
+    }
+    handle = await fs.open(filePath, flags);
+    const opened = await handle.stat({ bigint: true });
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1n ||
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino
+    ) {
+      return {
+        state: 'invalid',
+        reason: 'sidecar identity changed before read',
+      };
+    }
+    const buffer = Buffer.alloc(WORKTREE_SESSION_SIDECAR_MAX_BYTES + 1);
+    let bytesRead = 0;
+    while (bytesRead < buffer.length) {
+      const chunk = await handle.read(
+        buffer,
+        bytesRead,
+        buffer.length - bytesRead,
+        bytesRead,
+      );
+      if (chunk.bytesRead === 0) break;
+      bytesRead += chunk.bytesRead;
+    }
+    if (bytesRead > WORKTREE_SESSION_SIDECAR_MAX_BYTES) {
+      return { state: 'invalid', reason: 'unsafe sidecar size or identity' };
+    }
+    const after = await handle.stat({ bigint: true });
+    const pathStats = await fs.lstat(filePath, { bigint: true });
+    if (
+      !after.isFile() ||
+      after.nlink !== 1n ||
+      after.size !== BigInt(bytesRead) ||
+      after.dev !== opened.dev ||
+      after.ino !== opened.ino ||
+      !pathStats.isFile() ||
+      pathStats.nlink !== 1n ||
+      pathStats.dev !== after.dev ||
+      pathStats.ino !== after.ino
+    ) {
+      return {
+        state: 'invalid',
+        reason: 'sidecar identity changed during read',
+      };
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(buffer.subarray(0, bytesRead).toString('utf8'));
+    } catch {
+      return { state: 'invalid', reason: 'invalid sidecar JSON' };
+    }
+    if (!isValidWorktreeSession(parsed)) {
+      return { state: 'invalid', reason: 'invalid sidecar contents' };
+    }
+    return { state: 'valid', session: parsed };
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ENOENT') {
+      return observedSidecar
+        ? { state: 'invalid', reason: 'sidecar disappeared during read' }
+        : { state: 'missing' };
+    }
+    return {
+      state: 'invalid',
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+/** Writes the worktree session sidecar via `atomicWriteJSON`. */
 export async function writeWorktreeSession(
   filePath: string,
   session: WorktreeSession,
@@ -123,6 +257,215 @@ export async function clearWorktreeSession(filePath: string): Promise<void> {
     if (isNodeError(error) && error.code === 'ENOENT') return;
     throw error;
   }
+}
+
+export async function isSessionRuntimeActive(
+  sessionId: string,
+  projectRoots: string | readonly string[],
+): Promise<boolean> {
+  const roots = uniquePaths(
+    (Array.isArray(projectRoots) ? projectRoots : [projectRoots]).map((root) =>
+      path.resolve(root),
+    ),
+  );
+  const runtimeBases = getRuntimeBaseCandidates(roots);
+  let sawDeadRuntimeStatus = false;
+
+  for (const runtimeBase of runtimeBases) {
+    for (const projectRoot of roots) {
+      const statusPath = await Storage.runWithRuntimeBaseDir(
+        runtimeBase,
+        undefined,
+        async () => new Storage(projectRoot).getRuntimeStatusPath(sessionId),
+      );
+      const statusState = await getRuntimeStatusPathState(
+        statusPath,
+        sessionId,
+      );
+      if (statusState === 'active') {
+        return true;
+      }
+      sawDeadRuntimeStatus ||= statusState === 'dead';
+    }
+
+    const baseState = await getRuntimeStatusStateInBase(runtimeBase, sessionId);
+    if (baseState === 'active') {
+      return true;
+    }
+    sawDeadRuntimeStatus ||= baseState === 'dead';
+  }
+
+  const scanResult = await scanRuntimeStatusUnderRoots(roots, sessionId);
+  if (scanResult === 'active' || scanResult === 'incomplete') {
+    return true;
+  }
+
+  return !sawDeadRuntimeStatus;
+}
+
+function getRuntimeBaseCandidates(projectRoots: readonly string[]): string[] {
+  const currentBase = path.resolve(Storage.getRuntimeBaseDir());
+  const candidates = [currentBase];
+
+  for (const root of projectRoots) {
+    const rel = path.relative(root, currentBase);
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+      continue;
+    }
+    for (const candidateRoot of projectRoots) {
+      candidates.push(path.resolve(candidateRoot, rel));
+    }
+  }
+
+  return uniquePaths(candidates);
+}
+
+type RuntimeStatusState = 'active' | 'dead' | 'missing';
+
+async function getRuntimeStatusStateInBase(
+  runtimeBase: string,
+  sessionId: string,
+): Promise<RuntimeStatusState> {
+  const projectsDir = path.join(runtimeBase, 'projects');
+  let entries: Array<import('node:fs').Dirent>;
+  try {
+    entries = await fs.readdir(projectsDir, { withFileTypes: true });
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ENOENT') {
+      return 'missing';
+    }
+    throw error;
+  }
+
+  let sawDeadRuntimeStatus = false;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const statusPath = path.join(
+      projectsDir,
+      entry.name,
+      'chats',
+      `${sessionId}.runtime.json`,
+    );
+    const statusState = await getRuntimeStatusPathState(statusPath, sessionId);
+    if (statusState === 'active') {
+      return 'active';
+    }
+    sawDeadRuntimeStatus ||= statusState === 'dead';
+  }
+  return sawDeadRuntimeStatus ? 'dead' : 'missing';
+}
+
+type RuntimeStatusScanResult = 'active' | 'dead' | 'not-found' | 'incomplete';
+
+async function scanRuntimeStatusUnderRoots(
+  roots: readonly string[],
+  sessionId: string,
+): Promise<RuntimeStatusScanResult> {
+  const seen = new Set<string>();
+  const state = { dirs: 0 };
+  let sawDeadRuntimeStatus = false;
+  for (const root of roots) {
+    const result = await scanRuntimeStatusDir(root, sessionId, seen, state);
+    if (result === 'active' || result === 'incomplete') {
+      return result;
+    }
+    sawDeadRuntimeStatus ||= result === 'dead';
+  }
+  return sawDeadRuntimeStatus ? 'dead' : 'not-found';
+}
+
+async function scanRuntimeStatusDir(
+  dir: string,
+  sessionId: string,
+  seen: Set<string>,
+  state: { dirs: number },
+): Promise<RuntimeStatusScanResult> {
+  if (state.dirs >= RUNTIME_STATUS_SCAN_MAX_DIRS) {
+    return 'incomplete';
+  }
+  state.dirs++;
+
+  const realDir = await fs.realpath(dir).catch(() => path.resolve(dir));
+  if (seen.has(realDir)) {
+    return 'not-found';
+  }
+  seen.add(realDir);
+
+  let entries: Array<import('node:fs').Dirent>;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ENOENT') {
+      return 'not-found';
+    }
+    throw error;
+  }
+
+  let sawDeadRuntimeStatus = false;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const child = path.join(dir, entry.name);
+    if (entry.name === 'projects') {
+      const baseState = await getRuntimeStatusStateInBase(dir, sessionId);
+      if (baseState === 'active') {
+        return 'active';
+      }
+      sawDeadRuntimeStatus ||= baseState === 'dead';
+      continue;
+    }
+    if (shouldSkipRuntimeStatusScanDir(entry.name, dir)) {
+      continue;
+    }
+    const result = await scanRuntimeStatusDir(child, sessionId, seen, state);
+    if (result !== 'not-found') {
+      if (result === 'dead') {
+        sawDeadRuntimeStatus = true;
+        continue;
+      }
+      return result;
+    }
+  }
+
+  return sawDeadRuntimeStatus ? 'dead' : 'not-found';
+}
+
+function shouldSkipRuntimeStatusScanDir(name: string, parent: string): boolean {
+  if (RUNTIME_STATUS_SCAN_SKIP_DIRS.has(name)) {
+    return true;
+  }
+  return name === 'worktrees' && path.basename(parent) === '.qwen';
+}
+
+async function getRuntimeStatusPathState(
+  statusPath: string,
+  sessionId: string,
+): Promise<RuntimeStatusState> {
+  const status = await readRuntimeStatus(statusPath);
+  if (!status || status.sessionId !== sessionId) {
+    return 'missing';
+  }
+
+  if (status.hostname !== os.hostname()) {
+    return 'active';
+  }
+
+  try {
+    process.kill(status.pid, 0);
+    return 'active';
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ESRCH') {
+      return 'dead';
+    }
+    return 'active';
+  }
+}
+
+function uniquePaths(paths: readonly string[]): string[] {
+  return [...new Set(paths.map((value) => path.resolve(value)))];
 }
 
 export interface WorktreeRestoreResult {
@@ -156,6 +499,12 @@ export interface WorktreeRestoreResult {
  * 3. The sidecar exists but `readWorktreeSession` threw a non-ENOENT I/O
  *    error (e.g. permission, EIO) — we still attempt cleanup so the next
  *    resume isn't stuck reading the same broken file.
+ *
+ * A sidecar carrying `supersededBy` is refused the same way but deliberately
+ * NOT cleared: a worktree reset moved ownership of that checkout to the
+ * replacement session, and the daemon's reset route still reads this sidecar's
+ * `supersededBy` to redirect and to classify an interrupted transfer. Restoring
+ * here would point a live session at a checkout another session owns.
  *
  * Shared by TUI / headless / ACP entry points so all three behave
  * consistently on `--resume`. Failures are logged via the supplied
@@ -196,6 +545,21 @@ export async function restoreWorktreeContext(
     return { contextMessage: null, session: null };
   }
 
+  if (session.supersededBy !== undefined) {
+    // A worktree reset moved ownership of this checkout to
+    // `session.supersededBy`. Refuse the restore — resuming here would direct
+    // a live session into a worktree another session now owns — but leave the
+    // sidecar alone: the daemon's reset route still reads this link to
+    // redirect and to classify an interrupted transfer.
+    onWarn?.(
+      new Error(
+        `worktree session was superseded by ${session.supersededBy}; ` +
+          `not restoring its worktree context.`,
+      ),
+    );
+    return { contextMessage: null, session: null };
+  }
+
   // Structural sanity check: the worktreePath MUST live under
   // `<originalCwd>/.qwen/worktrees/`. Schema validation (readWorktreeSession)
   // already ensures the fields are strings, but a manually-edited or
@@ -206,10 +570,7 @@ export async function restoreWorktreeContext(
   // (PR #4174 review #3256839787.)
   const expectedParent = path.join(session.originalCwd, '.qwen', 'worktrees');
   const resolvedWorktree = path.resolve(session.worktreePath);
-  if (
-    !resolvedWorktree.startsWith(expectedParent + path.sep) &&
-    resolvedWorktree !== expectedParent
-  ) {
+  if (!resolvedWorktree.startsWith(expectedParent + path.sep)) {
     onWarn?.(
       new Error(
         `worktreePath ${session.worktreePath} is outside ${expectedParent}; ` +

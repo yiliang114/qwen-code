@@ -1,10 +1,14 @@
 # Authentication
 
-Qwen Code supports three authentication methods. Pick the one that matches how you want to run the CLI:
+Qwen Code's first-run `/auth` menu has three top-level options. Pick the one that matches how you want to run the CLI:
 
-- **Qwen OAuth**: sign in with your `qwen.ai` account in a browser. **Free tier discontinued on 2026-04-15** — switch to another method.
-- **Alibaba Cloud Coding Plan**: use an API key from Alibaba Cloud. Paid subscription with diverse model options and higher quotas.
-- **API Key**: bring your own API key. Flexible to your own needs — supports OpenAI, Anthropic, Gemini, and other compatible endpoints.
+- **Alibaba ModelStudio**: official recommended setup. Opens a sub-menu with **Coding Plan** (for individual developers · weekly quota included), **Token Plan** (for teams and companies · usage-based billing with a dedicated endpoint), or **Standard API Key** (connect with an existing ModelStudio API key). Token Plan and Standard API Key also enable the built-in [`web_search` tool](../../developers/tools/web-search.md) with no extra setup.
+- **Third-party Providers**: choose a built-in provider and connect with an API key (DeepSeek, Grok, MiniMax, Z.AI, Kimi, Idealab, ModelScope, OpenRouter, Requesty).
+- **Custom Provider**: manually connect a local server, proxy, or unsupported provider — supports OpenAI, Anthropic, Gemini, and other compatible endpoints.
+
+> [!note]
+>
+> **Qwen OAuth** is no longer a selectable dialog entry — its free tier was discontinued on 2026-04-15. It remains documented below as a hard-coded, discontinued provider only.
 
 ## Option 1: Qwen OAuth (Discontinued)
 
@@ -23,7 +27,7 @@ Start the CLI and follow the browser flow:
 qwen
 ```
 
-Then run `/auth` and choose the OAuth provider from the interactive dialog.
+Qwen OAuth is no longer offered as a selectable entry in the `/auth` dialog; run `/auth` and choose one of the current options (Alibaba ModelStudio, Third-party Providers, or Custom Provider) instead.
 
 > [!note]
 >
@@ -48,9 +52,9 @@ Alibaba Cloud Coding Plan is available in two regions:
 
 ### Interactive setup
 
-Enter `qwen` in the terminal to launch Qwen Code, then run the `/auth` command and select **Alibaba Cloud Coding Plan**. Choose your region, then enter your `sk-sp-xxxxxxxxx` key.
+Enter `qwen` in the terminal to launch Qwen Code, then run the `/auth` command, select **Alibaba ModelStudio**, and choose **Coding Plan** from the sub-menu. Choose your region, then enter your `sk-sp-xxxxxxxxx` key.
 
-After authentication, use the `/model` command to switch between all Alibaba Cloud Coding Plan supported models (including qwen3.5-plus, qwen3-coder-plus, qwen3-coder-next, qwen3-max, glm-4.7, and kimi-k2.5).
+After authentication, use the `/model` command to switch between all Alibaba Cloud Coding Plan supported models (including qwen3.5-plus, qwen3.6-plus, qwen3.7-plus, qwen3-coder-plus, qwen3-coder-next, qwen3-max-2026-01-23, glm-5, glm-4.7, kimi-k2.5, and MiniMax-M2.5).
 
 ### Headless or scripted setup
 
@@ -99,9 +103,80 @@ If you prefer to skip the interactive `/auth` flow, add the following to `~/.qwe
 >
 > The Coding Plan uses a dedicated endpoint (`https://coding.dashscope.aliyuncs.com/v1`) that is different from the standard Dashscope endpoint. Make sure to use the correct `baseUrl`.
 
-## 🚀 Option 3: API Key (flexible)
+## 🪙 Option 3: Alibaba Cloud Token Plan
 
-Use this if you want to connect to third-party providers such as OpenAI, Anthropic, Google, Azure OpenAI, OpenRouter, ModelScope, or a self-hosted endpoint. Supports multiple protocols and providers.
+Use this if your team or company prefers usage-based billing on a dedicated ModelStudio endpoint.
+
+- **How it works**: Subscribe to the Token Plan in Alibaba Cloud ModelStudio, then configure Qwen Code to use the region-specific Token Plan endpoint and your API key. You are billed for actual token usage instead of a fixed monthly fee.
+- **Requirements**: Obtain a Token Plan API key from [Alibaba Cloud ModelStudio(Beijing)](https://bailian.console.aliyun.com/cn-beijing?tab=doc#/doc/?type=model&url=3028856) or [Alibaba Cloud ModelStudio(intl)](https://modelstudio.console.alibabacloud.com/ap-southeast-1?tab=doc#/doc/?type=model), depending on the region of your account.
+- **Benefits**: Usage-based billing for teams and companies, dedicated region-specific endpoints, access to a wide range of models (Qwen, DeepSeek, GLM, Kimi, Minimax and more).
+- **Cost & quota**: View Alibaba Cloud ModelStudio Token Plan documentation [Beijing](https://bailian.console.aliyun.com/cn-beijing?tab=doc#/doc/?type=model&url=3028856) [intl](https://modelstudio.console.alibabacloud.com/ap-southeast-1?tab=doc#/doc/?type=model).
+
+Token Plan is available in two regions, each with its own dedicated endpoint:
+
+| Region                    | Endpoint                                                                 | Console URL                                                                                         |
+| ------------------------- | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| China (Beijing)           | `https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`     | [bailian.console.aliyun.com](https://bailian.console.aliyun.com/cn-beijing)                         |
+| Singapore (International) | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` | [modelstudio.console.alibabacloud.com](https://modelstudio.console.alibabacloud.com/ap-southeast-1) |
+
+### Interactive setup
+
+Enter `qwen` in the terminal to launch Qwen Code, then run the `/auth` command, select **Alibaba ModelStudio**, and choose **Token Plan** from the sub-menu. Choose your region (**China (Beijing)** or **Singapore (International)**), then enter your API key. The wizard then shows its final step (Step 3/3 · Model IDs), where you pick the model IDs to configure: the models served by your endpoint are offered there and are applied only when you explicitly select them. Token Plan API keys have no prefix requirement (unlike Coding Plan keys, which start with `sk-sp-`).
+
+After authentication, use the `/model` command to browse and switch between the models configured for your Token Plan. The model lineup evolves over time, so it is intentionally not listed here; model discovery from the endpoint happens during the `/auth` setup step above (the endpoint's own list is offered there and must be selected explicitly), and `/model` then shows the models configured for your plan.
+
+### Headless or scripted setup
+
+For CI, containers, or scripts, configure Token Plan with environment variables or `settings.json` instead of the interactive `/auth` flow.
+
+```bash
+export BAILIAN_TOKEN_PLAN_API_KEY="your-api-key"
+export OPENAI_BASE_URL="https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+export OPENAI_MODEL="qwen3.7-plus"
+```
+
+Use `https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1` for the China (Beijing) endpoint, or `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` for the international (Singapore) endpoint. Replace `qwen3.7-plus` with any model included in your plan.
+
+Note that `BAILIAN_TOKEN_PLAN_API_KEY` is a provider-specific key: it takes effect once the `settings.json` provider entry in the next section exists, because that entry declares it as the `envKey`. To select OpenAI-compatible auth with environment variables alone, export `OPENAI_API_KEY` instead — provider-specific keys do not select the auth type by themselves.
+
+### Alternative: configure via `settings.json`
+
+If you prefer to skip the interactive `/auth` flow, add the following to `~/.qwen/settings.json`:
+
+```json
+{
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "qwen3.7-plus",
+        "name": "qwen3.7-plus (Token Plan)",
+        "baseUrl": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        "description": "qwen3.7-plus from Alibaba Cloud Token Plan",
+        "envKey": "BAILIAN_TOKEN_PLAN_API_KEY"
+      }
+    ]
+  },
+  "env": {
+    "BAILIAN_TOKEN_PLAN_API_KEY": "your-api-key"
+  },
+  "security": {
+    "auth": {
+      "selectedType": "openai"
+    }
+  },
+  "model": {
+    "name": "qwen3.7-plus"
+  }
+}
+```
+
+> [!note]
+>
+> The Token Plan uses dedicated, region-specific endpoints (`*.maas.aliyuncs.com`) that are different from the standard DashScope endpoint. Make sure the `baseUrl` matches the region of your subscription.
+
+## 🚀 Option 4: API Key (flexible)
+
+Use this if you want to connect to third-party providers such as OpenAI, Anthropic, Google, Azure OpenAI, OpenRouter, Requesty, ModelScope, or a self-hosted endpoint. Supports multiple protocols and providers.
 
 ### Recommended: One-file setup via `settings.json`
 
@@ -153,15 +228,16 @@ The key concept is **Model Providers** (`modelProviders`): Qwen Code supports mu
 
 #### Supported protocols
 
-| Protocol          | `modelProviders` key | Environment variables                                        | Providers                                                                                   |
-| ----------------- | -------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
-| OpenAI-compatible | `openai`             | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`          | OpenAI, Azure OpenAI, OpenRouter, ModelScope, Alibaba Cloud, any OpenAI-compatible endpoint |
-| Anthropic         | `anthropic`          | `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL` | Anthropic Claude                                                                            |
-| Google GenAI      | `gemini`             | `GEMINI_API_KEY`, `GEMINI_MODEL`                             | Google Gemini                                                                               |
+| Protocol          | `modelProviders` key | Environment variables                                                                                                                                          | Providers                                                                                             |
+| ----------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| OpenAI-compatible | `openai`             | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` (alias: `QWEN_MODEL`)                                                                                      | OpenAI, Azure OpenAI, OpenRouter, Requesty, ModelScope, Alibaba Cloud, any OpenAI-compatible endpoint |
+| Anthropic         | `anthropic`          | `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`                                                                                                   | Anthropic Claude                                                                                      |
+| Google GenAI      | `gemini`             | `GEMINI_API_KEY`, `GEMINI_MODEL`                                                                                                                               | Google Gemini                                                                                         |
+| Vertex AI         | `vertex-ai`          | `GOOGLE_API_KEY` + `GOOGLE_MODEL` (sets `GOOGLE_GENAI_USE_VERTEXAI=true`) or `GOOGLE_CLOUD_PROJECT` + `GOOGLE_MODEL` (keyless ADC); uses the `gemini` protocol | Google Vertex AI                                                                                      |
 
 #### Step 1: Configure models and providers in `~/.qwen/settings.json`
 
-Define which models are available for each protocol. Each model entry requires at minimum an `id` and an `envKey` (the environment variable name that holds your API key).
+Define which models are available for each protocol. Each model entry requires at minimum an `id`; `envKey` (the environment variable name that holds your API key) is optional and recommended — when omitted, it falls back to the auth type's default env key (e.g. `OPENAI_API_KEY` for `openai`).
 
 > [!important]
 >
@@ -204,13 +280,14 @@ Edit `~/.qwen/settings.json` (create it if it doesn't exist). You can mix multip
 
 **`ModelConfig` fields (each entry inside `modelProviders`):**
 
-| Field              | Required | Description                                                          |
-| ------------------ | -------- | -------------------------------------------------------------------- |
-| `id`               | Yes      | Model ID sent to the API (e.g. `gpt-4o`, `claude-sonnet-4-20250514`) |
-| `name`             | No       | Display name in the `/model` picker (defaults to `id`)               |
-| `envKey`           | Yes      | Environment variable name for the API key (e.g. `OPENAI_API_KEY`)    |
-| `baseUrl`          | No       | API endpoint override (useful for proxies or custom endpoints)       |
-| `generationConfig` | No       | Fine-tune `timeout`, `maxRetries`, `samplingParams`, etc.            |
+| Field              | Required | Description                                                                                                                                        |
+| ------------------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`               | Yes      | Model ID sent to the API (e.g. `gpt-4o`, `claude-sonnet-4-20250514`)                                                                               |
+| `wireApi`          | No       | OpenAI-compatible request format: `chat-completions` or `responses`. Omit to inherit the provider protocol.                                        |
+| `name`             | No       | Display name in the `/model` picker (defaults to `id`)                                                                                             |
+| `envKey`           | No       | Environment variable name for the API key (e.g. `OPENAI_API_KEY`); optional/recommended — defaults to the auth type's default env key when omitted |
+| `baseUrl`          | No       | API endpoint override (useful for proxies or custom endpoints)                                                                                     |
+| `generationConfig` | No       | Fine-tune `timeout`, `maxRetries`, `samplingParams`, etc.                                                                                          |
 
 > [!note]
 >
@@ -310,16 +387,18 @@ qwen --model "qwen3.5-plus"
 
 The standalone `qwen auth` CLI command has been removed. Use these replacements instead:
 
-| Previous use case                | Replacement                                                                                 |
-| -------------------------------- | ------------------------------------------------------------------------------------------- |
-| Interactive authentication setup | Run `qwen`, then use `/auth`                                                                |
-| Coding Plan setup                | Use `/auth`, or set `BAILIAN_CODING_PLAN_API_KEY` with the Coding Plan base URL             |
-| OpenRouter setup                 | Use `/auth`, or set `OPENROUTER_API_KEY` and `OPENAI_BASE_URL=https://openrouter.ai/api/v1` |
-| API-key or custom provider setup | Configure `~/.qwen/settings.json`, `.env`, or provider-specific environment variables       |
-| Check current authentication     | Run `/doctor` inside Qwen Code                                                              |
-| OAuth browser flow               | Run `qwen` interactively and use `/auth`; OAuth cannot be configured with env vars alone    |
+| Previous use case                | Replacement                                                                                   |
+| -------------------------------- | --------------------------------------------------------------------------------------------- |
+| Interactive authentication setup | Run `qwen`, then use `/auth`                                                                  |
+| Coding Plan setup                | Use `/auth`, or set `BAILIAN_CODING_PLAN_API_KEY` with the Coding Plan base URL               |
+| Token Plan setup                 | Use `/auth`, or set `BAILIAN_TOKEN_PLAN_API_KEY` with the Token Plan base URL for your region |
+| OpenRouter setup                 | Use `/auth`, or set `OPENROUTER_API_KEY` and `OPENAI_BASE_URL=https://openrouter.ai/api/v1`   |
+| Requesty setup                   | Use `/auth`, or set `REQUESTY_API_KEY` and `OPENAI_BASE_URL=https://router.requesty.ai/v1`    |
+| API-key or custom provider setup | Configure `~/.qwen/settings.json`, `.env`, or provider-specific environment variables         |
+| Check current authentication     | Run `/doctor` inside Qwen Code                                                                |
+| OAuth browser flow               | Run `qwen` interactively and use `/auth`; OAuth cannot be configured with env vars alone      |
 
-Legacy invocations such as `qwen auth status` now print a removal notice with these migration paths.
+Legacy invocations such as `qwen auth status` print a removal notice that summarizes these migration paths, including a Token Plan entry with the base URLs for both regions.
 
 ## Security notes
 

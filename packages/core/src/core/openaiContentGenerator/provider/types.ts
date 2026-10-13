@@ -1,9 +1,11 @@
 import type { GenerateContentConfig } from '@google/genai';
 import type OpenAI from 'openai';
+import type { ContentGeneratorConfig } from '../../contentGenerator.js';
 import type { OpenAIResponseParsingOptions } from '../responseParsingOptions.js';
 
 export type OpenAIRequestContextOverrides = {
   splitToolMedia?: boolean;
+  toolResultContentFormat?: ContentGeneratorConfig['toolResultContentFormat'];
 };
 
 // Extended types to support cache_control for DashScope
@@ -27,9 +29,10 @@ export interface OpenAICompatibleProvider {
   buildRequest(
     request: OpenAI.Chat.ChatCompletionCreateParams,
     userPromptId: string,
+    reattachBlockCount?: number,
   ): OpenAI.Chat.ChatCompletionCreateParams;
   getDefaultGenerationConfig(): GenerateContentConfig;
-  getResponseParsingOptions?(): OpenAIResponseParsingOptions;
+  getResponseParsingOptions?(model?: string): OpenAIResponseParsingOptions;
   getRequestContextOverrides?(): OpenAIRequestContextOverrides;
 }
 

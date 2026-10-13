@@ -6,6 +6,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
+  ROOT_CONTEXT,
   SpanKind,
   SpanStatusCode,
   TraceFlags,
@@ -15,11 +16,19 @@ import {
 import { LogToSpanProcessor } from './log-to-span-processor.js';
 import type { ReadableLogRecord } from '@opentelemetry/sdk-logs';
 import type { SpanExporter } from '@opentelemetry/sdk-trace-base';
+import { sessionIdContext } from '../utils/sessionIdContext.js';
 
 let mockCurrentSessionId: string | undefined = undefined;
+let mockScopedSessionId: string | undefined = undefined;
+let mockIsInNativeSubagentSpan = false;
 
 vi.mock('./session-context.js', () => ({
   getCurrentSessionId: () => mockCurrentSessionId,
+  getSessionIdFromContext: () => mockScopedSessionId,
+}));
+
+vi.mock('./session-tracing.js', () => ({
+  isInNativeSubagentSpan: () => mockIsInNativeSubagentSpan,
 }));
 
 interface ExportedSpan {
@@ -41,6 +50,8 @@ describe('LogToSpanProcessor', () => {
   beforeEach(() => {
     exportedSpans = [];
     mockCurrentSessionId = undefined;
+    mockScopedSessionId = undefined;
+    mockIsInNativeSubagentSpan = false;
     mockExporter = {
       export: vi.fn((spans, cb) => {
         exportedSpans.push(...spans);
@@ -162,6 +173,7 @@ describe('LogToSpanProcessor', () => {
         error_message: 'secret upstream error',
         prompt: 'secret prompt',
         function_args: '{"token":"secret"}',
+        request_text: 'secret request',
         response_text: 'secret response',
         error_type: 'RateLimitError',
         safe: 'visible',
@@ -177,6 +189,7 @@ describe('LogToSpanProcessor', () => {
     expect(attrs).not.toHaveProperty('error_message');
     expect(attrs).not.toHaveProperty('prompt');
     expect(attrs).not.toHaveProperty('function_args');
+    expect(attrs).not.toHaveProperty('request_text');
     expect(attrs).not.toHaveProperty('response_text');
     expect(attrs['error_type']).toBe('RateLimitError');
     expect(attrs['safe']).toBe('visible');
@@ -199,6 +212,7 @@ describe('LogToSpanProcessor', () => {
         error_message: 'secret upstream error',
         prompt: 'secret prompt',
         function_args: '{"token":"secret"}',
+        request_text: 'secret request',
         response_text: 'secret response',
         safe: 'visible',
       },
@@ -213,6 +227,7 @@ describe('LogToSpanProcessor', () => {
     expect(attrs['error_message']).toBe('secret upstream error');
     expect(attrs['prompt']).toBe('secret prompt');
     expect(attrs['function_args']).toBe('{"token":"secret"}');
+    expect(attrs['request_text']).toBe('secret request');
     expect(attrs['response_text']).toBe('secret response');
     expect(attrs['safe']).toBe('visible');
     expect(attrs['log.bridge']).toBe(true);
@@ -590,6 +605,42 @@ describe('LogToSpanProcessor', () => {
     expect(exportedSpans[0].status.code).toBe(SpanStatusCode.OK);
   });
 
+  it('keeps cancelled tool calls UNSET even when legacy errors are present', async () => {
+    const logRecord = {
+      body: 'tool call cancelled',
+      hrTime: [1000, 0] as [number, number],
+      attributes: {
+        'event.name': 'qwen-code.tool_call',
+        status: 'cancelled',
+        success: false,
+        error: 'cancelled by user',
+        error_type: 'unhandled_exception',
+      },
+    } as unknown as ReadableLogRecord;
+
+    processor.onEmit(logRecord);
+    await processor.forceFlush();
+
+    expect(exportedSpans[0].status.code).toBe(SpanStatusCode.UNSET);
+  });
+
+  it('keeps ERROR for cancelled non-tool events that carry an error', async () => {
+    const logRecord = {
+      body: 'auth cancelled with error',
+      hrTime: [1000, 0] as [number, number],
+      attributes: {
+        'event.name': 'qwen-code.auth',
+        status: 'cancelled',
+        error_message: 'auth flow failed',
+      },
+    } as unknown as ReadableLogRecord;
+
+    processor.onEmit(logRecord);
+    await processor.forceFlush();
+
+    expect(exportedSpans[0].status.code).toBe(SpanStatusCode.ERROR);
+  });
+
   it('does not set ERROR for falsy error attributes', async () => {
     const logRecord = {
       body: 'ok event',
@@ -733,10 +784,51 @@ describe('LogToSpanProcessor', () => {
     expect(exportedSpans[0].spanContext().traceId).toBe(
       deriveTraceId('session-from-context'),
     );
+    expect(exportedSpans[0].attributes['session.id']).toBe(
+      'session-from-context',
+    );
+  });
+
+  it('prefers and stamps the scoped OTel session over the global fallback', async () => {
+    mockCurrentSessionId = 'stale-session';
+    mockScopedSessionId = 'scoped-session';
+    const logRecord = {
+      body: 'scoped event',
+      hrTime: [1000, 0] as [number, number],
+      attributes: {},
+    } as unknown as ReadableLogRecord;
+
+    processor.onEmit(logRecord, ROOT_CONTEXT);
+    await processor.forceFlush();
+
+    const { deriveTraceId } = await import('./trace-id-utils.js');
+    expect(exportedSpans[0].attributes['session.id']).toBe('scoped-session');
+    expect(exportedSpans[0].spanContext().traceId).toBe(
+      deriveTraceId('scoped-session'),
+    );
+  });
+
+  it('uses the per-request session before the global fallback', async () => {
+    mockCurrentSessionId = 'stale-session';
+    const logRecord = {
+      body: 'request-scoped event',
+      hrTime: [1000, 0] as [number, number],
+      attributes: {},
+    } as unknown as ReadableLogRecord;
+
+    sessionIdContext.run('request-session', () => processor.onEmit(logRecord));
+    await processor.forceFlush();
+
+    const { deriveTraceId } = await import('./trace-id-utils.js');
+    expect(exportedSpans[0].attributes['session.id']).toBe('request-session');
+    expect(exportedSpans[0].spanContext().traceId).toBe(
+      deriveTraceId('request-session'),
+    );
   });
 
   it('prefers log record session.id over getCurrentSessionId', async () => {
     mockCurrentSessionId = 'stale-session';
+    mockScopedSessionId = 'wrong-scoped-session';
     const logRecord = {
       body: 'event with session attr',
       hrTime: [1000, 0] as [number, number],
@@ -750,5 +842,448 @@ describe('LogToSpanProcessor', () => {
     expect(exportedSpans[0].spanContext().traceId).toBe(
       deriveTraceId('fresh-session'),
     );
+    expect(exportedSpans[0].attributes['session.id']).toBe('fresh-session');
+  });
+
+  describe('bridge skip-list (#3731 Phase 3)', () => {
+    it('skips qwen-code.subagent_execution when native subagent span is active', async () => {
+      mockIsInNativeSubagentSpan = true;
+      const logRecord = {
+        body: 'subagent started',
+        hrTime: [2000, 0] as [number, number],
+        attributes: {
+          'event.name': 'qwen-code.subagent_execution',
+          subagent_name: 'Explore',
+          status: 'started',
+        },
+      } as unknown as ReadableLogRecord;
+
+      processor.onEmit(logRecord);
+      await processor.forceFlush();
+
+      expect(exportedSpans).toHaveLength(0);
+      mockIsInNativeSubagentSpan = false;
+    });
+
+    it('bridges subagent_execution when no native span is active (e.g. runForkedAgent)', async () => {
+      mockIsInNativeSubagentSpan = false;
+      const logRecord = {
+        body: 'forked agent started',
+        hrTime: [2500, 0] as [number, number],
+        attributes: {
+          'event.name': 'qwen-code.subagent_execution',
+          subagent_name: 'dreamAgent',
+          status: 'started',
+        },
+      } as unknown as ReadableLogRecord;
+
+      processor.onEmit(logRecord);
+      await processor.forceFlush();
+
+      expect(exportedSpans).toHaveLength(1);
+      expect(exportedSpans[0].name).toBe('qwen-code.subagent_execution');
+    });
+
+    it('still bridges other events normally (e.g. qwen-code.tool_call)', async () => {
+      const logRecord = {
+        body: 'tool call',
+        hrTime: [3000, 0] as [number, number],
+        attributes: {
+          'event.name': 'qwen-code.tool_call',
+          tool_name: 'read_file',
+        },
+      } as unknown as ReadableLogRecord;
+
+      processor.onEmit(logRecord);
+      await processor.forceFlush();
+
+      // Sanity check: skip list is narrow — non-listed events still bridge.
+      expect(exportedSpans).toHaveLength(1);
+      expect(exportedSpans[0].name).toBe('qwen-code.tool_call');
+    });
+  });
+
+  describe('export failure diagnostics', () => {
+    function makeFailingProcessor(error: Error | undefined) {
+      const failingExporter = {
+        export: vi.fn((_spans, cb) => cb({ code: 1, error })),
+        shutdown: vi.fn().mockResolvedValue(undefined),
+        forceFlush: vi.fn().mockResolvedValue(undefined),
+      } as unknown as SpanExporter;
+      return new LogToSpanProcessor(failingExporter, 60000);
+    }
+
+    async function flushOne(p: LogToSpanProcessor) {
+      p.onEmit({
+        body: 'event',
+        hrTime: [1000, 0] as [number, number],
+        attributes: { 'event.name': 'event' },
+      } as unknown as ReadableLogRecord);
+      await p.forceFlush();
+    }
+
+    it('falls back to error.name when message is empty (HTTP/2 / stripped reason phrase)', async () => {
+      await processor.shutdown();
+      const err = Object.assign(new Error(''), {
+        name: 'OTLPExporterError',
+        code: 403,
+        data: 'Forbidden: invalid license',
+      });
+      processor = makeFailingProcessor(err);
+      const stderrWrite = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation(() => true);
+
+      try {
+        await flushOne(processor);
+        expect(stderrWrite).toHaveBeenCalledWith(
+          '[LogToSpan] export failed: code=1 error="OTLPExporterError" httpCode=403 data="Forbidden: invalid license"\n',
+        );
+      } finally {
+        stderrWrite.mockRestore();
+      }
+    });
+
+    it('JSON-escapes embedded newlines in message and data so the record stays on one line', async () => {
+      await processor.shutdown();
+      const err = Object.assign(new Error('line1\nline2'), {
+        name: 'OTLPExporterError',
+        code: 500,
+        data: '{\n  "error": "boom"\n}',
+      });
+      const sink = vi.fn();
+      processor = new LogToSpanProcessor(
+        {
+          export: vi.fn((_s, cb) => cb({ code: 1, error: err })),
+          shutdown: vi.fn().mockResolvedValue(undefined),
+          forceFlush: vi.fn().mockResolvedValue(undefined),
+        } as unknown as SpanExporter,
+        { flushIntervalMs: 60000, diagnosticsSink: sink },
+      );
+
+      await flushOne(processor);
+      const msg = sink.mock.calls[0][0] as string;
+      expect(msg).not.toContain('\n');
+      expect(msg).toContain('error="line1\\nline2"');
+      expect(msg).toContain('data="{\\n  \\"error\\": \\"boom\\"\\n}"');
+    });
+
+    it('truncates response data snippets to 200 characters before stringifying', async () => {
+      await processor.shutdown();
+      const err = Object.assign(new Error(''), {
+        name: 'OTLPExporterError',
+        code: 500,
+        data: 'x'.repeat(500),
+      });
+      processor = makeFailingProcessor(err);
+      const stderrWrite = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation(() => true);
+
+      try {
+        await flushOne(processor);
+        const msg = stderrWrite.mock.calls[0][0] as string;
+        expect(msg).toContain('httpCode=500');
+        expect(msg).toContain(`data="${'x'.repeat(200)}"`);
+        expect(msg).not.toContain('x'.repeat(201));
+      } finally {
+        stderrWrite.mockRestore();
+      }
+    });
+
+    it('omits httpCode when err.code is a non-numeric networking code (ECONNREFUSED)', async () => {
+      await processor.shutdown();
+      const err = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1'), {
+        code: 'ECONNREFUSED',
+      });
+      processor = makeFailingProcessor(err);
+      const stderrWrite = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation(() => true);
+
+      try {
+        await flushOne(processor);
+        const msg = stderrWrite.mock.calls[0][0] as string;
+        expect(msg).not.toContain('httpCode=');
+        expect(msg).toContain('error="connect ECONNREFUSED 127.0.0.1"');
+      } finally {
+        stderrWrite.mockRestore();
+      }
+    });
+
+    it('reports error="unknown" when result.error is missing', async () => {
+      await processor.shutdown();
+      processor = makeFailingProcessor(undefined);
+      const stderrWrite = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation(() => true);
+
+      try {
+        await flushOne(processor);
+        expect(stderrWrite).toHaveBeenCalledWith(
+          '[LogToSpan] export failed: code=1 error="unknown"\n',
+        );
+      } finally {
+        stderrWrite.mockRestore();
+      }
+    });
+
+    it('omits data field when err.data is a non-string truthy value (e.g. Buffer)', async () => {
+      await processor.shutdown();
+      const err = Object.assign(new Error('fail'), {
+        code: 500,
+        data: Buffer.from('binary'),
+      });
+      processor = makeFailingProcessor(err as unknown as Error);
+      const stderrWrite = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation(() => true);
+
+      try {
+        await flushOne(processor);
+        const msg = stderrWrite.mock.calls[0][0] as string;
+        expect(msg).toContain('httpCode=500');
+        expect(msg).not.toContain('data=');
+      } finally {
+        stderrWrite.mockRestore();
+      }
+    });
+
+    it('falls back to "unknown" when both message and name are empty (e.g. minified Error)', async () => {
+      await processor.shutdown();
+      const err = Object.assign(new Error(''), { name: '' });
+      processor = makeFailingProcessor(err);
+      const stderrWrite = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation(() => true);
+
+      try {
+        await flushOne(processor);
+        expect(stderrWrite).toHaveBeenCalledWith(
+          '[LogToSpan] export failed: code=1 error="unknown"\n',
+        );
+      } finally {
+        stderrWrite.mockRestore();
+      }
+    });
+
+    it('omits data field when err.data is an empty string (guards against length>0 loosening)', async () => {
+      await processor.shutdown();
+      const err = Object.assign(new Error('fail'), { code: 500, data: '' });
+      processor = makeFailingProcessor(err);
+      const stderrWrite = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation(() => true);
+
+      try {
+        await flushOne(processor);
+        const msg = stderrWrite.mock.calls[0][0] as string;
+        expect(msg).toContain('httpCode=500');
+        expect(msg).not.toContain('data=');
+      } finally {
+        stderrWrite.mockRestore();
+      }
+    });
+
+    it('routes diagnostics to an injected sink without touching stderr', async () => {
+      await processor.shutdown();
+      const sink = vi.fn();
+      const stderrWrite = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation(() => true);
+      const failingExporter = {
+        export: vi.fn((_spans, cb) =>
+          cb({ code: 1, error: new Error('boom') }),
+        ),
+        shutdown: vi.fn().mockResolvedValue(undefined),
+        forceFlush: vi.fn().mockResolvedValue(undefined),
+      } as unknown as SpanExporter;
+      processor = new LogToSpanProcessor(failingExporter, {
+        flushIntervalMs: 60000,
+        diagnosticsSink: sink,
+      });
+
+      try {
+        await flushOne(processor);
+        expect(sink).toHaveBeenCalledWith(
+          '[LogToSpan] export failed: code=1 error="boom"',
+        );
+        expect(stderrWrite).not.toHaveBeenCalled();
+      } finally {
+        stderrWrite.mockRestore();
+      }
+    });
+
+    it('routes buffer-overflow warnings through the injected sink', async () => {
+      await processor.shutdown();
+      const sink = vi.fn();
+      processor = new LogToSpanProcessor(
+        {
+          export: vi.fn((_s, cb) => cb({ code: 0 })),
+          shutdown: vi.fn().mockResolvedValue(undefined),
+          forceFlush: vi.fn().mockResolvedValue(undefined),
+        } as unknown as SpanExporter,
+        { flushIntervalMs: 60000, maxBufferSize: 2, diagnosticsSink: sink },
+      );
+
+      for (const body of ['a', 'b', 'c']) {
+        processor.onEmit({
+          body,
+          hrTime: [1000, 0] as [number, number],
+          attributes: { 'event.name': body },
+        } as unknown as ReadableLogRecord);
+      }
+
+      expect(sink).toHaveBeenCalledWith(
+        expect.stringContaining('[LogToSpan] buffer exceeded max size'),
+      );
+    });
+
+    it('routes export timeout through the injected sink', async () => {
+      await processor.shutdown();
+      vi.useFakeTimers();
+      const sink = vi.fn();
+      try {
+        processor = new LogToSpanProcessor(
+          {
+            // Never invoke the callback — force the timeout branch.
+            export: vi.fn(),
+            shutdown: vi.fn().mockResolvedValue(undefined),
+            forceFlush: vi.fn().mockResolvedValue(undefined),
+          } as unknown as SpanExporter,
+          { flushIntervalMs: 60000, diagnosticsSink: sink },
+        );
+        processor.onEmit({
+          body: 'event',
+          hrTime: [1000, 0] as [number, number],
+          attributes: { 'event.name': 'event' },
+        } as unknown as ReadableLogRecord);
+
+        const flushPromise = processor.forceFlush();
+        // EXPORT_TIMEOUT_MS is 30_000 — advance past it.
+        await vi.advanceTimersByTimeAsync(31_000);
+        await flushPromise;
+
+        expect(sink).toHaveBeenCalledWith(
+          expect.stringMatching(
+            /^\[LogToSpan] export timeout after \d+ms \(\d+ span\(s\)\)$/,
+          ),
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('routes export-threw (synchronous exporter exception) through the injected sink', async () => {
+      await processor.shutdown();
+      const sink = vi.fn();
+      processor = new LogToSpanProcessor(
+        {
+          export: vi.fn(() => {
+            throw new Error('exporter exploded synchronously');
+          }),
+          shutdown: vi.fn().mockResolvedValue(undefined),
+          forceFlush: vi.fn().mockResolvedValue(undefined),
+        } as unknown as SpanExporter,
+        { flushIntervalMs: 60000, diagnosticsSink: sink },
+      );
+
+      await flushOne(processor);
+      expect(sink).toHaveBeenCalledWith(
+        '[LogToSpan] export threw: error="exporter exploded synchronously"',
+      );
+    });
+
+    it('surfaces httpCode/data when a sync-thrown error carries OTLPExporterError fields', async () => {
+      await processor.shutdown();
+      const sink = vi.fn();
+      const err = Object.assign(new Error('Bad Request'), {
+        name: 'OTLPExporterError',
+        code: 400,
+        data: 'malformed payload',
+      });
+      processor = new LogToSpanProcessor(
+        {
+          export: vi.fn(() => {
+            throw err;
+          }),
+          shutdown: vi.fn().mockResolvedValue(undefined),
+          forceFlush: vi.fn().mockResolvedValue(undefined),
+        } as unknown as SpanExporter,
+        { flushIntervalMs: 60000, diagnosticsSink: sink },
+      );
+
+      await flushOne(processor);
+      expect(sink).toHaveBeenCalledWith(
+        '[LogToSpan] export threw: error="Bad Request" httpCode=400 data="malformed payload"',
+      );
+    });
+
+    it('JSON-escapes export-threw payloads with embedded newlines (single-line invariant)', async () => {
+      await processor.shutdown();
+      const sink = vi.fn();
+      processor = new LogToSpanProcessor(
+        {
+          export: vi.fn(() => {
+            throw new Error('line1\nline2');
+          }),
+          shutdown: vi.fn().mockResolvedValue(undefined),
+          forceFlush: vi.fn().mockResolvedValue(undefined),
+        } as unknown as SpanExporter,
+        { flushIntervalMs: 60000, diagnosticsSink: sink },
+      );
+
+      await flushOne(processor);
+      const msg = sink.mock.calls[0][0] as string;
+      expect(msg).not.toContain('\n');
+      expect(msg).toBe('[LogToSpan] export threw: error="line1\\nline2"');
+    });
+
+    it('handles non-Error throws (e.g. throw "string") in the export-threw path', async () => {
+      await processor.shutdown();
+      const sink = vi.fn();
+      processor = new LogToSpanProcessor(
+        {
+          export: vi.fn(() => {
+            // Deliberate non-Error throw to exercise the String(err) branch.
+            // eslint-disable-next-line no-restricted-syntax
+            throw 'raw string thrown';
+          }),
+          shutdown: vi.fn().mockResolvedValue(undefined),
+          forceFlush: vi.fn().mockResolvedValue(undefined),
+        } as unknown as SpanExporter,
+        { flushIntervalMs: 60000, diagnosticsSink: sink },
+      );
+
+      await flushOne(processor);
+      expect(sink).toHaveBeenCalledWith(
+        '[LogToSpan] export threw: error="raw string thrown"',
+      );
+    });
+
+    it('keeps processing exports after the sink throws', async () => {
+      await processor.shutdown();
+      const sink = vi.fn(() => {
+        throw new Error('sink exploded');
+      });
+      const exportFn = vi.fn(
+        (_spans, cb: (r: { code: number; error?: Error }) => void) =>
+          cb({ code: 1, error: new Error('boom') }),
+      );
+      processor = new LogToSpanProcessor(
+        {
+          export: exportFn,
+          shutdown: vi.fn().mockResolvedValue(undefined),
+          forceFlush: vi.fn().mockResolvedValue(undefined),
+        } as unknown as SpanExporter,
+        { flushIntervalMs: 60000, diagnosticsSink: sink },
+      );
+
+      await flushOne(processor);
+      await flushOne(processor);
+
+      expect(exportFn).toHaveBeenCalledTimes(2);
+      expect(sink).toHaveBeenCalledTimes(2);
+    });
   });
 });

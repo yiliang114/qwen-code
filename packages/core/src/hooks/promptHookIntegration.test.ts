@@ -39,12 +39,20 @@ describe('Prompt Hook Integration', () => {
       getContentGenerator: vi.fn().mockReturnValue({
         generateContent: mockGenerateContent,
         generateContentStream: vi.fn(),
-        countTokens: vi.fn(),
         embedContent: vi.fn(),
-        useSummarizedThinking: vi.fn().mockReturnValue(false),
+      }),
+      getBaseLlmClient: vi.fn().mockReturnValue({
+        resolveForModel: vi.fn().mockResolvedValue({
+          contentGenerator: {
+            generateContent: mockGenerateContent,
+          },
+          contentGeneratorConfig: { model: 'qwen-max' },
+          model: 'qwen-max',
+        }),
       }),
       getProjectRoot: vi.fn().mockReturnValue('/test/project'),
       getAllowedHttpHookUrls: vi.fn().mockReturnValue([]),
+      getAllowPrivateNetworkHooks: vi.fn().mockReturnValue(false),
       getHooks: vi.fn().mockReturnValue({}),
     } as unknown as Config;
 
@@ -314,7 +322,7 @@ describe('Prompt Hook Integration', () => {
   });
 
   describe('Timeout Handling', () => {
-    it('should timeout and cancel when LLM is slow', async () => {
+    it('should report a timeout when LLM is slow', async () => {
       mockGenerateContent.mockImplementation(
         () =>
           new Promise((resolve) => {
@@ -344,7 +352,7 @@ describe('Prompt Hook Integration', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.outcome).toBe('cancelled');
+      expect(result.outcome).toBe('timeout');
     }, 10000);
   });
 });

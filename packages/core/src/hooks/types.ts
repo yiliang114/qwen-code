@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import type { ChildProcess } from 'child_process';
+import type { ToolArtifact } from '../tools/tools.js';
+import type { TaskStatus } from '../agents/tasks/types.js';
 import { createDebugLogger } from '../utils/debugLogger.js';
 
 const debugLogger = createDebugLogger('TRUSTED_HOOKS');
@@ -26,14 +28,20 @@ export enum HookEventName {
   PostToolUse = 'PostToolUse',
   // PostToolUseFailure - After tool execution fails
   PostToolUseFailure = 'PostToolUseFailure',
+  // PostToolBatch - After a batch of tool calls resolves
+  PostToolBatch = 'PostToolBatch',
   // Notification - When notifications are sent
   Notification = 'Notification',
   // UserPromptSubmit - When the user submits a prompt
   UserPromptSubmit = 'UserPromptSubmit',
+  // UserPromptExpansion - When a slash command expands into a prompt
+  UserPromptExpansion = 'UserPromptExpansion',
   // SessionStart - When a new session is started
   SessionStart = 'SessionStart',
   // Stop - Right before Claude concludes its response
   Stop = 'Stop',
+  // MessageDisplay - Fires repeatedly as the assistant's reply streams, before Stop
+  MessageDisplay = 'MessageDisplay',
   // SubagentStart - When a subagent (Task tool call) is started
   SubagentStart = 'SubagentStart',
   // SubagentStop - Right before a subagent (Task tool call) concludes its response
@@ -44,14 +52,20 @@ export enum HookEventName {
   PostCompact = 'PostCompact',
   // SessionEnd - When a session is ending
   SessionEnd = 'SessionEnd',
+  // SessionDelete - After an explicitly selected session is deleted
+  SessionDelete = 'SessionDelete',
   // When a permission dialog is displayed
   PermissionRequest = 'PermissionRequest',
+  // When AUTO-mode classification denies a tool call
+  PermissionDenied = 'PermissionDenied',
   // StopFailure - When the turn ends due to an API error (instead of Stop)
   StopFailure = 'StopFailure',
   // TodoCreated - When a new todo item is added to the list (Qwen Code specific)
   TodoCreated = 'TodoCreated',
   // TodoCompleted - When a todo item's status changes to 'completed' (Qwen Code specific)
   TodoCompleted = 'TodoCompleted',
+  // InstructionsLoaded - When an instruction or context file is loaded
+  InstructionsLoaded = 'InstructionsLoaded',
 }
 
 /**
@@ -111,7 +125,8 @@ export type HookExecutionOutcome =
   | 'success' // Hook executed successfully
   | 'blocking' // Hook blocked the operation
   | 'non_blocking_error' // Hook failed but doesn't block
-  | 'cancelled'; // Hook was cancelled/aborted
+  | 'cancelled' // Hook was cancelled/aborted by the caller
+  | 'timeout'; // Hook ran past its timeout; distinct from a user cancel
 
 /**
  * Context provided to function hooks for state access
@@ -245,10 +260,36 @@ export type HookDecision = 'ask' | 'block' | 'deny' | 'approve' | 'allow';
  */
 export interface HookInput {
   session_id: string;
+  source_type?: string;
+  source_id?: string;
   transcript_path: string;
   cwd: string;
   hook_event_name: string;
   timestamp: string;
+  /**
+   * Approval mode of the session. Tool and subagent events report the mode
+   * that applied to them instead.
+   */
+  permission_mode?: PermissionMode;
+  /** Present only when the event fires inside a subagent. */
+  agent_id?: string;
+  /** Prompt id of the model turn the event belongs to, when known. */
+  prompt_id?: string;
+}
+
+export type InstructionMemoryType = 'user' | 'project' | 'local' | 'extension';
+
+export type InstructionLoadReason = 'session_start' | 'include' | 'refresh';
+
+/**
+ * Input for InstructionsLoaded hook events
+ */
+export interface InstructionsLoadedInput extends HookInput {
+  file_path: string;
+  memory_type: InstructionMemoryType;
+  load_reason: InstructionLoadReason;
+  trigger_file_path?: string;
+  parent_file_path?: string;
 }
 
 /**
@@ -259,9 +300,66 @@ export interface HookOutput {
   stopReason?: string;
   suppressOutput?: boolean;
   systemMessage?: string;
+  terminalSequence?: string;
   decision?: HookDecision;
   reason?: string;
   hookSpecificOutput?: Record<string, unknown>;
+}
+
+export function isToolArtifactLike(value: unknown): value is ToolArtifact {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const artifact = value as Record<string, unknown>;
+  return (
+    typeof artifact['title'] === 'string' &&
+    isOptionalString(artifact, 'kind') &&
+    isOptionalString(artifact, 'storage') &&
+    isOptionalString(artifact, 'description') &&
+    isOptionalString(artifact, 'workspacePath') &&
+    isOptionalString(artifact, 'managedId') &&
+    isOptionalString(artifact, 'url') &&
+    isOptionalString(artifact, 'mimeType') &&
+    (artifact['sizeBytes'] === undefined ||
+      (typeof artifact['sizeBytes'] === 'number' &&
+        Number.isSafeInteger(artifact['sizeBytes']) &&
+        artifact['sizeBytes'] >= 0)) &&
+    (artifact['metadata'] === undefined ||
+      isToolArtifactMetadataLike(artifact['metadata']))
+  );
+}
+
+function isToolArtifactMetadataLike(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  return Object.values(value).every(
+    (item) =>
+      item === null ||
+      typeof item === 'string' ||
+      typeof item === 'boolean' ||
+      (typeof item === 'number' && Number.isFinite(item)),
+  );
+}
+
+function isOptionalString(
+  value: Record<string, unknown>,
+  key: string,
+): boolean {
+  return value[key] === undefined || typeof value[key] === 'string';
+}
+
+export const MAX_USER_PROMPT_EXPANSION_ADDITIONAL_CONTEXT_LENGTH = 10_000;
+
+export function sanitizeUserPromptExpansionAdditionalContext(
+  raw: string,
+): string {
+  return raw
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .slice(0, MAX_USER_PROMPT_EXPANSION_ADDITIONAL_CONTEXT_LENGTH)
+    .replace(/&(?:a(?:mp?)?|lt?|gt?)?$/, '');
 }
 
 /**
@@ -279,6 +377,10 @@ export function createHookOutput(
       return new PostToolUseHookOutput(data);
     case HookEventName.PostToolUseFailure:
       return new PostToolUseFailureHookOutput(data);
+    case HookEventName.UserPromptExpansion:
+      return new UserPromptExpansionHookOutput(data);
+    case HookEventName.PostToolBatch:
+      return new PostToolBatchHookOutput(data);
     case HookEventName.Stop:
     case HookEventName.SubagentStop:
       return new StopHookOutput(data);
@@ -290,6 +392,27 @@ export function createHookOutput(
 }
 
 /**
+ * Whether a hook's output is a blocking decision on this event: for PreToolUse
+ * the permission decision wins over the generic `decision` field. The HTTP
+ * runner and the progress reporting both use this one test, so they report
+ * such a decision the same way.
+ *
+ * It covers decisions only. Output that stops the turn with `continue: false`,
+ * or a PreToolUse `ask`, also keeps a tool call from proceeding but is not a
+ * blocking decision here, and the function runner applies its own test that
+ * counts `continue: false`. Reporting a stop is left to the progress display.
+ */
+export function isBlockingHookOutput(
+  eventName: string,
+  data: Partial<HookOutput>,
+): boolean {
+  const output = createHookOutput(eventName, data);
+  return output instanceof PreToolUseHookOutput
+    ? output.isDenied()
+    : output.isBlockingDecision();
+}
+
+/**
  * Default implementation of HookOutput with utility methods
  */
 export class DefaultHookOutput implements HookOutput {
@@ -297,6 +420,7 @@ export class DefaultHookOutput implements HookOutput {
   stopReason?: string;
   suppressOutput?: boolean;
   systemMessage?: string;
+  terminalSequence?: string;
   decision?: HookDecision;
   reason?: string;
   hookSpecificOutput?: Record<string, unknown>;
@@ -306,6 +430,7 @@ export class DefaultHookOutput implements HookOutput {
     this.stopReason = data.stopReason;
     this.suppressOutput = data.suppressOutput;
     this.systemMessage = data.systemMessage;
+    this.terminalSequence = data.terminalSequence;
     this.decision = data.decision;
     this.reason = data.reason;
     this.hookSpecificOutput = data.hookSpecificOutput;
@@ -332,23 +457,35 @@ export class DefaultHookOutput implements HookOutput {
     return this.stopReason || this.reason || 'No reason provided';
   }
 
-  /**
-   * Get sanitized additional context for adding to responses.
-   */
-  getAdditionalContext(): string | undefined {
+  protected getRawAdditionalContext(): string | undefined {
     if (
       this.hookSpecificOutput &&
       'additionalContext' in this.hookSpecificOutput
     ) {
       const context = this.hookSpecificOutput['additionalContext'];
-      if (typeof context !== 'string') {
-        return undefined;
-      }
+      return typeof context === 'string' ? context : undefined;
+    }
+    return undefined;
+  }
 
+  /**
+   * Get sanitized additional context for adding to responses.
+   */
+  getAdditionalContext(): string | undefined {
+    const context = this.getRawAdditionalContext();
+    if (context !== undefined) {
       // Sanitize by escaping < and > to prevent tag injection
       return context.replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
     return undefined;
+  }
+
+  getArtifacts(): ToolArtifact[] {
+    const artifacts = this.hookSpecificOutput?.['artifacts'];
+    if (!Array.isArray(artifacts)) {
+      return [];
+    }
+    return artifacts.filter(isToolArtifactLike);
   }
 
   /**
@@ -484,6 +621,31 @@ export class PostToolUseFailureHookOutput extends DefaultHookOutput {
 }
 
 /**
+ * Specific hook output class for UserPromptExpansion events.
+ */
+export class UserPromptExpansionHookOutput extends DefaultHookOutput {
+  override getAdditionalContext(): string | undefined {
+    const raw = this.getRawAdditionalContext();
+    if (raw === undefined) {
+      return undefined;
+    }
+    return sanitizeUserPromptExpansionAdditionalContext(raw);
+  }
+}
+
+/**
+ * Specific hook output class for PostToolBatch events.
+ */
+export class PostToolBatchHookOutput extends DefaultHookOutput {
+  /**
+   * Check if batch processing should stop after the resolved tool calls.
+   */
+  override shouldStopExecution(): boolean {
+    return super.shouldStopExecution() || this.isBlockingDecision();
+  }
+}
+
+/**
  * Specific hook output class for Stop events.
  */
 export class StopHookOutput extends DefaultHookOutput {
@@ -521,6 +683,23 @@ export interface PermissionRequestInput extends HookInput {
   tool_name: string;
   tool_input: Record<string, unknown>;
   permission_suggestions?: PermissionSuggestion[];
+}
+
+export type PermissionDeniedReason =
+  /** AUTO classifier evaluated the request and actively blocked it. */
+  | 'classifier_blocked'
+  /** AUTO classifier could not return a verdict, so AUTO mode denied it. */
+  | 'classifier_unavailable';
+
+/**
+ * Input for PermissionDenied hook events
+ */
+export interface PermissionDeniedInput extends HookInput {
+  tool_name: string;
+  tool_input: Record<string, unknown>;
+  tool_use_id: string;
+  tool_call_id?: string; // Original API call ID from the LLM provider (e.g., call_xxx for OpenAI/Qwen)
+  reason: PermissionDeniedReason;
 }
 
 /**
@@ -603,7 +782,8 @@ export interface PreToolUseInput extends HookInput {
   permission_mode: PermissionMode;
   tool_name: string;
   tool_input: Record<string, unknown>;
-  tool_use_id: string; // Unique identifier for this tool use instance
+  tool_use_id: string; // Unique identifier for this tool use instance (internal format, e.g., toolu_xxx)
+  tool_call_id?: string; // Original API call ID from the LLM provider (e.g., call_xxx for OpenAI/Qwen)
 }
 
 /**
@@ -625,7 +805,9 @@ export interface PostToolUseInput extends HookInput {
   tool_name: string;
   tool_input: Record<string, unknown>;
   tool_response: Record<string, unknown>;
-  tool_use_id: string; // Unique identifier for this tool use instance
+  tool_use_id: string; // Unique identifier for this tool use instance (internal format, e.g., toolu_xxx)
+  tool_call_id?: string; // Original API call ID from the LLM provider (e.g., call_xxx for OpenAI/Qwen)
+  duration_ms?: number; // Tool execution time in milliseconds, when execution started
 }
 
 /**
@@ -637,8 +819,8 @@ export interface PostToolUseOutput extends HookOutput {
   hookSpecificOutput?: {
     hookEventName: 'PostToolUse';
     additionalContext?: string;
+    artifacts?: ToolArtifact[];
   };
-  updatedMCPToolOutput?: Record<string, unknown>;
 }
 
 /**
@@ -647,11 +829,13 @@ export interface PostToolUseOutput extends HookOutput {
  */
 export interface PostToolUseFailureInput extends HookInput {
   permission_mode: PermissionMode;
-  tool_use_id: string; // Unique identifier for the tool use
+  tool_use_id: string; // Unique identifier for the tool use (internal format, e.g., toolu_xxx)
+  tool_call_id?: string; // Original API call ID from the LLM provider (e.g., call_xxx for OpenAI/Qwen)
   tool_name: string;
   tool_input: Record<string, unknown>;
   error: string; // Error message describing the failure
   is_interrupt?: boolean; // Whether the failure was caused by user interruption
+  duration_ms?: number; // Tool execution time in milliseconds, when execution started
 }
 
 /**
@@ -662,6 +846,44 @@ export interface PostToolUseFailureOutput extends HookOutput {
   hookSpecificOutput?: {
     hookEventName: 'PostToolUseFailure';
     additionalContext?: string;
+    artifacts?: ToolArtifact[];
+  };
+}
+
+/**
+ * Tool call summary for PostToolBatch hook input
+ */
+export interface PostToolBatchToolCall {
+  tool_name: string;
+  tool_input: Record<string, unknown>;
+  tool_use_id: string;
+  tool_call_id?: string; // Original API call ID from the LLM provider (e.g., call_xxx for OpenAI/Qwen)
+  status: 'success' | 'error' | 'cancelled';
+  /**
+   * Serialized ToolCallResponseInfo fields for the resolved call:
+   * response_parts, result_display, error, error_type, execution_status,
+   * content_length, and vision_bridge_notice when applicable.
+   */
+  tool_response?: Record<string, unknown>;
+}
+
+/**
+ * PostToolBatch hook input
+ * Fired once after all tool calls in a batch have resolved.
+ */
+export interface PostToolBatchInput extends HookInput {
+  permission_mode: PermissionMode;
+  tool_calls: PostToolBatchToolCall[];
+}
+
+/**
+ * PostToolBatch hook output
+ */
+export interface PostToolBatchOutput extends HookOutput {
+  hookSpecificOutput?: {
+    hookEventName: 'PostToolBatch';
+    additionalContext?: string;
+    artifacts?: ToolArtifact[];
   };
 }
 
@@ -670,6 +892,7 @@ export interface PostToolUseFailureOutput extends HookOutput {
  */
 export interface UserPromptSubmitInput extends HookInput {
   prompt: string;
+  submitted_prompt?: string;
 }
 
 /**
@@ -678,6 +901,28 @@ export interface UserPromptSubmitInput extends HookInput {
 export interface UserPromptSubmitOutput extends HookOutput {
   hookSpecificOutput?: {
     hookEventName: 'UserPromptSubmit';
+    additionalContext?: string;
+  };
+}
+
+/**
+ * UserPromptExpansion hook input
+ *
+ * Field names intentionally follow the JSON hook payload convention rather
+ * than TypeScript camelCase, matching UserPromptSubmit and other hook inputs.
+ */
+export interface UserPromptExpansionInput extends HookInput {
+  command_name: string;
+  command_args: string;
+  prompt: string;
+}
+
+/**
+ * UserPromptExpansion hook output
+ */
+export interface UserPromptExpansionOutput extends HookOutput {
+  hookSpecificOutput?: {
+    hookEventName: 'UserPromptExpansion';
     additionalContext?: string;
   };
 }
@@ -712,11 +957,46 @@ export interface NotificationOutput extends HookOutput {
 }
 
 /**
+ * Context usage data included in Stop hook stdin payload
+ */
+export interface ContextUsageData {
+  context_usage: number;
+  context_limit: number;
+  input_tokens: number;
+}
+
+/**
+ * Background task info for hook payloads
+ */
+export interface BackgroundTaskInfo {
+  id: string;
+  status: TaskStatus;
+  agent_type: string;
+  started_at: string;
+  description?: string;
+}
+
+/**
+ * Cron job info for hook payloads
+ */
+export interface CronJobInfo {
+  id: string;
+  schedule: string;
+  prompt: string;
+  recurring: boolean;
+  next_run?: string;
+  last_run?: string;
+  enabled: boolean;
+}
+
+/**
  * Stop hook input
  */
-export interface StopInput extends HookInput {
+export interface StopInput extends HookInput, Partial<ContextUsageData> {
   stop_hook_active: boolean;
   last_assistant_message: string;
+  background_tasks: BackgroundTaskInfo[];
+  crons: CronJobInfo[];
 }
 
 /**
@@ -726,6 +1006,35 @@ export interface StopOutput extends HookOutput {
   hookSpecificOutput?: {
     hookEventName: 'Stop';
     additionalContext?: string;
+  };
+}
+
+/**
+ * MessageDisplay hook input
+ *
+ * Fires repeatedly as the assistant's reply streams (before `Stop`, which fires
+ * once at the end of the turn). `message_id` is stable for the whole streamed
+ * message; `displayed_text` is CUMULATIVE (the full text so far, not a delta),
+ * so hook authors never need to reassemble chunks themselves. `is_final` is
+ * true on the last firing for this message, so a hook script knows to flush
+ * (e.g. speak the tail of a buffered reply) rather than wait for more text
+ * that will never arrive.
+ */
+export interface MessageDisplayInput extends HookInput {
+  message_id: string;
+  displayed_text: string;
+  is_final: boolean;
+}
+
+/**
+ * MessageDisplay hook output
+ *
+ * Fire-and-forget, no control effects (no blocking/permission semantics) —
+ * purely observational, like `Notification`/`PostCompact`.
+ */
+export interface MessageDisplayOutput extends HookOutput {
+  hookSpecificOutput?: {
+    hookEventName: 'MessageDisplay';
   };
 }
 
@@ -794,6 +1103,13 @@ export interface SessionEndOutput extends HookOutput {
     hookEventName: 'SessionEnd';
     additionalContext?: string;
   };
+}
+
+/**
+ * SessionDelete hook input
+ */
+export interface SessionDeleteInput extends HookInput {
+  deleted_session_id: string;
 }
 
 /**
@@ -890,6 +1206,8 @@ export interface SubagentStopInput extends HookInput {
   agent_type: AgentType | string;
   agent_transcript_path: string;
   last_assistant_message: string;
+  background_tasks: BackgroundTaskInfo[];
+  crons: CronJobInfo[];
 }
 
 /**
@@ -905,7 +1223,7 @@ export interface SubagentStopOutput extends HookOutput {
 
 /**
  * StopFailure error types
- * Fires instead of Stop when an API error ended the turn
+ * Fires instead of Stop when an API error or loop detection ended the turn
  */
 export type StopFailureErrorType =
   | 'rate_limit'
@@ -914,6 +1232,7 @@ export type StopFailureErrorType =
   | 'invalid_request'
   | 'server_error'
   | 'max_output_tokens'
+  | 'loop_detected'
   | 'unknown';
 
 /**
@@ -993,6 +1312,7 @@ export interface TodoItem {
   id: string;
   content: string;
   status: TodoStatus;
+  blockedBy?: string[];
 }
 
 /**
