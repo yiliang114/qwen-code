@@ -23,61 +23,89 @@ const outDir = path.resolve(
 
 // Resolve an entry point, preferring .ts when present (fallback to .js)
 function resolveEntry(relativePathWithoutExt) {
-  const tsPath = path.join(projectRoot, `${relativePathWithoutExt}.ts`);
-  if (fs.existsSync(tsPath)) {
-    return tsPath;
+  for (const extension of ['.ts', '.tsx', '.js']) {
+    const candidate = path.join(
+      projectRoot,
+      `${relativePathWithoutExt}${extension}`,
+    );
+    if (fs.existsSync(candidate)) return candidate;
   }
-  return path.join(projectRoot, `${relativePathWithoutExt}.js`);
+  throw new Error(`Missing entry point: ${relativePathWithoutExt}`);
 }
 
-const builds = [
-  {
-    entryPoints: [resolveEntry('src/background/service-worker')],
-  },
-  {
-    entryPoints: [resolveEntry('src/sidepanel/capability-status')],
-    globalName: 'QwenCapabilityStatus',
-  },
+const entryPoints = [
+  resolveEntry('src/background/service-worker'),
+  resolveEntry('src/sidepanel'),
 ];
 
 async function build() {
-  const contexts = await Promise.all(
-    builds.map((buildOptions) =>
-      esbuild.context({
-        ...buildOptions,
-        bundle: true,
-        platform: 'browser',
-        format: 'iife',
-        target: ['chrome115'],
-        minify: isProduction,
-        sourcemap: !isProduction,
-        metafile: !isWatch,
-        outdir: outDir,
-        outbase: path.join(projectRoot, 'src'),
-        logLevel: 'info',
-      }),
-    ),
-  );
+  const ctx = await esbuild.context({
+    entryPoints,
+    bundle: true,
+    platform: 'browser',
+    format: 'iife',
+    target: ['chrome115'],
+    minify: isProduction,
+    sourcemap: !isProduction,
+    metafile: !isWatch,
+    conditions: ['style'],
+    define: {
+      'import.meta.env.DEV': 'false',
+    },
+    alias: {
+      '@': path.resolve(projectRoot, '../web-shell/client'),
+      '@qwen-code/acp-bridge/channelControlTimeouts': path.resolve(
+        projectRoot,
+        '../acp-bridge/src/channel-control-timeouts.ts',
+      ),
+      '@qwen-code/acp-bridge/daemonEventTypes': path.resolve(
+        projectRoot,
+        '../acp-bridge/src/daemonEventTypes.ts',
+      ),
+      '@qwen-code/acp-bridge/mcpTimeouts': path.resolve(
+        projectRoot,
+        '../acp-bridge/src/mcpTimeouts.ts',
+      ),
+      '@qwen-code/sdk/daemon': path.resolve(
+        projectRoot,
+        '../sdk-typescript/src/daemon/index.ts',
+      ),
+      '@qwen-code/web-shell/daemon-react-sdk': path.resolve(
+        projectRoot,
+        '../web-shell/client/daemon-react-sdk.ts',
+      ),
+      '@qwen-code/web-shell': path.resolve(
+        projectRoot,
+        '../web-shell/client/index.tsx',
+      ),
+    },
+    loader: {
+      '.gif': 'file',
+      '.jpeg': 'file',
+      '.jpg': 'file',
+      '.png': 'file',
+      '.svg': 'file',
+      '.ttf': 'file',
+      '.woff': 'file',
+      '.woff2': 'file',
+    },
+    outdir: path.join(projectRoot, outDir),
+    outbase: path.join(projectRoot, 'src'),
+    logLevel: 'info',
+  });
 
   if (isWatch) {
-    console.log('Watching background/content scripts...');
-    await Promise.all(contexts.map((ctx) => ctx.watch()));
+    console.log('Watching extension scripts...');
+    await ctx.watch();
   } else {
-    const results = await Promise.all(contexts.map((ctx) => ctx.rebuild()));
-    const metafile = results.reduce(
-      (combined, result) => ({
-        inputs: { ...combined.inputs, ...result.metafile.inputs },
-        outputs: { ...combined.outputs, ...result.metafile.outputs },
-      }),
-      { inputs: {}, outputs: {} },
-    );
-    // Lands next to the output directory root (dist/esbuild.json by default)
-    // so artifact-scan.js resolves the same path, including overrides.
-    const metafilePath = path.join(path.dirname(outDir), 'esbuild.json');
-    fs.mkdirSync(path.dirname(metafilePath), { recursive: true });
-    fs.writeFileSync(metafilePath, JSON.stringify(metafile, null, 2));
-    await Promise.all(contexts.map((ctx) => ctx.dispose()));
-    console.log('Background/content build complete!');
+    const result = await ctx.rebuild();
+    if (result.metafile) {
+      const metafilePath = path.join(projectRoot, 'dist/esbuild.json');
+      fs.mkdirSync(path.dirname(metafilePath), { recursive: true });
+      fs.writeFileSync(metafilePath, JSON.stringify(result.metafile, null, 2));
+    }
+    await ctx.dispose();
+    console.log('Extension script build complete!');
   }
 }
 

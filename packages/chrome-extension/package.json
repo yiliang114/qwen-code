@@ -1,7 +1,7 @@
 {
   "name": "@qwen-code/chrome-bridge",
   "version": "0.24.0",
-  "description": "Chrome extension bridge for Qwen CLI - enables AI-powered browser interactions",
+  "description": "Standalone Qwen browser agent",
   "private": true,
   "repository": {
     "type": "git",
@@ -39,6 +39,13 @@
     "package": "npm run build && node scripts/package-extension.js",
     "clean": "./scripts/clean.sh",
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@qwen-code/sdk": "file:../sdk-typescript",
+    "@qwen-code/web-shell": "file:../web-shell",
+    "lucide-react": "^1.24.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.0.0"
   },
   "engines": {
     "node": ">=22.0.0"

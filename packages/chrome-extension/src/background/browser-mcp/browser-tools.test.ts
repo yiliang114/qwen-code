@@ -48,6 +48,14 @@ class FakeSession implements DebuggerSession {
         return { result: { value: true } };
       }
       if (
+        method === 'Runtime.evaluate' &&
+        String(params?.['expression']).includes('document.activeElement')
+      ) {
+        return {
+          result: { value: { role: 'textbox', name: 'Search' } },
+        };
+      }
+      if (
         this.autoNavigate &&
         (method === 'Page.navigate' ||
           method === 'Page.reload' ||
@@ -132,6 +140,72 @@ describe('BrowserTools', () => {
         'list_network_requests',
         'get_network_request',
       ]),
+    );
+  });
+
+  it('does not enable diagnostic collection when disabled', async () => {
+    tools = new BrowserTools(session, false);
+
+    await tools.callTool('take_snapshot', {});
+
+    expect(session.send).not.toHaveBeenCalledWith('Log.enable');
+    expect(session.send).not.toHaveBeenCalledWith(
+      'Network.enable',
+      expect.anything(),
+    );
+  });
+
+  it('approves and executes an action against the same pinned tab', async () => {
+    const approve = vi.fn(
+      (name: string, _args: Record<string, unknown>, _tab: chrome.tabs.Tab) =>
+        name !== 'click',
+    );
+    tools = new BrowserTools(session, false, approve);
+    await tools.callTool('take_snapshot', {});
+
+    const result = await tools.callTool('click', { ref: 'e1' });
+
+    expect(resultText(result)).toBe('User denied this browser action.');
+    expect(approve).toHaveBeenLastCalledWith(
+      'click',
+      { ref: 'e1', target: 'button "Submit"' },
+      expect.objectContaining({ id: 1, url: 'https://example.test' }),
+    );
+    expect(session.send).not.toHaveBeenCalledWith(
+      'Input.dispatchMouseEvent',
+      expect.anything(),
+    );
+  });
+
+  it('rejects an action when the pinned tab navigates during approval', async () => {
+    const tab = await session.getTab();
+    vi.spyOn(session, 'getTab')
+      .mockResolvedValueOnce(tab)
+      .mockResolvedValueOnce({ ...tab, url: 'https://other.example' });
+    tools = new BrowserTools(session, false, () => true);
+
+    const result = await tools.callTool('scroll_page', { y: 100 });
+
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('page changed');
+    expect(session.send).not.toHaveBeenCalledWith(
+      'Runtime.evaluate',
+      expect.objectContaining({
+        expression: expect.stringContaining('window.scrollBy'),
+      }),
+    );
+  });
+
+  it('includes the focused control in keyboard approvals', async () => {
+    const approve = vi.fn(() => false);
+    tools = new BrowserTools(session, false, approve);
+
+    await tools.callTool('press_key', { key: 'Enter' });
+
+    expect(approve).toHaveBeenCalledWith(
+      'press_key',
+      { key: 'Enter', target: 'textbox "Search"' },
+      expect.objectContaining({ id: 1 }),
     );
   });
 

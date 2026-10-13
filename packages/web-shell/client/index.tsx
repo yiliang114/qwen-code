@@ -3,6 +3,7 @@ import {
   DaemonWorkspaceProvider,
   type DaemonProductSessionContext,
 } from '@qwen-code/web-shell/daemon-react-sdk';
+import type { DaemonTransport } from '@qwen-code/sdk/daemon';
 import { App, type WebShellProps } from './App';
 import {
   BrowserTurnNotifications,
@@ -39,6 +40,8 @@ export interface WebShellWithProvidersProps extends WebShellProps {
   lockWorkspaceCwd?: string;
   /** Client identity to reuse when attaching to an externally created session. */
   clientId?: string;
+  /** Optional in-process transport for hosts that do not use qwen serve. */
+  transport?: DaemonTransport;
   /**
    * Restart a live SSE event stream after each accepted prompt. Disabled by
    * default. A stream that is already down is always rebuilt immediately on
@@ -112,13 +115,18 @@ export function WebShellWithProviders(props: WebShellWithProvidersProps) {
     sessionContext,
     lockWorkspaceCwd,
     clientId,
+    transport,
     restartSseOnPrompt,
     historyPageSize,
     ...webShellProps
   } = props;
   const resolvedBaseUrl = resolveBaseUrl(baseUrl);
   const shell = (
-    <DaemonWorkspaceProvider baseUrl={resolvedBaseUrl} token={token}>
+    <DaemonWorkspaceProvider
+      baseUrl={resolvedBaseUrl}
+      token={token}
+      transport={transport}
+    >
       <WorkspaceSessionProvider
         sessionId={sessionId}
         workspaceId={workspaceId}
