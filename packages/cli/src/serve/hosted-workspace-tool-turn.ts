@@ -4456,9 +4456,15 @@ export class HostedWorkspaceToolTurn {
       }
       const activeRenewal = renewInFlight as Promise<void> | null;
       await activeRenewal?.catch(() => undefined);
-      await Promise.allSettled(
-        [...reserved.values()].map((id) => this.broker.cancel(id)),
+      const cancellationBarriers = new Set<string>();
+      const reservedIds = [...reserved.values()];
+      const cancellationResults = await Promise.allSettled(
+        reservedIds.map((id) => this.broker.cancel(id)),
       );
+      cancellationResults.forEach((result, index) => {
+        if (result.status === 'fulfilled')
+          cancellationBarriers.add(reservedIds[index]!);
+      });
       const probeBindings: Array<{
         readonly executionCallId: string;
         readonly request: (typeof requests)[number] | undefined;
@@ -4534,7 +4540,11 @@ export class HostedWorkspaceToolTurn {
           await settleNeverStarted(executionCallId, request, false);
           continue;
         }
-        if (grantOwnerState === undefined && request?.background === true)
+        if (
+          grantOwnerState === undefined &&
+          request?.background === true &&
+          cancellationBarriers.has(executionCallId)
+        )
           probeBindings.push({ executionCallId, request });
       }
       const probeResults = await Promise.all(
