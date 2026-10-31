@@ -49,9 +49,11 @@ job 级 `env` 读不到 `runner` 上下文（GitHub 会拒绝整个 workflow 文
 - **包缓存是冷的。** npm 与 pnpm store 落在 per-run HOME 下，每次运行都要从
   registry 安装；yamllint 每次重新 pip 到 `$HOME/.local`。实测冷装约 900 s，
   90/45 的时限本来就是按这个口径定的。内容可校验的缓存保持共享温热：
-  `XDG_CACHE_HOME`（lint.js 对 linter 归档做 SHA-256 校验）与 `COREPACK_HOME`
-  （corepack 校验 `packageManager` 的 sha512）指向
-  `${RUNNER_TOOL_CACHE}/qwen-ci-cache`，共享它们不会重新打开投毒通道。
+  `XDG_CACHE_HOME`（lint.js 对 linter 归档做 SHA-256 校验）保持共享温热，指向
+  `${RUNNER_TOOL_CACHE}/qwen-ci-cache`。`COREPACK_HOME` 放在 per-run HOME 内：
+  Corepack 在缓存命中时**不会**重验 `packageManager` 的 SHA-512（v0.34.6
+  corepackUtils.ts:207-231），共享缓存会让前一个 fork job 投毒 pnpm 后让下一个
+  可信 job 执行被污染的入口。
 - **`$GITHUB_WORKSPACE` 仍然共享。** 检出前的 "Restore workspace ownership" 与
   检出本身只能减轻、不能消除同机并行 job 留下的残留。该车道唯一的凭证是只读
   `GITHUB_TOKEN`（`contents: read`、`pull-requests: read`），绑定在 freshness、

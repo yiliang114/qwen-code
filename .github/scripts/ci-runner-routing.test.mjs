@@ -495,13 +495,20 @@ describe('ci.yml lint HOME isolation', () => {
           run.includes('GITHUB_ENV'),
         `${id} must publish HOME/USERPROFILE via GITHUB_ENV`,
       );
-      // Content-verified caches (linter archives, corepack) stay shared and
-      // warm outside the per-job HOME; dropping either reds this.
+      // XDG_CACHE_HOME points at the shared tool cache (lint.js SHA-256-
+      // checks linter archives). COREPACK_HOME stays inside the per-job HOME:
+      // Corepack does not re-verify packageManager's SHA-512 on cache hits,
+      // so a shared cache would expose the next job to a prior fork poison
+      // (corepackUtils.ts:207-231 in v0.34.6).
       assert.ok(
         run.includes('XDG_CACHE_HOME=') &&
-          run.includes('COREPACK_HOME=') &&
           run.includes('RUNNER_TOOL_CACHE'),
         `${id} must re-point verified caches at the shared tool cache`,
+      );
+      assert.ok(
+        run.includes('COREPACK_HOME=') &&
+          !run.includes('COREPACK_HOME=${RUNNER_TOOL_CACHE}'),
+        `${id} must isolate COREPACK_HOME in the per-job HOME`,
       );
     }
   });
