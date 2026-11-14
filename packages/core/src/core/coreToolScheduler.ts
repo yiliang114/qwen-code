@@ -250,10 +250,7 @@ import {
   getInvocationContext,
   runWithInvocationContext,
 } from '../utils/invocation-context.js';
-import {
-  evaluateToolInvocationGuard,
-  type ToolInvocationGuard,
-} from './tool-invocation-guard.js';
+import { evaluateToolInvocationGuard } from './tool-invocation-guard.js';
 import { goalTurnContext } from '../goals/goal-turn-context.js';
 import {
   codeModeToolResultStamp,
@@ -1627,12 +1624,6 @@ interface CoreToolSchedulerOptions {
    * `awaiting_approval`.
    */
   readOnlyRefusalMessage?: string;
-  /**
-   * Host-supplied invocation guard evaluated after `buildInvocation` for
-   * non-trusted tools; a denial settles the call as `EXECUTION_DENIED`
-   * (`not_started`) before permissions or execution.
-   */
-  invocationGuard?: ToolInvocationGuard;
   /** The terminal sequence a permission prompt's Notification hook returned. */
   onPermissionPromptTerminalSequence?: (terminalSequence: string) => void;
 }
@@ -3741,51 +3732,6 @@ export class CoreToolScheduler {
           }
           resolvedInvocation = invocationOrError;
 
-          const isTrustedTool =
-            isTrustedEagerTool ||
-            this.schedulerOptions.isTrustedTool?.(toolInstance) === true;
-          if (!isTrustedTool && this.schedulerOptions.invocationGuard) {
-            const invocationContext = getInvocationContext();
-            const builtParams = resolvedInvocation.params;
-            const guardArgs =
-              builtParams &&
-              typeof builtParams === 'object' &&
-              Object.keys(builtParams).length > 0
-                ? (builtParams as Record<string, unknown>)
-                : (policyGate.args as Record<string, unknown>);
-            const guardDecision = await runInRequestGoalContext(reqInfo, () =>
-              evaluateToolInvocationGuard(
-                this.schedulerOptions.invocationGuard!,
-                {
-                  callId: reqInfo.callId,
-                  toolName: canonicalName,
-                  args: guardArgs,
-                  signal,
-                  permissionChecked: false,
-                  sessionId: this.config.getSessionId(),
-                  cwd: this.config.getTargetDir(),
-                  ...(invocationContext ? { invocationContext } : {}),
-                },
-              ),
-            );
-            if (recordPrevalidationCancellation()) continue;
-            if (!guardDecision.allowed) {
-              newToolCalls.push({
-                status: 'error',
-                request: reqInfo,
-                tool: toolInstance,
-                response: createErrorResponse(
-                  reqInfo,
-                  new Error(guardDecision.reason),
-                  ToolErrorType.EXECUTION_DENIED,
-                  'not_started',
-                ),
-                durationMs: 0,
-              });
-              continue;
-            }
-          }
-
           // Reset all validation retry counters for this tool since it passed validation
           this.clearRetryCountsForTool(reqInfo.name);
 
@@ -3844,7 +3790,7 @@ export class CoreToolScheduler {
       this.postToolBatchSpanCallId = undefined;
       try {
         this.postToolBatchEnabledForBatch =
-          !this.config.getDisableAllHooks?.() &&
+          !this.config.getDisableAllHooks() &&
           (this.config.hasHooksForEvent?.('PostToolBatch') ?? false);
         if (this.postToolBatchEnabledForBatch) {
           this.postToolBatchSpanCallId = postToolBatchParentCallId;
@@ -4276,7 +4222,7 @@ export class CoreToolScheduler {
               actionFingerprint,
             );
             if (
-              !this.config.getDisableAllHooks?.() &&
+              !this.config.getDisableAllHooks() &&
               shouldFirePermissionDeniedForAutoMode(decision, outcome)
             ) {
               try {
@@ -4415,17 +4361,9 @@ export class CoreToolScheduler {
             );
             this.setStatusInternal(reqInfo.callId, 'scheduled');
           } else {
-            confirmationDetails =
-              typeof invocation.getConfirmationDetails === 'function'
-                ? await runInRequestGoalContext(reqInfo, () =>
-                    invocation.getConfirmationDetails(signal),
-                  )
-                : {
-                    type: 'info',
-                    title: reqInfo.name,
-                    prompt: reqInfo.name,
-                    onConfirm: async () => {},
-                  };
+            confirmationDetails = await runInRequestGoalContext(reqInfo, () =>
+              invocation.getConfirmationDetails(signal),
+            );
             if (
               this.cancelPreExecutionIfAborted(reqInfo.callId, signal, toolSpan)
             ) {
@@ -4607,10 +4545,10 @@ export class CoreToolScheduler {
             // Fire PermissionRequest hook before showing the permission dialog.
             // Hooks run before the background-agent auto-deny so they can
             // override the denial with policy-based decisions.
-            const messageBus = this.config.getMessageBus?.() as
+            const messageBus = this.config.getMessageBus() as
               | MessageBus
               | undefined;
-            const hooksEnabled = !this.config.getDisableAllHooks?.();
+            const hooksEnabled = !this.config.getDisableAllHooks();
 
             const permissionRequestGrant = permissionRequestGrants.has(
               reqInfo.callId,
@@ -5872,8 +5810,8 @@ export class CoreToolScheduler {
     batchState: BatchAbortState,
     signal: AbortSignal,
   ): Promise<ToolCall | undefined> {
-    const messageBus = this.config.getMessageBus?.() as MessageBus | undefined;
-    if (this.config.getDisableAllHooks?.() || !messageBus) return undefined;
+    const messageBus = this.config.getMessageBus() as MessageBus | undefined;
+    if (this.config.getDisableAllHooks() || !messageBus) return undefined;
     const { callId } = reqInfo;
     const canonicalName = canonicalToolName(reqInfo.name);
     // Hooks see actual filesystem paths, as tool validation does; the tool
@@ -6113,8 +6051,8 @@ export class CoreToolScheduler {
     const toolUseId = this.preToolUseIds.get(callId) ?? generateToolUseId();
 
     // Get MessageBus for hook execution
-    const messageBus = this.config.getMessageBus?.() as MessageBus | undefined;
-    const hooksEnabled = !this.config.getDisableAllHooks?.();
+    const messageBus = this.config.getMessageBus() as MessageBus | undefined;
+    const hooksEnabled = !this.config.getDisableAllHooks();
     let producerObserved = false;
     const observeSyntheticProducer = (
       response: CoreToolCallResponseInfo,
@@ -7993,7 +7931,7 @@ export class CoreToolScheduler {
       let messageBus: MessageBus | undefined;
       try {
         messageBus = this.postToolBatchEnabledForBatch
-          ? this.config.getMessageBus?.()
+          ? this.config.getMessageBus()
           : undefined;
       } catch (error) {
         debugLogger.warn(
@@ -8589,7 +8527,7 @@ export class CoreToolScheduler {
             actionFingerprint,
           );
           if (
-            !this.config.getDisableAllHooks?.() &&
+            !this.config.getDisableAllHooks() &&
             shouldFirePermissionDeniedForAutoMode(decision, outcome)
           ) {
             try {

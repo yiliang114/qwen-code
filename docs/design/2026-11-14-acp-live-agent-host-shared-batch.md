@@ -44,32 +44,32 @@ An `AcpToolBatchHost` input (`isTrustedLiveTool`, forwarded to
 `CoreToolSchedulerOptions.isTrustedTool`) carries the session's three trusted
 live tool instances (by identity, not name). Inside `CoreToolScheduler`, a
 trusted tool instance bypasses the L1 `PermissionManager.isToolEnabled` /
-legacy deny check, the Agent Host `invocationGuard`, and the L3→L4
-`evaluatePermissionFlow` check so it schedules directly without interactive
-approval. Their execution channel is the session's daemon `extMethod`,
+legacy deny check and the L3→L4 `evaluatePermissionFlow` check so it schedules
+directly without interactive approval. Their execution channel is the
+session's daemon `extMethod`,
 already constrained by lifecycle (`setLiveConversationActive`), so no
 genuine approval prompt can come from the model calling them. The trust is by
 tool-instance reference, so a same-named MCP tool or ordinary tool in the
 same live session still goes through the normal permission flow.
 
-### Agent Host read-only and invocation guard
+### Agent Host read-only behavior
 
-Two host behaviors, still scoped to `sourceType === 'agent-host'` and
-forwarded through `AcpToolBatchHost` to `CoreToolSchedulerOptions`:
+Workspace confinement and read-only tool policy stay on the session `Config`:
+its `getToolInvocationGuard()` (`createAgentHostToolInvocationGuard`) is
+evaluated by `CoreToolScheduler` at the execution boundary, so an
+out-of-workspace or disallowed call settles as `EXECUTION_DENIED`
+(`not_started`) with the guard's reason. The batch does not build or forward a
+second guard.
 
-1. `invocationGuard` (`createAgentHostToolInvocationGuard`) is evaluated
-   right after `buildInvocation` succeeds for non-trusted tools. A call that
-   violates workspace confinement or read-only tool policy settles immediately
-   as `EXECUTION_DENIED` (`not_started`) with the guard's reason before
-   permissions or execution.
-2. `readOnlyRefusalMessage` is checked only when a call actually reaches the
-   interactive approval gate (right before `awaiting_approval`, after
-   auto-allowed read checks and permission hooks). Auto-allowed in-workspace
-   read tools (`read_file`, `ls`, `grep`, `glob`) execute normally; any call
-   that still requires interactive approval settles as `EXECUTION_DENIED`
-   (`not_started`) with `Tool "<name>" requires approval, which is unavailable
-on this read-only Agent Host.` without emitting `session/request_permission`
-   or aborting the rest of the turn.
+`readOnlyRefusalMessage` is the one host behavior forwarded through
+`AcpToolBatchHost` to `CoreToolSchedulerOptions`, and it is checked only when
+a call actually reaches the interactive approval gate (right before
+`awaiting_approval`, after auto-allowed read checks and permission hooks).
+Auto-allowed in-workspace read tools (`read_file`, `ls`, `grep`, `glob`)
+execute normally; any call that still requires interactive approval settles as
+`EXECUTION_DENIED` (`not_started`) with `Tool "<name>" requires approval, which
+is unavailable on this read-only Agent Host.` without emitting
+`session/request_permission` or aborting the rest of the turn.
 
 ### Removing the flag
 
@@ -98,12 +98,13 @@ suites with end-to-end shared-batch integration scenarios:
      the ordinary tool still requests ACP permission.
   2. A read-only Agent Host session in `ApprovalMode.DEFAULT` that runs an
      auto-allowed in-workspace `list_directory` call, denies an
-     out-of-workspace `read_file` via `invocationGuard`, and refuses an
+     out-of-workspace `read_file` through the session Config's
+     `getToolInvocationGuard`, and refuses an
      approval-needing in-workspace `read_file` via `readOnlyRefusalMessage`
      with zero `requestPermission` calls before continuing to the next model
      round.
 - `acp-tool-batch.test.ts` verifies that `runAcpToolBatch` forwards
-  `isTrustedLiveTool`, `readOnlyRefusalMessage`, and `invocationGuard` to
+  `isTrustedLiveTool` and `readOnlyRefusalMessage` to
   `createSchedulerExecutor`.
 
 ## Risks and boundaries
@@ -118,9 +119,9 @@ suites with end-to-end shared-batch integration scenarios:
   result-aware exemption starts in core's duplicate recording). If a genuine
   regression shows, the live task tool identities are recorded by name in the
   batch's duplicate handling rather than broadening core's exemptions.
-- **Agent Host glob/grep.** `invocationGuard` evaluates built invocation
-  parameters after `buildInvocation`, so out-of-workspace paths in `read_file`,
-  `glob`, `grep`, and `ls` are denied before permission or execution.
+- **Agent Host glob/grep.** The session `Config.getToolInvocationGuard()` is
+  applied by `CoreToolScheduler` at the execution boundary, so out-of-workspace
+  paths in `read_file`, `glob`, `grep`, and `ls` are denied before execution.
 - **#17181 dependency.** The branch bases on #17181's `SharedLoopRound`
   handoff shape and merges cleanly with `main`.
 
@@ -131,5 +132,5 @@ suites with end-to-end shared-batch integration scenarios:
 - Live-tool sessions and Agent Host sessions both take the shared batch, with
   shared-batch integration scenarios covering trusted live-tool execution,
   ordinary-tool permission prompts, auto-allowed Agent Host reads,
-  out-of-workspace `invocationGuard` denials, and approval-needing read-only
-  refusals with zero outbound `requestPermission` calls.
+  out-of-workspace `getToolInvocationGuard()` denials, and approval-needing
+  read-only refusals with zero outbound `requestPermission` calls.

@@ -19,7 +19,6 @@ import {
   canonicalToolName,
   ToolNames,
 } from '@qwen-code/qwen-code-core/tools/tool-names.js';
-import type { ToolInvocationGuard } from '@qwen-code/qwen-code-core/core/tool-invocation-guard.js';
 import { enforceFunctionResponseBudget } from '@qwen-code/qwen-code-core/tools/tool-response-finalizer.js';
 import {
   isShellProgressData,
@@ -81,11 +80,6 @@ export interface AcpToolBatchHost {
    * leaves the session. Omit for ordinary sessions.
    */
   readonly readOnlyRefusalMessage?: string;
-  /**
-   * Evaluated at the batch's execution boundary after build, before execute;
-   * a denial becomes `not_started`. Omit for ordinary sessions.
-   */
-  readonly invocationGuard?: ToolInvocationGuard;
   sendUpdate(update: SessionUpdate): Promise<void>;
   /** `session/request_permission`, one at a time. */
   requestPermission(
@@ -571,9 +565,6 @@ export async function runAcpToolBatch(
         }),
         ...(host.readOnlyRefusalMessage !== undefined && {
           readOnlyRefusalMessage: host.readOnlyRefusalMessage,
-        }),
-        ...(host.invocationGuard && {
-          invocationGuard: host.invocationGuard,
         }),
         onPermissionPromptTerminalSequence: (sequence) => {
           if (!closed) host.sendTerminalSequence(sequence);

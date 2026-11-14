@@ -36,7 +36,6 @@ type SchedulerOptions = {
   ) => void;
   isTrustedTool?: (tool: unknown) => boolean;
   readOnlyRefusalMessage?: string;
-  invocationGuard?: unknown;
 };
 
 const batch = vi.hoisted(() => ({
@@ -737,9 +736,8 @@ describe('runAcpToolBatch', () => {
     ]);
   });
 
-  it('forwards live-tool trust, read-only refusal, and invocationGuard to the scheduler', async () => {
+  it('forwards live-tool trust and read-only refusal to the scheduler', async () => {
     const trustedTool = { name: 'capture_screen_context' };
-    const guard = vi.fn().mockReturnValue({ allowed: true as const });
     batch.run = async () => ({ parts: [] });
 
     await runAcpToolBatch(
@@ -747,7 +745,6 @@ describe('runAcpToolBatch', () => {
         ...host,
         isTrustedLiveTool: (tool) => tool === trustedTool,
         readOnlyRefusalMessage: 'read-only host refusal for __name__',
-        invocationGuard: guard,
       },
       {
         requests: [read],
@@ -762,6 +759,5 @@ describe('runAcpToolBatch', () => {
     expect(batch.options.readOnlyRefusalMessage).toBe(
       'read-only host refusal for __name__',
     );
-    expect(batch.options.invocationGuard).toBe(guard);
   });
 });

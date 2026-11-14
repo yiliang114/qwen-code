@@ -15788,17 +15788,6 @@ export class Session implements SessionContext {
         this.config.getSessionSourceType?.() === 'agent-host'
           ? 'Tool "__name__" requires approval, which is unavailable on this read-only Agent Host.'
           : undefined,
-      invocationGuard:
-        this.config.getSessionSourceType?.() === 'agent-host'
-          ? createAgentHostToolInvocationGuard(
-              undefined,
-              this.config.getTargetDir(),
-              (candidate) =>
-                this.config
-                  .getWorkspaceContext()
-                  .isPathWithinWorkspace(candidate),
-            )
-          : undefined,
       sendUpdate: (update) => this.sendUpdate(update),
       requestPermission: (params, signal) =>
         this.#requestPermissionQueued(params, signal),

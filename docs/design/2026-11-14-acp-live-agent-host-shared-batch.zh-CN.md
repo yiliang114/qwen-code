@@ -38,27 +38,28 @@
 `AcpToolBatchHost` 的 `isTrustedLiveTool` 输入（转发至
 `CoreToolSchedulerOptions.isTrustedTool`）按实例身份（而非工具名）识别会话的
 三个可信 live 工具实例。在 `CoreToolScheduler` 内，受信任的工具实例直接跳过
-L1 `PermissionManager.isToolEnabled` / 旧版拒绝列表检查、Agent Host
-`invocationGuard` 以及 L3→L4 `evaluatePermissionFlow` 权限评估，无需交互式审批
+L1 `PermissionManager.isToolEnabled` / 旧版拒绝列表检查以及 L3→L4
+`evaluatePermissionFlow` 权限评估，无需交互式审批
 即可直接调度执行。它们的执行通道是会话的 daemon `extMethod`，已由
 `setLiveConversationActive` 生命周期约束，因此模型调用它们时不会产生审批请求。
 信任按工具实例引用相等判定，同一 live 会话中的普通工具或同名 MCP 工具仍走正常
 ACP 权限流程。
 
-### Agent Host 的只读与调用围栏
+### Agent Host 的只读行为
 
-两个宿主行为仍限定于 `sourceType === 'agent-host'`，经 `AcpToolBatchHost`
-转发给 `CoreToolSchedulerOptions`：
+工作区路径围栏与只读工具策略仍由会话 `Config` 提供：其
+`getToolInvocationGuard()`（`createAgentHostToolInvocationGuard`）由
+`CoreToolScheduler` 在执行边界评估，违反工作区围栏或只读策略的调用以
+`EXECUTION_DENIED`（`not_started`）及围栏拒绝原因结算。批不再另建或转发第二份
+围栏。
 
-1. `invocationGuard`（`createAgentHostToolInvocationGuard`）在非受信任工具的
-   `buildInvocation` 成功后立即评估。违反工作区路径围栏或只读策略的调用在权限
-   检查和执行前直接以 `EXECUTION_DENIED`（`not_started`）及围栏拒绝原因结算。
-2. `readOnlyRefusalMessage` 仅在调用真正到达交互式审批关口时（`awaiting_approval`
-   之前、自动放行的只读检查与权限 hook 之后）触发。工作区内自动放行的只读工具
-   （`read_file`、`ls`、`grep`、`glob`）正常执行；任何仍需交互审批的调用以
-   `EXECUTION_DENIED`（`not_started`）和消息
-   `Tool "<name>" requires approval, which is unavailable on this read-only Agent Host.`
-   拒绝，不发送 `session/request_permission`，也不中止整轮对话。
+`readOnlyRefusalMessage` 是唯一经 `AcpToolBatchHost` 转发给
+`CoreToolSchedulerOptions` 的宿主行为，仅在调用真正到达交互式审批关口时
+（`awaiting_approval` 之前、自动放行的只读检查与权限 hook 之后）触发。工作区内
+自动放行的只读工具（`read_file`、`ls`、`grep`、`glob`）正常执行；任何仍需交互
+审批的调用以 `EXECUTION_DENIED`（`not_started`）和消息
+`Tool "<name>" requires approval, which is unavailable on this read-only Agent Host.`
+拒绝，不发送 `session/request_permission`，也不中止整轮对话。
 
 ### 去掉 flag
 
@@ -80,11 +81,12 @@ loop guards、todo reminder 和结果感知去重对每个 ACP 轮次生效。
      普通 `read_file` 工具，验证可信 live 工具跳过 `isToolEnabled` 与
      `requestPermission` 直接执行，而同一会话中的普通工具仍发出 ACP 权限请求。
   2. 只读 Agent Host 会话在 `ApprovalMode.DEFAULT` 下运行工作区内自动放行的
-     `list_directory`、由 `invocationGuard` 拦截工作区外的 `read_file`，以及由
+     `list_directory`、由会话 Config 的 `getToolInvocationGuard()` 拦截工作区外的
+     `read_file`，以及由
      `readOnlyRefusalMessage` 拒绝工作区内需审批的 `read_file`（零次
      `requestPermission` 调用），并继续推进到下一模型轮。
-- `acp-tool-batch.test.ts` 验证 `runAcpToolBatch` 将 `isTrustedLiveTool`、
-  `readOnlyRefusalMessage` 和 `invocationGuard` 转发给 `createSchedulerExecutor`。
+- `acp-tool-batch.test.ts` 验证 `runAcpToolBatch` 将 `isTrustedLiveTool` 与
+  `readOnlyRefusalMessage` 转发给 `createSchedulerExecutor`。
 
 ## 风险与边界
 
@@ -95,9 +97,9 @@ loop guards、todo reminder 和结果感知去重对每个 ACP 轮次生效。
 - **live 任务轮询。** always-on 连续相同调用守卫不区分结果是否改变
   （#9450 的豁免在 core 的结果感知去重里）。若出现真实回归，把 live
   任务工具的 sentinel 按实例身份写进批的重复处理，而不是扩 core 豁免。
-- **Agent Host 的 glob/grep。** `invocationGuard` 在 `buildInvocation` 后对构建
-  好的参数求值，因此 `read_file`、`glob`、`grep`、`ls` 的工作区外路径均在权限与
-  执行前被拦截。
+- **Agent Host 的 glob/grep。** 会话 `Config.getToolInvocationGuard()` 由
+  `CoreToolScheduler` 在执行边界应用，因此 `read_file`、`glob`、`grep`、`ls` 的
+  工作区外路径在执行前被拦截。
 - **#17181 依赖。** 分支基于 #17181 的 `SharedLoopRound` 交接形状，并与 `main`
   合流。
 
@@ -107,4 +109,5 @@ loop guards、todo reminder 和结果感知去重对每个 ACP 轮次生效。
   `SendMessageOptions` 及其读点消失。
 - live 会话与 Agent Host 会话都走共享批，并由共享批集成场景覆盖可信 live 工具
   免审执行、普通工具权限审批、Agent Host 自动放行只读工具、工作区外
-  `invocationGuard` 拦截，以及需审批调用的只读拒绝（零次外发 `requestPermission`）。
+  `getToolInvocationGuard()` 拦截，以及需审批调用的只读拒绝（零次外发
+  `requestPermission`）。

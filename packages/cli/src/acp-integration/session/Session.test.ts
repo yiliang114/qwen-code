@@ -5542,6 +5542,7 @@ describe('Session', () => {
         .fn()
         .mockReturnValue(permissionManager);
       mockConfig.getDisableAllHooks = vi.fn().mockReturnValue(true);
+      mockConfig.getMessageBus = vi.fn().mockReturnValue(undefined);
       mockConfig.getExperimentalZedIntegration = vi.fn().mockReturnValue(true);
       mockConfig.isInteractive = vi.fn().mockReturnValue(false);
       mockConfig.getTruncateToolOutputThreshold = vi
@@ -5660,6 +5661,7 @@ describe('Session', () => {
         .mockReturnValue(ApprovalMode.DEFAULT);
       mockConfig.getPermissionManager = vi.fn().mockReturnValue(null);
       mockConfig.getDisableAllHooks = vi.fn().mockReturnValue(true);
+      mockConfig.getMessageBus = vi.fn().mockReturnValue(undefined);
       mockConfig.getExperimentalZedIntegration = vi.fn().mockReturnValue(true);
       mockConfig.isInteractive = vi.fn().mockReturnValue(false);
       mockConfig.getTruncateToolOutputThreshold = vi
@@ -5674,6 +5676,16 @@ describe('Session', () => {
           candidate === workspaceDir ||
           candidate.startsWith(`${workspaceDir}${path.sep}`),
       });
+      mockConfig.getToolInvocationGuard = vi
+        .fn()
+        .mockReturnValue(
+          createAgentHostToolInvocationGuard(
+            undefined,
+            workspaceDir,
+            (candidate) =>
+              mockConfig.getWorkspaceContext().isPathWithinWorkspace(candidate),
+          ),
+        );
       runAcpToolBatchSpy.mockImplementationOnce(
         (
           await vi.importActual<typeof import('./acp-tool-batch.js')>(
@@ -5710,6 +5722,9 @@ describe('Session', () => {
       expect(lsExecute).toHaveBeenCalledOnce();
       expect(readExecute).not.toHaveBeenCalled();
       expect(mockClient.requestPermission).not.toHaveBeenCalled();
+      // The workspace confinement guard is the session Config's, applied at
+      // the scheduler's execution boundary.
+      expect(mockConfig.getToolInvocationGuard).toHaveBeenCalled();
       expect(send).toHaveBeenCalledTimes(2);
       const toolResultParts = send.mock.calls[1][0] as Part[];
       const responsesById = new Map(
