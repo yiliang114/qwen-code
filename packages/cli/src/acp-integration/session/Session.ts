@@ -7611,9 +7611,9 @@ export class Session implements SessionContext {
             // itself: UserPromptSubmit on the admitted verdict, memory recall,
             // system reminders and workflow intent for a UserQuery, then the
             // Stop hook and stop-policy continuations. ACP keeps the user turn
-            // with its file-history snapshot and the interaction span. Live
-            // and Agent Host sessions also keep ACP's tool executor and guards
-            // instead of the shared tool batch.
+            // with its file-history snapshot and the interaction span; tool
+            // batches run on the shared loop's batch with live-tool trust,
+            // read-only refusal, and the Agent Host invocation guard.
             const sharedModelRound =
               this.config.isUnifiedAgentLoopEnabled?.('acp') === true;
             // A retry, a continue or a restore re-enters a turn: its first
@@ -8910,6 +8910,9 @@ export class Session implements SessionContext {
    * turn around it runs the tool batch and decides what is sent next.
    */
   async #runSharedRound(round: SharedRound): Promise<SharedRoundResult> {
+    debugLogger.debug(
+      `[ACP] model round on the shared agent loop (prompt ${round.promptId})`,
+    );
     const {
       message,
       promptId,
@@ -15776,7 +15779,6 @@ export class Session implements SessionContext {
       client: this.client,
       toolCallEmitter: this.toolCallEmitter,
       messageEmitter: this.messageEmitter,
-      getTool: (name) => this.config.getToolRegistry().getTool(name),
       isTrustedLiveTool: (tool) =>
         tool !== undefined &&
         (tool === this.liveScreenContextTool ||
@@ -15919,6 +15921,9 @@ export class Session implements SessionContext {
     toolLoopState: DaemonToolLoopState,
     onFullTurnModel?: (model: string) => boolean,
   ): Promise<RunToolResult> {
+    debugLogger.debug(
+      `[ACP] tool batch on the shared agent loop (prompt ${promptId}, ${requests.length} call(s))`,
+    );
     promptIdContext.enterWith(promptId);
     todoWorkChainContext.enterWith(
       this.config.getActiveTodoWorkChainOwner(promptId),

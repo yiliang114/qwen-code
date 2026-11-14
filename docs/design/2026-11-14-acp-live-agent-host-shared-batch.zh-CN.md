@@ -35,77 +35,76 @@
 
 ### live 工具的信任
 
-`AcpToolBatchHost` 增加一个输入，携带会话的三个可信 live 工具实例
-（按身份，不按名字）。批的 `beforeToolLaunch` 恰好对这些实例跳过只读
-拒绝和调用围栏；L1 enablement 和权限申请已经由调度器按工具声明的信任
-处理，批内无需重复豁免。它们的执行通道是会话的 daemon `extMethod`，
-由 `setLiveConversationActive` 生命周期约束，所以模型调用它们时不会真的
-产生审批提问。信任按工具实例引用相等，不让同名的 MCP 工具继承。
+`AcpToolBatchHost` 的 `isTrustedLiveTool` 输入（转发至
+`CoreToolSchedulerOptions.isTrustedTool`）按实例身份（而非工具名）识别会话的
+三个可信 live 工具实例。在 `CoreToolScheduler` 内，受信任的工具实例直接跳过
+L1 `PermissionManager.isToolEnabled` / 旧版拒绝列表检查、Agent Host
+`invocationGuard` 以及 L3→L4 `evaluatePermissionFlow` 权限评估，无需交互式审批
+即可直接调度执行。它们的执行通道是会话的 daemon `extMethod`，已由
+`setLiveConversationActive` 生命周期约束，因此模型调用它们时不会产生审批请求。
+信任按工具实例引用相等判定，同一 live 会话中的普通工具或同名 MCP 工具仍走正常
+ACP 权限流程。
 
 ### Agent Host 的只读与调用围栏
 
-两个主机行为，作用域仍是 `sourceType === 'agent-host'`：
+两个宿主行为仍限定于 `sourceType === 'agent-host'`，经 `AcpToolBatchHost`
+转发给 `CoreToolSchedulerOptions`：
 
-1. 每个到达批的 `beforeToolLaunch` 且不属于 live 信任的调用，都用会话
-   只读的提示拒绝，不发 `session/request_permission`（不走
-   `#requestPermissionQueued`）。
-2. `createAgentHostToolInvocationGuard` 作为批的宿主输入传入，在
-   `beforeToolLaunch`、调度器 build 之前评估。build 失败的调用仍走
-   scheduler 的重试路径，与当前 ACP executor 一致。
-
-集成测试断言会话没有发出 `session/request_permission`。验收不区分是
-plan 端先拒还是执行端 deflect；倾向在 launch 前拒。
+1. `invocationGuard`（`createAgentHostToolInvocationGuard`）在非受信任工具的
+   `buildInvocation` 成功后立即评估。违反工作区路径围栏或只读策略的调用在权限
+   检查和执行前直接以 `EXECUTION_DENIED`（`not_started`）及围栏拒绝原因结算。
+2. `readOnlyRefusalMessage` 仅在调用真正到达交互式审批关口时（`awaiting_approval`
+   之前、自动放行的只读检查与权限 hook 之后）触发。工作区内自动放行的只读工具
+   （`read_file`、`ls`、`grep`、`glob`）正常执行；任何仍需交互审批的调用以
+   `EXECUTION_DENIED`（`not_started`）和消息
+   `Tool "<name>" requires approval, which is unavailable on this read-only Agent Host.`
+   拒绝，不发送 `session/request_permission`，也不中止整轮对话。
 
 ### 去掉 flag
 
-两类会话迁到共享批之后，`#runsToolsOnSharedBatch()` 直接删除（两个
-调用点并入共享路径）。`toolLoopGuardsByHost` 从 `SendMessageOptions`
-删除，core 的 loop guards、todo reminder 和结果感知去重对每个 ACP
-轮次生效。`checkAlwaysOnSafeties`（整轮次数上限、连续相同调用守卫——
-含后台任务豁免）接管该轮；TUI 依赖的重复停止（#14590，含 YOLO 后台
-任务）在统一 loop 下由批的 `keepCancelledResults: true` 保持对等的
-覆盖形态。
+两类会话迁到共享批之后，`#runsToolsOnSharedBatch()` 直接删除（两个调用点并入
+共享路径）。`toolLoopGuardsByHost` 从 `SendMessageOptions` 删除，core 的
+loop guards、todo reminder 和结果感知去重对每个 ACP 轮次生效。
+`checkAlwaysOnSafeties`（整轮次数上限、连续相同调用守卫——含后台任务豁免）接管
+该轮；TUI 依赖的重复停止（#14590，含 YOLO 后台任务）在统一 loop 下由批的
+`keepCancelledResults: true` 保持对等的覆盖形态。
 
 ### 测试计划
 
-测试按价值驱动，不为覆盖率凑数。设计上是抬升现有单一来源，不新增平行
-case 列表：
+测试按价值驱动，在现有测试套件中补齐真实共享批的集成场景：
 
-- 单元：`Session.test.ts` 复用现有 harness。此前断言
-  `toolLoopGuardsByHost: true` 且 `runAcpToolBatch` 未被调用的用例随
-  分支翻转；每个用例以行为断言驱动（live 工具免审批、agent-host 在
-  launch 前拒绝、guards 恢复）而不是按 flag 传给 core 的样子。共享批
-  harness 对截断响应的请求显式打 `wasOutputTruncated`，与真实 client
-  在轮次上的标记一致。
-- core 侧按价值闸门：`checkAlwaysOnSafeties`、tool-result 那部分不再
-  re-mock，增强写进拥有该不变式的单一来源；如果现有 harness 表达不了
-  live 任务长轮询的 sentinel，再补。
+- `Session.test.ts` 翻转原先断言 `toolLoopGuardsByHost: true` 的用例，并在
+  `kernel=false` 与 `kernel=true` 下通过真实 `runAcpToolBatch` 与
+  `CoreToolScheduler` 运行两类集成场景：
+  1. live 工具会话在同一共享批中同时调用可信的 `capture_screen_context` 与需审批的
+     普通 `read_file` 工具，验证可信 live 工具跳过 `isToolEnabled` 与
+     `requestPermission` 直接执行，而同一会话中的普通工具仍发出 ACP 权限请求。
+  2. 只读 Agent Host 会话在 `ApprovalMode.DEFAULT` 下运行工作区内自动放行的
+     `list_directory`、由 `invocationGuard` 拦截工作区外的 `read_file`，以及由
+     `readOnlyRefusalMessage` 拒绝工作区内需审批的 `read_file`（零次
+     `requestPermission` 调用），并继续推进到下一模型轮。
+- `acp-tool-batch.test.ts` 验证 `runAcpToolBatch` 将 `isTrustedLiveTool`、
+  `readOnlyRefusalMessage` 和 `invocationGuard` 转发给 `createSchedulerExecutor`。
 
 ## 风险与边界
 
 - **重复停止回归（#14590）。** TUI 的后台任务重复停止现由
   `checkAlwaysOnSafeties` 提供。统一 loop 下，executor 返回打捞结果，
   cancelled 批的缺失响应合成为 cancellation。`keepCancelledResults: true`
-  的形态与该停止等价；daemon cancelled 批路径上的等价用例是合并前
-  的守门。
+  的形态与该停止等价。
 - **live 任务轮询。** always-on 连续相同调用守卫不区分结果是否改变
   （#9450 的豁免在 core 的结果感知去重里）。若出现真实回归，把 live
   任务工具的 sentinel 按实例身份写进批的重复处理，而不是扩 core 豁免。
-- **Agent Host 的 glob/grep。** executor deflect Agent Host 围栏拒绝的
-  路径搜索；信任只作用于工具的执行通道。
-- **#17181 依赖。** 分支基于 `SharedLoopRound` / `beforeToolLaunch`
-  形状。若 #17181 落地时形状不同，本设计跟随其终形状，不另改 loop
-  契约。
+- **Agent Host 的 glob/grep。** `invocationGuard` 在 `buildInvocation` 后对构建
+  好的参数求值，因此 `read_file`、`glob`、`grep`、`ls` 的工作区外路径均在权限与
+  执行前被拦截。
+- **#17181 依赖。** 分支基于 #17181 的 `SharedLoopRound` 交接形状，并与 `main`
+  合流。
 
 ## 验收
 
 - `#runsToolsOnSharedBatch()` 删除；`toolLoopGuardsByHost` 从
   `SendMessageOptions` 及其读点消失。
-- live 会话与 Agent Host 会话都走共享批；单元 harness 驱动截断的 edit
-  走该批、可信 live 工具不经权限提问、普通工具仍走完权限往返。
-- daemon cancelled 批的重复停止保持等价（批的 `keepCancelledResults`
-  保持该停止的覆盖形态）。
-
-后续：每类会话一个全栈集成场景（live 用 fake ACP client + fake daemon
-`extMethod`；Agent Host 断言被拒 edit 且零次外发
-`request_permission`）随本行的下一片段落地。
+- live 会话与 Agent Host 会话都走共享批，并由共享批集成场景覆盖可信 live 工具
+  免审执行、普通工具权限审批、Agent Host 自动放行只读工具、工作区外
+  `invocationGuard` 拦截，以及需审批调用的只读拒绝（零次外发 `requestPermission`）。
