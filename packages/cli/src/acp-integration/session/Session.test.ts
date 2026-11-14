@@ -5485,7 +5485,9 @@ describe('Session', () => {
       });
       // The client marks the cut response's pending calls truncated; the
       // mocked model stream omits that step, so mark the request here.
-      cutCall.value.wasOutputTruncated = true;
+      (
+        cutCall as { value: core.ToolCallRequestInfo }
+      ).value.wasOutputTruncated = true;
       const send = useSharedRounds([
         cutCall,
         finished(FinishReason.MAX_TOKENS),
