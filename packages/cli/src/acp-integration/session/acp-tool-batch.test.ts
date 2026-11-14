@@ -193,6 +193,8 @@ describe('runAcpToolBatch', () => {
       continueRelatedAgent: () => undefined,
       sendTerminalSequence: vi.fn(),
       refuseToolCall: () => undefined,
+      getTool: () => undefined,
+      isTrustedLiveTool: () => false,
     } as unknown as AcpToolBatchHost;
   });
 
