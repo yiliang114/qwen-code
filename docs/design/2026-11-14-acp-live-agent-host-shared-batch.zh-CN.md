@@ -96,7 +96,8 @@ loop guards、todo reminder 和结果感知去重对每个 ACP 轮次生效。
   的形态与该停止等价。
 - **live 任务轮询。** always-on 连续相同调用守卫不区分结果是否改变
   （#9450 的豁免在 core 的结果感知去重里）。若出现真实回归，把 live
-  任务工具的 sentinel 按实例身份写进批的重复处理，而不是扩 core 豁免。
+  任务工具的 sentinel 按实例身份写进批的重复处理，而不是扩 core 豁免：
+  信任按实例身份判定，同名工具不继承。
 - **Agent Host 的 glob/grep。** 会话 `Config.getToolInvocationGuard()` 由
   `CoreToolScheduler` 在执行边界应用，因此 `read_file`、`glob`、`grep`、`ls` 的
   工作区外路径在执行前被拦截。

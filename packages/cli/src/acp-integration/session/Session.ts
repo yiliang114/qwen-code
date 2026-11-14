@@ -7612,8 +7612,10 @@ export class Session implements SessionContext {
             // system reminders and workflow intent for a UserQuery, then the
             // Stop hook and stop-policy continuations. ACP keeps the user turn
             // with its file-history snapshot and the interaction span; tool
-            // batches run on the shared loop's batch with live-tool trust,
-            // read-only refusal, and the Agent Host invocation guard.
+            // batches run on the shared loop's batch with live-tool trust and
+            // read-only refusal; the Agent Host invocation guard stays on the
+            // session Config and is evaluated by the scheduler at its
+            // execution boundary.
             const sharedModelRound =
               this.config.isUnifiedAgentLoopEnabled?.('acp') === true;
             // A retry, a continue or a restore re-enters a turn: its first
@@ -7629,8 +7631,10 @@ export class Session implements SessionContext {
               if (sharedModelRound && goalTurn) goalTurn.loopStopped = true;
             };
             // Every session's tool batches run on the shared loop's batch;
-            // the batch host carries live-tool trust, read-only refusal, and
-            // the Agent Host invocation guard.
+            // the batch host carries live-tool trust and read-only refusal,
+            // while the Agent Host invocation guard stays on the session
+            // Config and is evaluated by the scheduler at its execution
+            // boundary.
             const sharedToolBatch = sharedModelRound;
             let promptAdmission: UserPromptAdmission | undefined;
             // A continue, a restore or a runtime continuation runs no

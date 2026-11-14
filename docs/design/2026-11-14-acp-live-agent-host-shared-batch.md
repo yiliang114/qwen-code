@@ -117,8 +117,10 @@ suites with end-to-end shared-batch integration scenarios:
 - **Live-task polling.** The always-on consecutive-identical guard counts
   identical live calls even when their results changed (#9450's
   result-aware exemption starts in core's duplicate recording). If a genuine
-  regression shows, the live task tool identities are recorded by name in the
-  batch's duplicate handling rather than broadening core's exemptions.
+  regression shows, the live task tool identities are recorded by
+  tool-instance reference in the batch's duplicate handling rather than
+  broadening core's exemptions: trust is by instance identity, so a
+  same-named tool inherits none of it.
 - **Agent Host glob/grep.** The session `Config.getToolInvocationGuard()` is
   applied by `CoreToolScheduler` at the execution boundary, so out-of-workspace
   paths in `read_file`, `glob`, `grep`, and `ls` are denied before execution.
