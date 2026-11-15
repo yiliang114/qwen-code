@@ -305,7 +305,7 @@ final class AgentSessionPolicies {
                         && jdbc.queryForList("SELECT turn_id FROM ma_turn WHERE tenant_id=? AND session_id=? AND submission_attempted=TRUE LIMIT 1 FOR UPDATE",
                                 tenantId, sessionId).isEmpty();
                 if (!beforeModel || !isBootstrapRevision(body)
-                        || !objectMapper.valueToTree(initial).equals(body.path("command"))) {
+                        || !isInitialBootstrapCommand(objectMapper.valueToTree(initial), body.path("command"))) {
                     throw new ManagedAgentException(409, "extension_initialization_conflict", "Initial extension selection conflicts with its creation receipt.");
                 }
                 return;
@@ -329,6 +329,33 @@ final class AgentSessionPolicies {
         if (!onlyInitialTurn || !isBootstrapRevision(body) || !command.equals(body.path("command"))) {
             throw new ManagedAgentException(409, "child_launch_snapshot_invalid", "Child extension bootstrap conflicts with its launch snapshot");
         }
+    }
+
+    /**
+     * 恢复重放时的恒等式判断：创建回执（expected）只含 operationId/actorKey/expectedRevision/extensions，
+     * 而 harness 重放初始扩展命令时会额外带一个 mode: "apply"（见 CLI hosted-extension-session 的提交包装）。
+     * 因此不能要求字节级相等，否则「创建后未下发初始配置且首轮失败」的 Session 永远无法恢复。
+     * 这里按语义字段比对：actual 的每个字段都必须与 expected 一致，仅允许多出一个 mode: "apply"。
+     */
+    static boolean isInitialBootstrapCommand(JsonNode expected, JsonNode actual) {
+        if (actual == null || !actual.isObject() || expected == null || !expected.isObject()) {
+            return false;
+        }
+        var fields = actual.fields();
+        while (fields.hasNext()) {
+            var entry = fields.next();
+            String name = entry.getKey();
+            if ("mode".equals(name)) {
+                if (!"apply".equals(entry.getValue().asText())) {
+                    return false;
+                }
+                continue;
+            }
+            if (!entry.getValue().equals(expected.get(name))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     static boolean isBootstrapRevision(JsonNode body) {
