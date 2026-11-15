@@ -335,27 +335,20 @@ final class AgentSessionPolicies {
      * 恢复重放时的恒等式判断：创建回执（expected）只含 operationId/actorKey/expectedRevision/extensions，
      * 而 harness 重放初始扩展命令时会额外带一个 mode: "apply"（见 CLI hosted-extension-session 的提交包装）。
      * 因此不能要求字节级相等，否则「创建后未下发初始配置且首轮失败」的 Session 永远无法恢复。
-     * 这里按语义字段比对：actual 的每个字段都必须与 expected 一致，仅允许多出一个 mode: "apply"。
+     * 修复方式：从 actual 剥离唯一容许的 mode: "apply" 字段后，与 expected 做完整对象深相等。
+     * actual 缺字段、多其它字段、或 mode 不是 "apply" 都判为不一致，不退化成子集匹配。
      */
     static boolean isInitialBootstrapCommand(JsonNode expected, JsonNode actual) {
         if (actual == null || !actual.isObject() || expected == null || !expected.isObject()) {
             return false;
         }
-        var fields = actual.fields();
-        while (fields.hasNext()) {
-            var entry = fields.next();
-            String name = entry.getKey();
-            if ("mode".equals(name)) {
-                if (!"apply".equals(entry.getValue().asText())) {
-                    return false;
-                }
-                continue;
-            }
-            if (!entry.getValue().equals(expected.get(name))) {
-                return false;
-            }
+        com.fasterxml.jackson.databind.node.ObjectNode stripped = actual.deepCopy();
+        if (!"apply".equals(stripped.path("mode").asText(null))) {
+            // mode 缺失或不是 apply 时不能剥离；此时 actual 必须与 expected 完全一致
+            return actual.equals(expected);
         }
-        return true;
+        stripped.remove("mode");
+        return stripped.equals(expected);
     }
 
     static boolean isBootstrapRevision(JsonNode body) {
